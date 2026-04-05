@@ -1,0 +1,33 @@
+{
+  "name": "meteoblue-weather-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:web": "npm --prefix zip run dev",
+    "stitch:explore": "node tools/stitch-concept.mjs explore",
+    "stitch:refine": "node tools/stitch-concept.mjs refine",
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc -p tsconfig.build.json",
+    "build:web": "npm --prefix zip run build",
+    "check:encoding": "node tools/check-encoding.mjs",
+    "check": "tsc --noEmit && npm --prefix zip run lint && node tools/check-encoding.mjs",
+    "start": "node dist/index.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "fastify": "^5.3.0"
+  },
+  "devDependencies": {
+    "@google/stitch-sdk": "^0.1.0",
+    "@types/node": "^24.5.2",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

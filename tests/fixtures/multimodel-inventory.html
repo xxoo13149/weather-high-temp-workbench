@@ -1,0 +1,65 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+  <body>
+    <div class="last-update">Last update: 2026-04-04 01:00 UTC</div>
+
+    <div class="model-selector">
+      <label for="params_IFS025">IFS 0.25°</label>
+      <input id="params_IFS025" type="checkbox" name="params[]" value="IFS025" checked="checked" />
+
+      <label for="params_ICON">ICON</label>
+      <input id="params_ICON" type="checkbox" name="params[]" value="ICON" checked="checked" />
+
+      <label for="params_GEM15">GEM 15 km</label>
+      <input id="params_GEM15" type="checkbox" name="params[]" value="GEM15" checked="checked" />
+    </div>
+
+    <table class="datatable">
+      <thead>
+        <tr>
+          <th class="model-name">Model</th>
+          <th class="last-update">Last update</th>
+          <th class="provider">Provider</th>
+          <th class="coverage">Coverage</th>
+          <th class="spatial-resolution">Resolution</th>
+          <th class="temporal-resolution">Horizon</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="model-name">IFS 0.25°</td>
+          <td class="last-updated" title="2026-04-04T00:00:00.000Z">00:00 UTC</td>
+          <td class="provider"><a href="#">ECMWF</a></td>
+          <td class="coverage">Global</td>
+          <td class="spatial-resolution">0.25°</td>
+          <td class="temporal-resolution">10 days</td>
+        </tr>
+        <tr>
+          <td class="model-name">ICON</td>
+          <td class="last-updated" title="2026-04-04T00:30:00.000Z">00:30 UTC</td>
+          <td class="provider"><a href="#">DWD</a></td>
+          <td class="coverage">Global</td>
+          <td class="spatial-resolution">13 km</td>
+          <td class="temporal-resolution">7 days</td>
+        </tr>
+        <tr>
+          <td class="model-name">GEM 15 km</td>
+          <td class="last-updated" title="2026-04-04T00:15:00.000Z">00:15 UTC</td>
+          <td class="provider"><a href="#">ECCC</a></td>
+          <td class="coverage">Global</td>
+          <td class="spatial-resolution">15 km</td>
+          <td class="temporal-resolution">10 days</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div
+      class="highcharts"
+      data-url="//my.meteoblue.com/images/meteogram_multimodel?format=highcharts&amp;download=1&amp;domains=IFS025&amp;domains=ICON&amp;domains=GEM15&amp;sig=chart123"
+    ></div>
+
+    <a id="chart_download" href="//my.meteoblue.com/images/meteogram_multimodel?format=png&amp;download=1&amp;sig=abc123">
+      <span>Download image</span>
+    </a>
+  </body>
+</html>

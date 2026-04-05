@@ -1,0 +1,15 @@
+{
+  "components": [
+    "button",
+    "input",
+    "select",
+    "tabs",
+    "dialog",
+    "sheet",
+    "scroll-area",
+    "tooltip",
+    "separator",
+    "command",
+    "badge"
+  ]
+}
