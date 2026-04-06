@@ -1,4 +1,4 @@
-import { CheckCheck, ChevronLeft, ChevronRight, Home, Radar, RefreshCw, SignalHigh, Star, TriangleAlert } from "lucide-react";
+import { CheckCheck, ChevronLeft, ChevronRight, Home, Radar, RefreshCw, SignalHigh, Star, TriangleAlert, TrendingUp } from "lucide-react";
 import { motion } from "motion/react";
 
 import { Button } from "@/components/ui/button";
@@ -12,7 +12,7 @@ export const CommandHeader = ({
   syncState,
   refreshState,
   refreshDisabled,
-  isAnalysis,
+  currentPage,
   railExpanded,
   favorite,
   favoriteDisabled,
@@ -22,6 +22,7 @@ export const CommandHeader = ({
   onToggleFavorite,
   onNavigateHome,
   onNavigateAnalysis,
+  onNavigateKelly,
 }: {
   locationName: string;
   locationTimezone?: string;
@@ -29,7 +30,7 @@ export const CommandHeader = ({
   syncState: "fresh" | "stale";
   refreshState: "idle" | "pending" | "success" | "error";
   refreshDisabled: boolean;
-  isAnalysis: boolean;
+  currentPage: "home" | "analysis" | "kelly";
   railExpanded: boolean;
   favorite: boolean;
   favoriteDisabled: boolean;
@@ -39,6 +40,7 @@ export const CommandHeader = ({
   onToggleFavorite: () => void;
   onNavigateHome: () => void;
   onNavigateAnalysis: () => void;
+  onNavigateKelly: () => void;
 }) => {
   const refreshLabel =
     refreshState === "pending"
@@ -55,7 +57,7 @@ export const CommandHeader = ({
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.28, ease: "easeOut" }}
       className="terminal-panel command-header-shell px-4 py-3.5 md:px-5"
-      data-page={isAnalysis ? "analysis" : "home"}
+      data-page={currentPage}
       data-sync-state={syncState}
     >
       <div className="panel-section command-header-grid flex flex-wrap items-start justify-between gap-3">
@@ -117,11 +119,11 @@ export const CommandHeader = ({
         <div className="command-header-actions flex flex-wrap items-center justify-end gap-2">
           <Button
             type="button"
-            variant={isAnalysis ? "ghost" : "default"}
+            variant={currentPage === "home" ? "default" : "ghost"}
             size="sm"
             onClick={onNavigateHome}
             className="command-header-nav"
-            data-active={!isAnalysis}
+            data-active={currentPage === "home"}
           >
             <Home className="mr-2 h-4 w-4" />
             {UI_TEXT.header.home}
@@ -129,14 +131,26 @@ export const CommandHeader = ({
 
           <Button
             type="button"
-            variant={isAnalysis ? "default" : "secondary"}
+            variant={currentPage === "analysis" ? "default" : "secondary"}
             size="sm"
             onClick={onNavigateAnalysis}
             className="command-header-nav"
-            data-active={isAnalysis}
+            data-active={currentPage === "analysis"}
           >
             <Radar className="mr-2 h-4 w-4" />
             {UI_TEXT.header.analysis}
+          </Button>
+
+          <Button
+            type="button"
+            variant={currentPage === "kelly" ? "default" : "secondary"}
+            size="sm"
+            onClick={onNavigateKelly}
+            className="command-header-nav"
+            data-active={currentPage === "kelly"}
+          >
+            <TrendingUp className="mr-2 h-4 w-4" />
+            Kelly 实验台
           </Button>
 
           <Button

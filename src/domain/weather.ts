@@ -254,6 +254,189 @@ export interface MultiModelInsightResponse {
   warnings: string[];
 }
 
+export type KellyRiskMode = "conservative" | "balanced" | "aggressive";
+export type KellyContractType = "range" | "atLeast" | "atMost" | "exact";
+export type KellyTemperatureUnit = "C" | "F";
+export type KellySourceState = "fresh" | "stale" | "degraded" | "unavailable" | "connected" | "disconnected";
+
+export interface KellySourceStatus {
+  kind: "weather" | "market-discovery" | "orderbooks" | "stream";
+  state: KellySourceState;
+  label: string;
+  detail: string | null;
+  updatedAt: string | null;
+}
+
+export interface KellyExcludedModel {
+  modelName: string;
+  reason: string;
+}
+
+export interface KellyWeatherEvidence {
+  location: LocationInfo;
+  targetDate: string;
+  availableTargetDates: string[];
+  currentReferenceTemperatureC: number | null;
+  currentReferenceSource: "manual" | "hourly-current" | "hourly-selected" | "model-mean";
+  currentWeatherTimestamp: string | null;
+  currentModelTimestamp: string | null;
+  targetModelTimestamp: string | null;
+  sourceSummaryZh: string | null;
+  hourlyPageUrl: string;
+  multimodelPageUrl: string;
+  fetchedAt: string;
+  stale: boolean;
+  participatingModelCount: number;
+  excludedModels: KellyExcludedModel[];
+}
+
+export interface KellyProbabilityCurvePoint {
+  temperatureC: number;
+  density: number;
+  cumulative: number;
+}
+
+export interface KellyBucketProbability {
+  marketId: string;
+  label: string;
+  contractType: KellyContractType;
+  bucketStartC: number | null;
+  bucketEndC: number | null;
+  probabilityYes: number;
+  probabilityNo: number;
+}
+
+export interface KellyMarketRow {
+  marketId: string;
+  slug: string | null;
+  title: string;
+  marketUrl: string | null;
+  conditionId: string | null;
+  liquidity: number | null;
+  volume24h: number | null;
+  contractType: KellyContractType;
+  unit: KellyTemperatureUnit;
+  bucketStartC: number | null;
+  bucketEndC: number | null;
+  bucketLabel: string;
+  parseStatus: "matched" | "unresolved";
+  exclusionReason: string | null;
+  yesTokenId: string | null;
+  noTokenId: string | null;
+  yesPrice: number | null;
+  noPrice: number | null;
+  yesBestBid: number | null;
+  yesBestAsk: number | null;
+  noBestBid: number | null;
+  noBestAsk: number | null;
+  spreadPct: number | null;
+  fairYes: number;
+  fairNo: number;
+  edgeYes: number;
+  edgeNo: number;
+  kellyYes: number;
+  kellyNo: number;
+  recommendedSide: "yes" | "no" | "none";
+  suggestedStake: number;
+  updatedAt: string | null;
+}
+
+export interface KellyRecommendation {
+  slot: "primary" | "secondary";
+  marketId: string;
+  title: string;
+  marketUrl: string | null;
+  side: "yes" | "no";
+  edge: number;
+  fairPrice: number;
+  marketPrice: number;
+  kellyFraction: number;
+  suggestedStake: number;
+  reason: string;
+}
+
+export interface KellyDistributionSummary {
+  meanTemperatureC: number;
+  medianTemperatureC: number;
+  modeTemperatureC: number;
+  mostLikelyRangeLabel: string;
+  shrink: number;
+  usableModelCount: number;
+  totalModelCount: number;
+  peakSpreadC: number;
+}
+
+export interface KellySourceLinks {
+  meteoblueWeekUrl: string;
+  meteoblueMultimodelUrl: string;
+  polymarketSearchUrl: string;
+  marketUrls: string[];
+}
+
+export interface KellyWorkbenchResponse {
+  location: LocationInfo;
+  targetDate: string;
+  availableTargetDates: string[];
+  generatedAt: string;
+  bankroll: number;
+  riskMode: KellyRiskMode;
+  riskMultiplier: number;
+  minEdge: number;
+  weatherEvidence: KellyWeatherEvidence;
+  distributionSummary: KellyDistributionSummary;
+  probabilityCurve: KellyProbabilityCurvePoint[];
+  bucketProbabilities: KellyBucketProbability[];
+  markets: KellyMarketRow[];
+  recommendations: KellyRecommendation[];
+  sourceLinks: KellySourceLinks;
+  sourceStatus: KellySourceStatus[];
+  warnings: string[];
+}
+
+export interface KellyStreamMarketPatch {
+  marketId: string;
+  yesPrice: number | null;
+  noPrice: number | null;
+  yesBestBid: number | null;
+  yesBestAsk: number | null;
+  noBestBid: number | null;
+  noBestAsk: number | null;
+  spreadPct: number | null;
+  edgeYes: number;
+  edgeNo: number;
+  kellyYes: number;
+  kellyNo: number;
+  recommendedSide: "yes" | "no" | "none";
+  suggestedStake: number;
+  updatedAt: string | null;
+}
+
+export type KellyStreamMessage =
+  | {
+      type: "status";
+      generatedAt: string;
+      state: KellySourceState;
+      message: string;
+    }
+  | {
+      type: "markets";
+      generatedAt: string;
+      markets: KellyStreamMarketPatch[];
+    };
+
+export interface KellyRequestOptions {
+  targetDate?: string;
+  bankroll?: number;
+  riskMode?: KellyRiskMode;
+  minEdge?: number;
+  actualTemperatureC?: number;
+  selectedHourTimestamp?: string;
+}
+
+export interface KellyStreamHandle {
+  close(): Promise<void> | void;
+}
+
 export interface UserFavoritesResponse {
   fetchedAt: string;
   locationIds: LocationInfo["id"][];
@@ -274,6 +457,15 @@ export interface WeatherService {
     timestamp?: string,
     actualTemperatureC?: number,
   ): Promise<MultiModelInsightResponse>;
+  getKellyWorkbench?(
+    locationId: LocationInfo["id"],
+    options?: KellyRequestOptions,
+  ): Promise<KellyWorkbenchResponse>;
+  createKellyStream?(
+    locationId: LocationInfo["id"],
+    options: KellyRequestOptions,
+    onMessage: (message: KellyStreamMessage) => void,
+  ): Promise<KellyStreamHandle>;
   getUserFavorites?(): Promise<UserFavoritesResponse>;
   setUserFavorite?(locationId: LocationInfo["id"], favorite: boolean): Promise<UserFavoritesResponse>;
 }

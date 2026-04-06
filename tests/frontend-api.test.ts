@@ -68,4 +68,74 @@ describe("weatherApi", () => {
       expect.any(Object),
     );
   });
+
+  test("builds Kelly endpoint requests with route controls", async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          location: { id: "miami_mia", name: "Miami International Airport", timezone: "America/New_York" },
+          targetDate: "2026-03-28",
+          availableTargetDates: ["2026-03-28"],
+          generatedAt: "2026-03-28T00:00:00.000Z",
+          bankroll: 1000,
+          riskMode: "balanced",
+          riskMultiplier: 0.5,
+          minEdge: 0.02,
+          weatherEvidence: {},
+          distributionSummary: {},
+          probabilityCurve: [],
+          bucketProbabilities: [],
+          markets: [],
+          recommendations: [],
+          sourceLinks: {},
+          sourceStatus: [],
+          warnings: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+          },
+        },
+      ),
+    );
+
+    const apiModulePath = new URL("../zip/src/api.ts", import.meta.url).href;
+    const { weatherApi } = (await import(apiModulePath)) as {
+      weatherApi: {
+        fetchKellyWorkbench: (
+          locationId?: string,
+          targetDate?: string,
+          bankroll?: number,
+          riskMode?: "conservative" | "balanced" | "aggressive",
+          minEdge?: number,
+          actualTemperatureC?: number,
+          selectedHour?: string,
+        ) => Promise<unknown>;
+        buildKellyStreamUrl: (
+          locationId?: string,
+          targetDate?: string,
+          bankroll?: number,
+          riskMode?: "conservative" | "balanced" | "aggressive",
+          minEdge?: number,
+          actualTemperatureC?: number,
+          selectedHour?: string,
+        ) => string;
+      };
+    };
+
+    await weatherApi.fetchKellyWorkbench("miami_mia", "2026-03-28", 2500, "aggressive", 0.03, 24.5, "2026-03-28T16:00:00-04:00");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "/api/weather/kelly?locationId=miami_mia&targetDate=2026-03-28&bankroll=2500&riskMode=aggressive&minEdge=0.03&actualTemperatureC=24.5&selectedHour=2026-03-28T16%3A00%3A00-04%3A00",
+      ),
+      expect.any(Object),
+    );
+
+    expect(
+      weatherApi.buildKellyStreamUrl("miami_mia", "2026-03-28", 2500, "aggressive", 0.03, 24.5, "2026-03-28T16:00:00-04:00"),
+    ).toContain("ws://localhost:3000/api/weather/kelly/stream");
+  });
 });

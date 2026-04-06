@@ -8,6 +8,10 @@ import type {
   HourlyMode,
   HourlySourceType,
   HourlyWeatherResponse,
+  KellyRequestOptions,
+  KellyStreamHandle,
+  KellyStreamMessage,
+  KellyWorkbenchResponse,
   LocationInfo,
   MultiModelDistributionResponse,
   MultiModelInsightResponse,
@@ -17,6 +21,8 @@ import type {
   WeatherReportResponse,
   WeatherService,
 } from "../../domain/weather.js";
+import { buildDiscoveryWarnings, PolymarketClient, type NormalizedOrderBook, type PolymarketDiscoveryResult } from "../../kelly/polymarket.js";
+import { applyPricingToMarkets, buildKellyWorkbench, buildStreamMarketPatches, resolveKellyTargetDate } from "../../kelly/workbench.js";
 import { RefreshableCache } from "../../lib/cache.js";
 import { FavoritesStore } from "../../lib/favorites-store.js";
 import { fetchBinary, fetchText } from "../../lib/http.js";
@@ -65,6 +71,16 @@ interface ImageCacheValue {
   contentType: string;
   body: Buffer;
 }
+
+const buildKellyCacheKey = (locationId: LocationInfo["id"], targetDate: string) => `${locationId}::${targetDate}`;
+const resolveKellyDistributionTimestamp = (availableTimestamps: string[], targetDate: string): string | null => {
+  const matching = availableTimestamps.filter((timestamp) => timestamp.slice(0, 10) === targetDate);
+  if (matching.length === 0) {
+    return null;
+  }
+
+  return matching[Math.floor(matching.length / 2)] ?? matching[0] ?? null;
+};
 
 const normalizeText = (value: string): string => value.replace(/\s+/g, " ").trim();
 const dateFormatterCache = new Map<string, Intl.DateTimeFormat>();
@@ -260,12 +276,16 @@ export class MeteoblueWeatherService implements WeatherService {
     LocationInfo["id"],
     RefreshableCache<MultiModelDistributionCacheValue>
   >();
+  private readonly kellyMarketCaches = new Map<string, RefreshableCache<PolymarketDiscoveryResult>>();
+  private readonly kellyOrderBookCaches = new Map<string, RefreshableCache<Map<string, NormalizedOrderBook>>>();
   private readonly favoritesStore: FavoritesStore;
   private readonly allowedLocationIds: Set<LocationInfo["id"]>;
+  private readonly polymarketClient: PolymarketClient;
 
   constructor(options?: { favoritesStore?: FavoritesStore }) {
     this.favoritesStore = options?.favoritesStore ?? new FavoritesStore();
     this.allowedLocationIds = new Set(Object.keys(LOCATION_REGISTRY) as LocationInfo["id"][]);
+    this.polymarketClient = new PolymarketClient();
   }
 
   private requireLocation(locationId: LocationInfo["id"]) {
@@ -391,6 +411,48 @@ export class MeteoblueWeatherService implements WeatherService {
       async () => await loadMultiModelDistribution(location.multimodelPageUrl, location.timezone),
     );
     this.multiModelDistributionCaches.set(locationId, cache);
+    return cache;
+  }
+
+  private getKellyMarketCache(locationId: LocationInfo["id"], targetDate: string) {
+    const key = buildKellyCacheKey(locationId, targetDate);
+    const existing = this.kellyMarketCaches.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const location = this.requireLocation(locationId);
+    const cache = new RefreshableCache<PolymarketDiscoveryResult>(
+      config.polymarketMarketTtlMs,
+      async () => await this.polymarketClient.discoverMarkets(location, targetDate),
+    );
+
+    this.kellyMarketCaches.set(key, cache);
+    return cache;
+  }
+
+  private getKellyOrderBookCache(locationId: LocationInfo["id"], targetDate: string) {
+    const key = buildKellyCacheKey(locationId, targetDate);
+    const existing = this.kellyOrderBookCaches.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const cache = new RefreshableCache<Map<string, NormalizedOrderBook>>(config.polymarketOrderbookTtlMs, async () => {
+      const marketResult = await this.getKellyMarketCache(locationId, targetDate).get({ allowStaleOnError: true });
+      const tokenIds = marketResult.value.candidates
+        .filter((candidate) => candidate.parseStatus === "matched")
+        .flatMap((candidate) => [candidate.yesTokenId, candidate.noTokenId])
+        .filter((tokenId): tokenId is string => Boolean(tokenId));
+
+      if (!tokenIds.length) {
+        return new Map<string, NormalizedOrderBook>();
+      }
+
+      return await this.polymarketClient.fetchOrderBooks(tokenIds);
+    });
+
+    this.kellyOrderBookCaches.set(key, cache);
     return cache;
   }
 
@@ -682,6 +744,188 @@ export class MeteoblueWeatherService implements WeatherService {
         },
       );
     }
+  }
+
+  async getKellyWorkbench(
+    locationId: LocationInfo["id"],
+    options: KellyRequestOptions = {},
+  ): Promise<KellyWorkbenchResponse> {
+    const location = this.requireLocation(locationId);
+    const targetDate = resolveKellyTargetDate(location.timezone, options.targetDate);
+    const [hourly, report, insight] = await Promise.all([
+      this.getHourly(locationId, "1h", 24),
+      this.getWeatherReport(locationId),
+      this.getMultiModelInsight(locationId, options.selectedHourTimestamp, options.actualTemperatureC),
+    ]);
+    const targetDistributionTimestamp = resolveKellyDistributionTimestamp(insight.availableTimestamps, targetDate);
+
+    if (!targetDistributionTimestamp) {
+      throw new AppError(
+        400,
+        "BAD_REQUEST",
+        `Query parameter 'targetDate' is not available for this location: '${targetDate}'.`,
+      );
+    }
+
+    const distribution = await this.getMultiModelDistribution(locationId, targetDistributionTimestamp, 1);
+
+    const warnings: string[] = [];
+    let discoveryResult: PolymarketDiscoveryResult | null = null;
+    let discoveryFetchedAt: string | null = null;
+
+    try {
+      const marketResult = await this.getKellyMarketCache(locationId, targetDate).get({ allowStaleOnError: true });
+      discoveryResult = marketResult.value;
+      discoveryFetchedAt = discoveryResult.fetchedAt;
+      if (marketResult.stale) {
+        warnings.push("Polymarket 市场目录刷新失败，当前使用最近一次成功缓存。");
+      }
+      warnings.push(...buildDiscoveryWarnings(discoveryResult.candidates));
+    } catch {
+      warnings.push("Polymarket 市场目录暂时不可用，当前仅展示天气侧推导结果。");
+    }
+
+    let orderBooks = new Map<string, NormalizedOrderBook>();
+    let priceFetchedAt: string | null = null;
+
+    if (discoveryResult?.candidates.some((candidate) => candidate.parseStatus === "matched")) {
+      try {
+        const orderBookResult = await this.getKellyOrderBookCache(locationId, targetDate).get({
+          allowStaleOnError: true,
+          staleWhileRevalidate: true,
+        });
+        orderBooks = orderBookResult.value;
+        priceFetchedAt =
+          [...orderBooks.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]?.updatedAt ?? null;
+        if (orderBookResult.stale) {
+          warnings.push("Polymarket 盘口快照刷新失败，当前使用最近一次成功缓存。");
+        }
+      } catch {
+        warnings.push("Polymarket 盘口快照暂时不可用，当前仅展示公允概率与档位匹配。");
+      }
+    }
+
+    return buildKellyWorkbench({
+      location,
+      targetDate,
+      hourly,
+      report,
+      insight,
+      distribution,
+      discoveryCandidates: discoveryResult?.candidates ?? [],
+      discoveryFetchedAt,
+      sourceLinks:
+        discoveryResult?.sourceLinks ?? {
+          meteoblueWeekUrl: location.weekPageUrl,
+          meteoblueMultimodelUrl: location.multimodelPageUrl,
+          polymarketSearchUrl: `${config.polymarketGammaBaseUrl}/public-search?q=${encodeURIComponent(
+            `${location.cityName} weather ${targetDate}`,
+          )}`,
+          marketUrls: [],
+        },
+      orderBooks,
+      priceFetchedAt,
+      options,
+      warnings,
+    });
+  }
+
+  async createKellyStream(
+    locationId: LocationInfo["id"],
+    options: KellyRequestOptions,
+    onMessage: (message: KellyStreamMessage) => void,
+  ): Promise<KellyStreamHandle> {
+    const location = this.requireLocation(locationId);
+    const targetDate = resolveKellyTargetDate(location.timezone, options.targetDate);
+    const snapshot = await this.getKellyWorkbench(locationId, {
+      ...options,
+      targetDate,
+    });
+    const matchedMarkets = snapshot.markets.filter(
+      (market) => market.parseStatus === "matched" && market.yesTokenId && market.noTokenId,
+    );
+
+    if (!matchedMarkets.length) {
+      onMessage({
+        type: "status",
+        generatedAt: new Date().toISOString(),
+        state: "unavailable",
+        message: "当前没有可订阅的 Polymarket 盘口。",
+      });
+      return {
+        close() {},
+      };
+    }
+
+    let closed = false;
+    let pendingTimer: NodeJS.Timeout | null = null;
+    let lastTriggeredAt: string | null = null;
+
+    const emitSnapshot = async () => {
+      try {
+        const books = await this.polymarketClient.fetchOrderBooks(
+          matchedMarkets.flatMap((market) => [market.yesTokenId!, market.noTokenId!]),
+        );
+        const repriced = applyPricingToMarkets(snapshot.markets, books, {
+          bankroll: snapshot.bankroll,
+          riskMode: snapshot.riskMode,
+          minEdge: snapshot.minEdge,
+        });
+
+        onMessage({
+          type: "markets",
+          generatedAt: new Date().toISOString(),
+          markets: buildStreamMarketPatches(repriced),
+        });
+      } catch {
+        onMessage({
+          type: "status",
+          generatedAt: new Date().toISOString(),
+          state: "degraded",
+          message: "实时流收到信号，但本轮盘口同步失败。",
+        });
+      }
+    };
+
+    const upstreamStream = this.polymarketClient.createMarketStream(
+      matchedMarkets.flatMap((market) => [market.yesTokenId!, market.noTokenId!]),
+      onMessage,
+      (occurredAt) => {
+        lastTriggeredAt = occurredAt;
+        if (pendingTimer) {
+          return;
+        }
+
+        pendingTimer = setTimeout(async () => {
+          pendingTimer = null;
+          if (closed) {
+            return;
+          }
+          await emitSnapshot();
+          if (lastTriggeredAt) {
+            onMessage({
+              type: "status",
+              generatedAt: new Date().toISOString(),
+              state: "fresh",
+              message: `已根据 ${lastTriggeredAt} 的上游事件刷新盘口。`,
+            });
+          }
+        }, 300);
+      },
+    );
+
+    await emitSnapshot();
+
+    return {
+      async close() {
+        closed = true;
+        if (pendingTimer) {
+          clearTimeout(pendingTimer);
+          pendingTimer = null;
+        }
+        await upstreamStream.close();
+      },
+    };
   }
 
   async getUserFavorites(): Promise<UserFavoritesResponse> {

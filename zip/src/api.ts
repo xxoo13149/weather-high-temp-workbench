@@ -3,6 +3,7 @@ import type {
   ApiErrorPayload,
   DashboardResponse,
   HourlyWeatherResponse,
+  KellyWorkbenchResponse,
   MultiModelDistributionResponse,
   MultiModelInsightResponse,
   MultiModelStatusResponse,
@@ -138,6 +139,31 @@ export const weatherApi = {
       actualTemperatureC,
     }, init),
 
+  fetchKellyWorkbench: (
+    locationId?: string,
+    targetDate?: string,
+    bankroll?: number,
+    riskMode?: "conservative" | "balanced" | "aggressive",
+    minEdge?: number,
+    actualTemperatureC?: number,
+    selectedHour?: string,
+    init?: RequestInit,
+  ) =>
+    requestJson<KellyWorkbenchResponse>(
+      CONFIG.api.BASE_URL,
+      CONFIG.api.KELLY,
+      {
+        locationId,
+        targetDate,
+        bankroll,
+        riskMode,
+        minEdge,
+        actualTemperatureC,
+        selectedHour,
+      },
+      init,
+    ),
+
   fetchFavorites: () =>
     requestJson<UserFavoritesResponse>(CONFIG.api.USER_BASE_URL, CONFIG.api.FAVORITES),
 
@@ -158,6 +184,32 @@ export const weatherApi = {
       allowStale,
       ts: cacheBust,
     }),
+
+  buildKellyStreamUrl: (
+    locationId?: string,
+    targetDate?: string,
+    bankroll?: number,
+    riskMode?: "conservative" | "balanced" | "aggressive",
+    minEdge?: number,
+    actualTemperatureC?: number,
+    selectedHour?: string,
+  ) => {
+    const url = new URL(
+      buildUrl(CONFIG.api.BASE_URL, CONFIG.api.KELLY_STREAM, {
+        locationId,
+        targetDate,
+        bankroll,
+        riskMode,
+        minEdge,
+        actualTemperatureC,
+        selectedHour,
+      }),
+      window.location.origin,
+    );
+
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
+  },
 };
 
 export const getErrorMessage = (error: unknown, fallback: string) => {

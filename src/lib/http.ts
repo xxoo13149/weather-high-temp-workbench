@@ -6,13 +6,22 @@ const defaultHeaders = {
   "user-agent": config.userAgent,
 };
 
-const fetchWithHandling = async (url: string, errorCode: string, messagePrefix: string): Promise<Response> => {
+const fetchWithHandling = async (
+  url: string,
+  errorCode: string,
+  messagePrefix: string,
+  init?: RequestInit,
+): Promise<Response> => {
   let response: Response;
 
   try {
     response = await fetch(url, {
-      headers: defaultHeaders,
-      signal: AbortSignal.timeout(config.httpTimeoutMs),
+      ...init,
+      headers: {
+        ...defaultHeaders,
+        ...(init?.headers ?? {}),
+      },
+      signal: init?.signal ?? AbortSignal.timeout(config.httpTimeoutMs),
     });
   } catch (error) {
     throw new AppError(502, errorCode, `${messagePrefix} ${url}: ${String(error)}`, {
@@ -34,8 +43,8 @@ export const fetchText = async (url: string): Promise<string> => {
   return await response.text();
 };
 
-export const fetchJson = async <T>(url: string): Promise<T> => {
-  const response = await fetchWithHandling(url, "UPSTREAM_JSON_FETCH_FAILED", "Failed to fetch JSON");
+export const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
+  const response = await fetchWithHandling(url, "UPSTREAM_JSON_FETCH_FAILED", "Failed to fetch JSON", init);
 
   try {
     return (await response.json()) as T;

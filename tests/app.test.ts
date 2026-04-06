@@ -280,6 +280,127 @@ const createService = (): WeatherService => {
     }),
   );
 
+  const getKellyWorkbench = vi.fn().mockImplementation(
+    async (locationId: keyof typeof locationMap, options?: { targetDate?: string; bankroll?: number; riskMode?: string; minEdge?: number }) => ({
+      location: buildLocationInfo(locationId),
+      targetDate: options?.targetDate ?? "2026-03-28",
+      availableTargetDates: ["2026-03-28"],
+      generatedAt: "2026-03-27T15:30:00.000Z",
+      bankroll: options?.bankroll ?? 1000,
+      riskMode: options?.riskMode ?? "balanced",
+      riskMultiplier: 0.5,
+      minEdge: options?.minEdge ?? 0.02,
+      weatherEvidence: {
+        location: buildLocationInfo(locationId),
+        targetDate: options?.targetDate ?? "2026-03-28",
+        availableTargetDates: ["2026-03-28"],
+        currentReferenceTemperatureC: 20,
+        currentReferenceSource: "manual",
+        currentWeatherTimestamp: "2026-03-28T03:00:00+08:00",
+        currentModelTimestamp: "2026-03-28T03:00:00+08:00",
+        targetModelTimestamp: "2026-03-28T05:00:00+08:00",
+        sourceSummaryZh: reportZh,
+        hourlyPageUrl: `https://example.com/week/${locationId}`,
+        multimodelPageUrl: `https://example.com/multimodel/${locationId}`,
+        fetchedAt: "2026-03-27T15:30:00.000Z",
+        stale: false,
+        participatingModelCount: 1,
+        excludedModels: [],
+      },
+      distributionSummary: {
+        meanTemperatureC: 21,
+        medianTemperatureC: 21,
+        modeTemperatureC: 21,
+        mostLikelyRangeLabel: "21C - 22C",
+        shrink: 0.81,
+        usableModelCount: 1,
+        totalModelCount: 1,
+        peakSpreadC: 0,
+      },
+      probabilityCurve: [
+        { temperatureC: 20, density: 0.25, cumulative: 0.25 },
+        { temperatureC: 21, density: 0.45, cumulative: 0.7 },
+        { temperatureC: 22, density: 0.3, cumulative: 1 },
+      ],
+      bucketProbabilities: [
+        {
+          marketId: "range:21-22",
+          label: "21C - 22C",
+          contractType: "range",
+          bucketStartC: 21,
+          bucketEndC: 22,
+          probabilityYes: 0.45,
+          probabilityNo: 0.55,
+        },
+      ],
+      markets: [
+        {
+          marketId: "market-1",
+          slug: "market-1",
+          title: "Will the high temperature be at least 21C?",
+          marketUrl: "https://example.com/polymarket/market-1",
+          conditionId: "condition-1",
+          contractType: "atLeast",
+          unit: "C",
+          bucketStartC: 21,
+          bucketEndC: null,
+          bucketLabel: ">= 21C",
+          parseStatus: "matched",
+          exclusionReason: null,
+          yesTokenId: "yes-1",
+          noTokenId: "no-1",
+          yesPrice: 0.41,
+          noPrice: 0.59,
+          yesBestBid: 0.4,
+          yesBestAsk: 0.42,
+          noBestBid: 0.58,
+          noBestAsk: 0.6,
+          spreadPct: 0.02,
+          fairYes: 0.55,
+          fairNo: 0.45,
+          edgeYes: 0.13,
+          edgeNo: -0.15,
+          kellyYes: 0.1,
+          kellyNo: 0,
+          recommendedSide: "yes",
+          suggestedStake: 100,
+          updatedAt: "2026-03-27T15:30:00.000Z",
+        },
+      ],
+      recommendations: [
+        {
+          slot: "primary",
+          marketId: "market-1",
+          title: "Will the high temperature be at least 21C?",
+          marketUrl: "https://example.com/polymarket/market-1",
+          side: "yes",
+          edge: 0.13,
+          fairPrice: 0.55,
+          marketPrice: 0.42,
+          kellyFraction: 0.1,
+          suggestedStake: 100,
+          reason: "test",
+        },
+      ],
+      sourceLinks: {
+        meteoblueWeekUrl: `https://example.com/week/${locationId}`,
+        meteoblueMultimodelUrl: `https://example.com/multimodel/${locationId}`,
+        polymarketSearchUrl: `https://example.com/polymarket/search/${locationId}`,
+        marketUrls: ["https://example.com/polymarket/market-1"],
+      },
+      sourceStatus: [
+        {
+          kind: "weather",
+          state: "fresh",
+          label: "天气证据",
+          detail: "ok",
+          updatedAt: "2026-03-27T15:30:00.000Z",
+        },
+      ],
+      warnings: [],
+    }),
+  );
+
   return {
     getHourly,
     getWeatherReport,
@@ -287,6 +408,7 @@ const createService = (): WeatherService => {
     getMultiModelStatus,
     getMultiModelDistribution,
     getMultiModelInsight,
+    getKellyWorkbench,
     getUserFavorites: vi.fn().mockResolvedValue({
       fetchedAt: "2026-03-27T15:30:00.000Z",
       locationIds: ["shanghai_pvg"],
@@ -430,6 +552,35 @@ describe("createApp", () => {
     expect(response.headers["content-type"]).toContain("image/png");
     expect(service.getMultiModelImage).toHaveBeenCalledWith("miami_mia", false);
     expect(response.body).toBe("png");
+
+    await app.close();
+  });
+
+  test("returns a Kelly workbench snapshot for a locationId and targetDate", async () => {
+    const service = createService();
+    const app = createApp(service, { frontendDistDir });
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/weather/kelly?locationId=miami_mia&targetDate=2026-03-28&bankroll=2500&riskMode=aggressive&minEdge=0.03&actualTemperatureC=24.5",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(service.getKellyWorkbench).toHaveBeenCalledWith(
+      "miami_mia",
+      expect.objectContaining({
+        targetDate: "2026-03-28",
+        bankroll: 2500,
+        riskMode: "aggressive",
+        minEdge: 0.03,
+        actualTemperatureC: 24.5,
+      }),
+    );
+    expect(response.json()).toMatchObject({
+      location: { id: "miami_mia" },
+      targetDate: "2026-03-28",
+      markets: [expect.objectContaining({ marketId: "market-1" })],
+      recommendations: [expect.objectContaining({ marketId: "market-1" })],
+    });
 
     await app.close();
   });

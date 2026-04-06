@@ -13,6 +13,8 @@ export const CONFIG = {
     MULTIMODEL_STATUS: "/multimodel/status",
     MULTIMODEL_DISTRIBUTION: "/multimodel/distribution",
     MULTIMODEL_INSIGHTS: "/multimodel/insights",
+    KELLY: "/kelly",
+    KELLY_STREAM: "/kelly/stream",
     FAVORITES: "/favorites",
   },
   location: {

@@ -4,6 +4,7 @@ import { getErrorMessage, weatherApi } from "./api";
 import { AnalysisWorkspace } from "./components/AnalysisWorkspace";
 import { CommandHeader } from "./components/CommandHeader";
 import { InsightCard } from "./components/InsightCard";
+import { KellyWorkbench } from "./components/KellyWorkbench";
 import { LocationRail } from "./components/LocationRail";
 import { TerminalBackdrop } from "./components/terminal/TerminalBackdrop";
 import { WarningLines } from "./components/WarningLines";
@@ -29,8 +30,10 @@ import {
   type DistributionViewModel,
   type InsightViewModel,
 } from "./mappers";
+import { deriveKellyRecommendations } from "./kelly";
+import type { KellyRiskMode, KellyStreamMessage, KellyWorkbenchResponse } from "./types";
 
-type AppPath = "/" | "/analysis";
+type AppPath = "/" | "/analysis" | "/kelly";
 type RefreshState = "idle" | "pending" | "success" | "error";
 type TimezoneGroup = "asia" | "europe" | "americas";
 type AnalysisDataEnvelope<T> = {
@@ -43,6 +46,10 @@ type AnalysisDataEnvelope<T> = {
 
 interface RouteState extends AnalysisWorkspaceState {
   path: AppPath;
+  targetDate: string | null;
+  bankroll: number;
+  riskMode: KellyRiskMode;
+  minEdge: number;
 }
 
 const parseNumber = (value: string | null) => {
@@ -56,14 +63,24 @@ const parseNumber = (value: string | null) => {
 
 const parseRouteState = (): RouteState => {
   const url = new URL(window.location.href);
+  const pathname = url.pathname === "/analysis" ? "/analysis" : url.pathname === "/kelly" ? "/kelly" : "/";
 
   return {
-    path: url.pathname === "/analysis" ? "/analysis" : "/",
+    path: pathname,
     tab: url.searchParams.get("tab") === "image" ? "image" : "models",
     locationId: url.searchParams.get("locationId") ?? CONFIG.location.DEFAULT_ID,
     selectedInsightTimestamp: url.searchParams.get("timestamp"),
     actualTemperatureC: parseNumber(url.searchParams.get("actualTemperatureC")),
     selectedHourlyTimestamp: url.searchParams.get("selectedHour"),
+    targetDate: url.searchParams.get("targetDate"),
+    bankroll: parseNumber(url.searchParams.get("bankroll")) ?? 1000,
+    riskMode:
+      url.searchParams.get("riskMode") === "conservative" ||
+      url.searchParams.get("riskMode") === "aggressive" ||
+      url.searchParams.get("riskMode") === "balanced"
+        ? (url.searchParams.get("riskMode") as KellyRiskMode)
+        : "balanced",
+    minEdge: parseNumber(url.searchParams.get("minEdge")) ?? 0.02,
   };
 };
 
@@ -74,6 +91,10 @@ const buildRouteUrl = (state: RouteState) => {
 
   if (state.path === "/analysis") {
     url.searchParams.set("tab", state.tab);
+  }
+
+  if (state.path === "/kelly" && state.targetDate) {
+    url.searchParams.set("targetDate", state.targetDate);
   }
 
   if (state.locationId && state.locationId !== CONFIG.location.DEFAULT_ID) {
@@ -90,6 +111,18 @@ const buildRouteUrl = (state: RouteState) => {
 
   if (state.selectedHourlyTimestamp) {
     url.searchParams.set("selectedHour", state.selectedHourlyTimestamp);
+  }
+
+  if (state.path === "/kelly") {
+    if (state.bankroll !== 1000) {
+      url.searchParams.set("bankroll", String(state.bankroll));
+    }
+    if (state.riskMode !== "balanced") {
+      url.searchParams.set("riskMode", state.riskMode);
+    }
+    if (state.minEdge !== 0.02) {
+      url.searchParams.set("minEdge", String(state.minEdge));
+    }
   }
 
   return `${url.pathname}${url.search}`;
@@ -128,6 +161,14 @@ const resolveDefaultReferenceTemperature = (
   return items.find((item) => typeof item.temperatureC === "number")?.temperatureC ?? null;
 };
 
+const resolveTodayForTimezone = (timeZone: string) =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+
 const DEFAULT_ACTIVE_TIMEZONE_GROUP: TimezoneGroup = "asia";
 
 const buildAnalysisBatchKey = (
@@ -147,11 +188,21 @@ export default function App() {
   const [dashboard, setDashboard] = useState<DashboardViewModel | null>(null);
   const [insight, setInsight] = useState<InsightViewModel | null>(null);
   const [distribution, setDistribution] = useState<DistributionViewModel | null>(null);
+  const [kellySnapshot, setKellySnapshot] = useState<KellyWorkbenchResponse | null>(null);
+  const [loadingKelly, setLoadingKelly] = useState(false);
+  const [kellyError, setKellyError] = useState<string | null>(null);
+  const [kellyStreamState, setKellyStreamState] = useState<string>("idle");
+  const [kellyRefreshNonce, setKellyRefreshNonce] = useState(0);
 
   const [railExpanded, setRailExpanded] = useState(false);
   const [activeTimezoneGroup, setActiveTimezoneGroup] = useState<TimezoneGroup>(DEFAULT_ACTIVE_TIMEZONE_GROUP);
-  const [manualTemperatureText, setManualTemperatureText] = useState("");
-  const [referenceTemperatureMode, setReferenceTemperatureMode] = useState<"default" | "manual">("default");
+  const [manualTemperatureText, setManualTemperatureText] = useState(() => {
+    const initial = parseRouteState().actualTemperatureC;
+    return initial !== null ? String(initial) : "";
+  });
+  const [referenceTemperatureMode, setReferenceTemperatureMode] = useState<"default" | "manual">(
+    () => (parseRouteState().actualTemperatureC !== null ? "manual" : "default"),
+  );
   const [cacheBust, setCacheBust] = useState(Date.now());
   const [favoriteLocationIds, setFavoriteLocationIds] = useState<string[]>([]);
   const [favoritePendingIds, setFavoritePendingIds] = useState<string[]>([]);
@@ -182,10 +233,16 @@ export default function App() {
   const dashboardAbortRef = useRef<AbortController | null>(null);
   const insightAbortRef = useRef<AbortController | null>(null);
   const distributionAbortRef = useRef<AbortController | null>(null);
+  const kellyAbortRef = useRef<AbortController | null>(null);
+  const kellyRequestSeqRef = useRef(0);
+  const kellySocketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     const onPopState = () => {
-      setRouteState(parseRouteState());
+      const next = parseRouteState();
+      setRouteState(next);
+      setReferenceTemperatureMode(next.actualTemperatureC !== null ? "manual" : "default");
+      setManualTemperatureText(next.actualTemperatureC !== null ? String(next.actualTemperatureC) : "");
     };
 
     window.addEventListener("popstate", onPopState);
@@ -234,6 +291,8 @@ export default function App() {
   useEffect(
     () => () => {
       clearRefreshResetTimer();
+      kellyAbortRef.current?.abort();
+      kellySocketRef.current?.close();
     },
     [],
   );
@@ -414,6 +473,25 @@ export default function App() {
     }
   }, [dashboard?.locationDirectory, routeState.locationId]);
 
+  useEffect(() => {
+    if (routeState.path !== "/kelly") {
+      return;
+    }
+
+    const locationTimezone =
+      dashboard?.locationDirectory.find((location) => location.id === routeState.locationId)?.timezone ??
+      dashboard?.hourly.locationTimezone;
+
+    if (!locationTimezone || routeState.targetDate) {
+      return;
+    }
+
+    updateRouteState((current) => ({
+      ...current,
+      targetDate: resolveTodayForTimezone(locationTimezone),
+    }));
+  }, [dashboard?.hourly.locationTimezone, dashboard?.locationDirectory, routeState.locationId, routeState.path, routeState.targetDate]);
+
   const items = dashboard?.hourly.items ?? [];
   const selectedIndex = items.findIndex((item) => item.timestamp === routeState.selectedHourlyTimestamp);
   const selectedItem = items[selectedIndex >= 0 ? selectedIndex : 0] ?? null;
@@ -495,7 +573,7 @@ export default function App() {
   }, [dashboard?.locationDirectory, locationTemperatures]);
 
   useEffect(() => {
-    if (!dashboard) {
+    if (!dashboard || routeState.path === "/kelly") {
       setInsight(null);
       setLatestInsightEnvelope(null);
       return;
@@ -557,7 +635,7 @@ export default function App() {
       cancelled = true;
       controller.abort();
     };
-  }, [dashboard?.generatedAt, routeState.actualTemperatureC, routeState.locationId, routeState.selectedInsightTimestamp]);
+  }, [dashboard?.generatedAt, routeState.actualTemperatureC, routeState.locationId, routeState.path, routeState.selectedInsightTimestamp]);
 
   useEffect(() => {
     if (!insight) {
@@ -646,6 +724,71 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    if (routeState.path !== "/kelly" || !dashboard || !routeState.targetDate) {
+      return;
+    }
+
+    let cancelled = false;
+    const requestSeq = kellyRequestSeqRef.current + 1;
+    kellyRequestSeqRef.current = requestSeq;
+    kellyAbortRef.current?.abort();
+    const controller = new AbortController();
+    kellyAbortRef.current = controller;
+    setLoadingKelly(true);
+    setKellyStreamState("connecting");
+
+    const load = async () => {
+      try {
+        const response = await weatherApi.fetchKellyWorkbench(
+          routeState.locationId,
+          routeState.targetDate ?? undefined,
+          routeState.bankroll,
+          routeState.riskMode,
+          routeState.minEdge,
+          routeState.actualTemperatureC ?? undefined,
+          routeState.selectedHourlyTimestamp ?? undefined,
+          { signal: controller.signal },
+        );
+
+        if (cancelled || requestSeq !== kellyRequestSeqRef.current) {
+          return;
+        }
+
+        setKellySnapshot(response);
+        setKellyError(null);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+        if (!cancelled && requestSeq === kellyRequestSeqRef.current) {
+          setKellyError(getErrorMessage(error, "Kelly 实验台读取失败。"));
+        }
+      } finally {
+        if (!cancelled && requestSeq === kellyRequestSeqRef.current) {
+          setLoadingKelly(false);
+        }
+        if (kellyAbortRef.current === controller) {
+          kellyAbortRef.current = null;
+        }
+      }
+    };
+
+    void load();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [
+    dashboard?.generatedAt,
+    kellyRefreshNonce,
+    routeState.actualTemperatureC,
+    routeState.locationId,
+    routeState.path,
+    routeState.selectedHourlyTimestamp,
+    routeState.targetDate,
+  ]);
+
+  useEffect(() => {
     if (!latestInsightEnvelope || !latestDistributionEnvelope) {
       return;
     }
@@ -668,6 +811,8 @@ export default function App() {
   const imageUrl = dashboard ? weatherApi.buildMultiModelImageUrl(routeState.locationId, true, cacheBust) : null;
   const imageUpdatedAt = dashboard?.multimodel.displayUpdatedAt ?? dashboard?.sync.updatedAt ?? null;
   const isAnalysis = routeState.path === "/analysis";
+  const isKelly = routeState.path === "/kelly";
+  const currentPage = isKelly ? "kelly" : isAnalysis ? "analysis" : "home";
 
   useEffect(() => {
     if (!imageUrl || !dashboard?.multimodel.imageUrlFound) {
@@ -678,6 +823,122 @@ export default function App() {
     preview.decoding = "async";
     preview.src = imageUrl;
   }, [dashboard?.multimodel.imageUrlFound, imageUrl]);
+
+  useEffect(() => {
+    if (routeState.path !== "/kelly" || !routeState.targetDate || !kellySnapshot) {
+      kellySocketRef.current?.close();
+      kellySocketRef.current = null;
+      return;
+    }
+
+    const socket = new WebSocket(
+      weatherApi.buildKellyStreamUrl(
+        routeState.locationId,
+        routeState.targetDate ?? undefined,
+        routeState.bankroll,
+        routeState.riskMode,
+        routeState.minEdge,
+        routeState.actualTemperatureC ?? undefined,
+        routeState.selectedHourlyTimestamp ?? undefined,
+      ),
+    );
+
+    kellySocketRef.current?.close();
+    kellySocketRef.current = socket;
+    setKellyStreamState("connecting");
+
+    socket.onopen = () => {
+      setKellyStreamState("connected");
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data) as KellyStreamMessage;
+        if (message.type === "status") {
+          setKellyStreamState(message.state);
+          return;
+        }
+
+        setKellyStreamState("connected");
+        setKellySnapshot((current) => {
+          if (!current) {
+            return current;
+          }
+
+          const updates = new Map(message.markets.map((market) => [market.marketId, market]));
+          const nextMarkets = current.markets.map((market) => {
+            const patch = updates.get(market.marketId);
+            return patch
+              ? {
+                  ...market,
+                  yesPrice: patch.yesPrice,
+                  noPrice: patch.noPrice,
+                  yesBestBid: patch.yesBestBid,
+                  yesBestAsk: patch.yesBestAsk,
+                  noBestBid: patch.noBestBid,
+                  noBestAsk: patch.noBestAsk,
+                  spreadPct: patch.spreadPct,
+                  edgeYes: patch.edgeYes,
+                  edgeNo: patch.edgeNo,
+                  kellyYes: patch.kellyYes,
+                  kellyNo: patch.kellyNo,
+                  recommendedSide: patch.recommendedSide,
+                  suggestedStake: patch.suggestedStake,
+                  updatedAt: patch.updatedAt,
+                }
+              : market;
+          });
+
+          return {
+            ...current,
+            generatedAt: message.generatedAt,
+            markets: nextMarkets,
+            recommendations: deriveKellyRecommendations(nextMarkets, routeState.bankroll, routeState.riskMode, routeState.minEdge),
+            sourceStatus: current.sourceStatus.map((status) =>
+              status.kind === "stream"
+                ? {
+                    ...status,
+                    state: "fresh",
+                    detail: "已收到实时盘口更新。",
+                    updatedAt: message.generatedAt,
+                  }
+                : status,
+            ),
+          } satisfies KellyWorkbenchResponse;
+        });
+      } catch {
+        setKellyStreamState("degraded");
+      }
+    };
+
+    socket.onclose = () => {
+      if (kellySocketRef.current === socket) {
+        setKellyStreamState("disconnected");
+      }
+    };
+
+    socket.onerror = () => {
+      setKellyStreamState("degraded");
+    };
+
+    return () => {
+      socket.close();
+      if (kellySocketRef.current === socket) {
+        kellySocketRef.current = null;
+      }
+    };
+  }, [
+    kellySnapshot?.location.id,
+    kellySnapshot?.targetDate,
+    routeState.actualTemperatureC,
+    routeState.bankroll,
+    routeState.locationId,
+    routeState.minEdge,
+    routeState.path,
+    routeState.riskMode,
+    routeState.selectedHourlyTimestamp,
+    routeState.targetDate,
+  ]);
 
   const currentAnalysisKey = buildAnalysisBatchKey(
     routeState.locationId,
@@ -746,32 +1007,37 @@ export default function App() {
   const locationGroups = useMemo(() => buildDockLocationGroups(locations), [locations]);
 
   const dashboardMatchesRoute = dashboard?.hourly.location.id === routeState.locationId;
-  const homepageReady = Boolean(dashboard) && dashboardMatchesRoute && !dashboardError;
+  const workspaceReady = Boolean(dashboard) && dashboardMatchesRoute && !dashboardError;
   const peakSummary = displayedAnalysisInsight
     ? buildPeakSummary(displayedAnalysisInsight.peakTimeDistribution, activeLocationTimezone)
     : UI_TEXT.analysis.peakSummaryLoading;
 
   return (
     <div
-      className={`weather-shell ${railExpanded ? "weather-shell-rail-open" : ""} ${isAnalysis ? "weather-shell-analysis" : "weather-shell-home"}`}
-      data-page={isAnalysis ? "analysis" : "home"}
+      className={`weather-shell ${railExpanded ? "weather-shell-rail-open" : ""} ${currentPage === "analysis" ? "weather-shell-analysis" : currentPage === "kelly" ? "weather-shell-kelly" : "weather-shell-home"}`}
+      data-page={currentPage}
     >
       <TerminalBackdrop />
 
       <CommandHeader
-        locationName={homeViewModel.locationName}
+        locationName={kellySnapshot?.location.name ?? homeViewModel.locationName}
         locationTimezone={activeLocationTimezone}
         updatedAt={dashboard?.sync.updatedAt ?? null}
         syncState={dashboard?.sync.state ?? "fresh"}
         refreshState={refreshState}
-        refreshDisabled={loadingDashboard}
-        isAnalysis={isAnalysis}
+        refreshDisabled={loadingDashboard || (isKelly && loadingKelly)}
+        currentPage={currentPage}
         railExpanded={railExpanded}
         favorite={favoriteLocationIds.includes(routeState.locationId)}
         favoriteDisabled={favoritePendingIds.includes(routeState.locationId)}
         favoriteError={favoritesError}
         onToggleRail={() => setRailExpanded((current) => !current)}
-        onRefresh={() => void refreshDashboard(true, routeState.locationId)}
+        onRefresh={() => {
+          void refreshDashboard(true, routeState.locationId);
+          if (isKelly) {
+            setKellyRefreshNonce((current) => current + 1);
+          }
+        }}
         onToggleFavorite={() => void toggleFavorite(routeState.locationId)}
         onNavigateHome={() => {
           setRailExpanded(false);
@@ -793,11 +1059,21 @@ export default function App() {
             "push",
           );
         }}
+        onNavigateKelly={() => {
+          setRailExpanded(false);
+          updateRouteState(
+            (current) => ({
+              ...current,
+              path: "/kelly",
+            }),
+            "push",
+          );
+        }}
       />
 
       {dashboardError ? <WarningLines items={[dashboardError]} /> : null}
 
-      {!homepageReady && !dashboardError ? (
+      {!workspaceReady && !dashboardError ? (
         <section className="terminal-panel flex flex-1 items-center justify-center px-6 py-10">
           <div className="panel-section text-center">
             <div className="eyebrow">{UI_TEXT.app.loadingEyebrow}</div>
@@ -807,7 +1083,7 @@ export default function App() {
         </section>
       ) : null}
 
-      {homepageReady ? (
+      {workspaceReady ? (
         <div className={`${isAnalysis ? "analysis-layout-shell" : "terminal-layout"} workspace-stage`}>
           <LocationRail
             expanded={railExpanded}
@@ -828,6 +1104,10 @@ export default function App() {
               setLatestDistributionEnvelope(null);
               setAnalysisSnapshot(null);
               setLastConsistentAnalysisKey(null);
+              setKellySnapshot(null);
+              setKellyError(null);
+              setKellyStreamState("idle");
+              kellySocketRef.current?.close();
               setDashboardError(null);
               setInsightError(null);
               setDistributionError(null);
@@ -837,6 +1117,7 @@ export default function App() {
                 actualTemperatureC: null,
                 selectedInsightTimestamp: null,
                 selectedHourlyTimestamp: null,
+                targetDate: current.path === "/kelly" ? null : current.targetDate,
               }));
             }}
             onToggleFavorite={(id) => void toggleFavorite(id)}
@@ -880,6 +1161,90 @@ export default function App() {
                     "push",
                   )
                 }
+              />
+            </div>
+          ) : isKelly ? (
+            <div className={`workspace-shell workspace-shell-kelly-stage ${railExpanded ? "workspace-shell-muted" : ""}`}>
+              <KellyWorkbench
+                snapshot={kellySnapshot}
+                locations={dashboard.locationDirectory}
+                activeLocationId={routeState.locationId}
+                timezone={activeLocationTimezone}
+                bankroll={routeState.bankroll}
+                riskMode={routeState.riskMode}
+                minEdge={routeState.minEdge}
+                actualTemperatureText={manualTemperatureText}
+                loading={loadingKelly}
+                error={kellyError}
+                streamState={kellyStreamState}
+                onLocationChange={(locationId) => {
+                  setReferenceTemperatureMode("default");
+                  setManualTemperatureText("");
+                  setDashboard(null);
+                  setInsight(null);
+                  setDistribution(null);
+                  setKellySnapshot(null);
+                  setKellyError(null);
+                  setKellyStreamState("idle");
+                  setDashboardError(null);
+                  setInsightError(null);
+                  setDistributionError(null);
+                  kellySocketRef.current?.close();
+                  updateRouteState(
+                    (current) => ({
+                      ...current,
+                      locationId,
+                      actualTemperatureC: null,
+                      selectedInsightTimestamp: null,
+                      selectedHourlyTimestamp: null,
+                      targetDate: null,
+                    }),
+                    "push",
+                  );
+                }}
+                onTargetDateChange={(targetDate) =>
+                  updateRouteState(
+                    (current) => ({
+                      ...current,
+                      targetDate,
+                    }),
+                    "push",
+                  )
+                }
+                onBankrollChange={(bankrollValue) =>
+                  updateRouteState((current) => ({
+                    ...current,
+                    bankroll: bankrollValue && Number.isFinite(bankrollValue) && bankrollValue > 0 ? bankrollValue : 1000,
+                  }))
+                }
+                onRiskModeChange={(nextRiskMode) =>
+                  updateRouteState((current) => ({
+                    ...current,
+                    riskMode: nextRiskMode,
+                  }))
+                }
+                onMinEdgeChange={(nextMinEdge) =>
+                  updateRouteState((current) => ({
+                    ...current,
+                    minEdge:
+                      nextMinEdge !== null && Number.isFinite(nextMinEdge) && nextMinEdge >= 0
+                        ? Math.min(1, Math.max(0, nextMinEdge))
+                        : 0.02,
+                  }))
+                }
+                onActualTemperatureChange={(value) => {
+                  setReferenceTemperatureMode(value.trim() ? "manual" : "default");
+                  setManualTemperatureText(value);
+                  const parsed = Number.parseFloat(value);
+                  updateRouteState((current) => ({
+                    ...current,
+                    actualTemperatureC: Number.isFinite(parsed) ? parsed : null,
+                  }));
+                }}
+                onRefresh={() => {
+                  void refreshDashboard(true, routeState.locationId);
+                  setKellyRefreshNonce((current) => current + 1);
+                }}
               />
             </div>
           ) : (

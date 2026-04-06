@@ -1,11 +1,12 @@
 ﻿import { readFile, stat } from "node:fs/promises";
 import { extname, normalize, resolve, sep } from "node:path";
 
+import websocket from "@fastify/websocket";
 import Fastify from "fastify";
 
 import { DEFAULT_LOCATION, LOCATION_DIRECTORY, LOCATION_REGISTRY } from "./config.js";
 import { AppError, isAppError } from "./domain/errors.js";
-import type { HourlyMode, LocationDirectoryEntry, LocationInfo, WeatherService } from "./domain/weather.js";
+import type { HourlyMode, KellyRiskMode, LocationDirectoryEntry, LocationInfo, WeatherService } from "./domain/weather.js";
 import { MeteoblueWeatherService } from "./providers/meteoblue/service.js";
 
 interface CreateAppOptions {
@@ -89,6 +90,64 @@ const parseActualTemperatureC = (raw: unknown): number | undefined => {
   const value = Number.parseFloat(raw);
   if (!Number.isFinite(value)) {
     throw new AppError(400, "BAD_REQUEST", "Query parameter 'actualTemperatureC' must be a finite number.");
+  }
+
+  return value;
+};
+
+const parseKellyTargetDate = (raw: unknown): string | undefined => {
+  if (raw === undefined || raw === "") {
+    return undefined;
+  }
+
+  if (typeof raw !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'targetDate' must use YYYY-MM-DD format.");
+  }
+
+  return raw;
+};
+
+const parseBankroll = (raw: unknown): number | undefined => {
+  if (raw === undefined || raw === "") {
+    return undefined;
+  }
+
+  if (typeof raw !== "string") {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'bankroll' must be a positive number.");
+  }
+
+  const value = Number.parseFloat(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'bankroll' must be a positive number.");
+  }
+
+  return value;
+};
+
+const parseKellyRiskMode = (raw: unknown): KellyRiskMode | undefined => {
+  if (raw === undefined || raw === "") {
+    return undefined;
+  }
+
+  if (raw === "conservative" || raw === "balanced" || raw === "aggressive") {
+    return raw;
+  }
+
+  throw new AppError(400, "BAD_REQUEST", "Query parameter 'riskMode' must be conservative, balanced, or aggressive.");
+};
+
+const parseKellyMinEdge = (raw: unknown): number | undefined => {
+  if (raw === undefined || raw === "") {
+    return undefined;
+  }
+
+  if (typeof raw !== "string") {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'minEdge' must be between 0 and 1.");
+  }
+
+  const value = Number.parseFloat(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'minEdge' must be between 0 and 1.");
   }
 
   return value;
@@ -196,6 +255,7 @@ export const createApp = (
   const app = Fastify({
     logger: false,
   });
+  void app.register(websocket);
 
   const frontendDistDir = options.frontendDistDir ?? defaultFrontendDistDir;
   const buildId = process.env.BUILD_ID ?? `local-${Date.now().toString(36)}`;
@@ -299,6 +359,94 @@ export const createApp = (
 
     return await service.getMultiModelInsight(locationId, timestamp, actualTemperatureC);
   });
+
+  app.get("/api/weather/kelly", async (request) => {
+    if (!service.getKellyWorkbench) {
+      throw new AppError(503, "KELLY_UNAVAILABLE", "Kelly workbench is not configured.", {
+        retryable: false,
+      });
+    }
+
+    const query = (request.query as Record<string, unknown> | undefined) ?? {};
+    const locationId = parseQueryLocationId(query.locationId);
+    const targetDate = parseKellyTargetDate(query.targetDate);
+    const bankroll = parseBankroll(query.bankroll);
+    const riskMode = parseKellyRiskMode(query.riskMode);
+    const minEdge = parseKellyMinEdge(query.minEdge);
+    const actualTemperatureC = parseActualTemperatureC(query.actualTemperatureC);
+    const selectedHourTimestamp = parseTimestamp(query.selectedHour);
+
+    return await service.getKellyWorkbench(locationId, {
+      targetDate,
+      bankroll,
+      riskMode,
+      minEdge,
+      actualTemperatureC,
+      selectedHourTimestamp,
+    });
+  });
+
+  app.get(
+    "/api/weather/kelly/stream",
+    { websocket: true },
+    async (socket, request) => {
+      if (!service.createKellyStream) {
+        socket.send(
+          JSON.stringify({
+            type: "status",
+            generatedAt: new Date().toISOString(),
+            state: "unavailable",
+            message: "Kelly stream is not configured.",
+          }),
+        );
+        socket.close();
+        return;
+      }
+
+      const query = (request.query as Record<string, unknown> | undefined) ?? {};
+
+      try {
+        const locationId = parseQueryLocationId(query.locationId);
+        const targetDate = parseKellyTargetDate(query.targetDate);
+        const bankroll = parseBankroll(query.bankroll);
+        const riskMode = parseKellyRiskMode(query.riskMode);
+        const minEdge = parseKellyMinEdge(query.minEdge);
+        const actualTemperatureC = parseActualTemperatureC(query.actualTemperatureC);
+        const selectedHourTimestamp = parseTimestamp(query.selectedHour);
+
+        const stream = await service.createKellyStream(
+          locationId,
+          {
+            targetDate,
+            bankroll,
+            riskMode,
+            minEdge,
+            actualTemperatureC,
+            selectedHourTimestamp,
+          },
+          (message) => {
+            socket.send(JSON.stringify(message));
+          },
+        );
+
+        socket.on("close", async () => {
+          await stream.close();
+        });
+      } catch (error) {
+        const appError =
+          error instanceof AppError ? error : new AppError(500, "KELLY_STREAM_ERROR", "Kelly stream failed to initialize.");
+        socket.send(
+          JSON.stringify({
+            type: "status",
+            generatedAt: new Date().toISOString(),
+            state: "degraded",
+            message: appError.message,
+          }),
+        );
+        socket.close();
+      }
+    },
+  );
 
   app.get("/api/user/favorites", async () => {
     if (!service.getUserFavorites) {

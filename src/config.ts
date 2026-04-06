@@ -180,7 +180,13 @@ export const config = {
   weekPageTtlMs: readNumber("WEEK_PAGE_TTL_MS", 90_000),
   multimodelImageTtlMs: readNumber("MULTIMODEL_IMAGE_TTL_MS", 300_000),
   multimodelDistributionTtlMs: readNumber("MULTIMODEL_STATS_TTL_MS", 120_000),
+  polymarketMarketTtlMs: readNumber("POLYMARKET_MARKET_TTL_MS", 60_000),
+  polymarketOrderbookTtlMs: readNumber("POLYMARKET_ORDERBOOK_TTL_MS", 5_000),
   httpTimeoutMs: readNumber("HTTP_TIMEOUT_MS", 15_000),
+  polymarketGammaBaseUrl: process.env.POLYMARKET_GAMMA_BASE_URL ?? "https://gamma-api.polymarket.com",
+  polymarketClobBaseUrl: process.env.POLYMARKET_CLOB_BASE_URL ?? "https://clob.polymarket.com",
+  polymarketClobWsUrl:
+    process.env.POLYMARKET_CLOB_WS_URL ?? "wss://ws-subscriptions-clob.polymarket.com/ws/market",
   userAgent:
     process.env.USER_AGENT ??
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) weather-relay/0.2",
