@@ -136,6 +136,14 @@ const resolveEntrySource = (book: InternalOrderBook | undefined): KellyEntrySour
   return "unavailable";
 };
 
+const resolveDisplayUnit = (markets: KellyMarketRow[]): KellyTemperatureUnit => {
+  const counts: Record<KellyTemperatureUnit, number> = { C: 0, F: 0 };
+  for (const market of markets) {
+    counts[market.unit] = (counts[market.unit] ?? 0) + 1;
+  }
+  return counts.F > counts.C ? "F" : "C";
+};
+
 const resolveMarketLifecycle = ({
   market,
   yesBook,
@@ -1422,6 +1430,7 @@ export const buildKellyWorkbench = ({
     riskMode,
     minEdge,
   });
+  const displayUnit = resolveDisplayUnit(pricedMarkets);
   const activeMarkets = pricedMarkets.filter(
     (market) => market.parseStatus === "matched" && market.lifecycle === "tradable" && hasExecutableEntry(market),
   );
@@ -1536,6 +1545,7 @@ export const buildKellyWorkbench = ({
     riskMode,
     riskMultiplier: RISK_PROFILE[riskMode].multiplier,
     minEdge,
+    displayUnit,
     weatherEvidence,
     distributionSummary,
     probabilityCurve: curve,

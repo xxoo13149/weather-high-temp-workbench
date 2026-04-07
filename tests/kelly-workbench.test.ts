@@ -567,4 +567,34 @@ describe("buildKellyWorkbench", () => {
       vi.useRealTimers();
     }
   });
+
+  test("resolves Fahrenheit display unit when most markets report F", () => {
+    const args = createBuildArgs();
+    const fCandidates = args.discoveryCandidates.slice(0, 2).map((candidate) => ({
+      ...candidate,
+      unit: "F" as const,
+      bucketLabel: candidate.bucketLabel.replace("C", "F"),
+    }));
+    args.discoveryCandidates = fCandidates;
+    const allowedTokens = new Set(
+      fCandidates.flatMap((candidate) => [candidate.yesTokenId, candidate.noTokenId].filter(Boolean)),
+    );
+    args.orderBooks = new Map(
+      [...args.orderBooks].filter(([tokenId]) => allowedTokens.has(tokenId)),
+    );
+
+    const result = buildKellyWorkbench(args);
+    expect(result.markets.length).toBeGreaterThan(0);
+    expect(result.displayUnit).toBe("F");
+  });
+
+  test("defaults display unit to Celsius when no markets exist", () => {
+    const args = createBuildArgs();
+    args.discoveryCandidates = [];
+    args.orderBooks = new Map();
+
+    const result = buildKellyWorkbench(args);
+    expect(result.markets).toHaveLength(0);
+    expect(result.displayUnit).toBe("C");
+  });
 });

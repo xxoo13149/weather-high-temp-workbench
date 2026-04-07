@@ -5,6 +5,8 @@ import type { KellyProbabilityPanelData } from "@/lib/kelly";
 import { buildKellyCurveGeometry, projectKellyCurveX } from "@/lib/kelly";
 import { cn } from "@/lib/utils";
 import { formatNumber } from "@/utils";
+import type { KellyTemperatureUnit } from "@/types";
+import { convertAbsoluteTemperature } from "@/components/kelly/temperature";
 
 type KellyProbabilityStageProps = {
   probability: KellyProbabilityPanelData;
@@ -35,6 +37,10 @@ export const KellyProbabilityStage = ({ probability, selectedMarketId }: KellyPr
     () => buildKellyCurveGeometry(probability.samples, CHART_WIDTH, CHART_HEIGHT),
     [probability.samples],
   );
+
+  const displayUnit: KellyTemperatureUnit = probability.displayUnit;
+  const formatAxisTemperature = (value: number) =>
+    `${formatNumber(convertAbsoluteTemperature(value, displayUnit), 0)}°${displayUnit}`;
 
   return (
     <section className="kelly-block kelly-block--muted">
@@ -166,7 +172,7 @@ export const KellyProbabilityStage = ({ probability, selectedMarketId }: KellyPr
                     fontSize="10"
                     textAnchor="middle"
                   >
-                    {formatNumber(point.source.temperatureC, 0)}°C
+                    {formatAxisTemperature(point.source.temperatureC)}
                   </text>
                 </g>
               ))}
@@ -192,7 +198,7 @@ export const KellyProbabilityStage = ({ probability, selectedMarketId }: KellyPr
                 <article key={marker.id} className={cn("kelly-threshold-item", active && "is-active")}>
                   <div className="kelly-threshold-item__title">
                     <span>{marker.label}</span>
-                    <strong className="data-mono">{formatNumber(marker.temperatureC, 0)}°C</strong>
+                    <strong className="data-mono">{formatAxisTemperature(marker.temperatureC)}</strong>
                   </div>
                   {marker.detail ? <div className="kelly-threshold-item__detail">{marker.detail}</div> : null}
                 </article>

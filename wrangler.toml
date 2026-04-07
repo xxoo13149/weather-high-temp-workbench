@@ -1,0 +1,17 @@
+name = "weather-high-temp-workbench"
+main = "src/cloudflare/worker.ts"
+compatibility_date = "2026-04-08"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./zip/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[vars]
+HOST = "0.0.0.0"
+PORT = "8787"
+
+[[routes]]
+pattern = "lukaluka.fun"
+custom_domain = true

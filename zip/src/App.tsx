@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 
 import { getErrorMessage, weatherApi } from "./api";
-import { AnalysisWorkspace } from "./components/AnalysisWorkspace";
 import { CommandHeader } from "./components/CommandHeader";
 import { InsightCard } from "./components/InsightCard";
-import { KellyWorkbench } from "./components/KellyWorkbench";
 import { LocationRail } from "./components/LocationRail";
 import { TerminalBackdrop } from "./components/terminal/TerminalBackdrop";
 import { WarningLines } from "./components/WarningLines";
-import { WeatherOverview } from "./components/WeatherOverview";
+const LazyWeatherOverview = lazy(() => import("./components/WeatherOverview").then((mod) => ({ default: mod.WeatherOverview })));
+const LazyAnalysisWorkspace = lazy(() =>
+  import("./components/AnalysisWorkspace").then((mod) => ({ default: mod.AnalysisWorkspace })),
+);
+const LazyKellyWorkbench = lazy(() => import("./components/KellyWorkbench").then((mod) => ({ default: mod.KellyWorkbench })));
 import { CONFIG } from "./config";
 import {
   UI_TEXT,
@@ -398,6 +400,22 @@ const resolveKellySourceState = (
 
   return "unavailable";
 };
+
+const RouteSurfaceFallback = ({
+  title,
+  detail,
+}: {
+  title: string;
+  detail: string;
+}) => (
+  <section className="terminal-panel">
+    <div className="panel-section">
+      <div className="eyebrow">按需加载</div>
+      <h2 className="mt-3 text-xl font-semibold text-white">{title}</h2>
+      <p className="mt-3 text-sm text-white/64">{detail}</p>
+    </div>
+  </section>
+);
 
 export default function App() {
   const [routeState, setRouteState] = useState<RouteState>(() => parseRouteState());
@@ -2329,113 +2347,140 @@ export default function App() {
 
           {isAnalysis ? (
             <div className={`workspace-shell workspace-shell-analysis-stage ${railExpanded || isLocationTransitionPending ? "workspace-shell-muted" : ""}`}>
-              <AnalysisWorkspace
-                tab={routeState.tab}
-                insight={displayedAnalysisInsight}
-                distribution={displayedAnalysisDistribution}
-                dashboard={dashboard}
-                locationTimezone={activeLocationTimezone}
-                imageUrl={imageUrl}
-                imageUpdatedAt={imageUpdatedAt}
-                loadingInsight={loadingInsight}
-                loadingDistribution={loadingDistribution}
-                insightError={insightError}
-                distributionError={distributionError}
-                actualTemperatureC={routeState.actualTemperatureC}
-                warnings={translatedWarnings}
-                peakSummary={peakSummary}
-                analysisKey={currentAnalysisKey}
-                lastConsistentAnalysisKey={lastConsistentAnalysisKey}
-                onTabChange={(tabValue) =>
-                  updateRouteState(
-                    (current) => ({
-                      ...current,
-                      path: "/analysis",
-                      tab: tabValue,
-                    }),
-                    "push",
-                  )
+              <Suspense
+                fallback={
+                  <RouteSurfaceFallback
+                    title="分析工作区加载中..."
+                    detail="正在按需加载模型与图像工作面。"
+                  />
                 }
-              />
+              >
+                <LazyAnalysisWorkspace
+                  tab={routeState.tab}
+                  insight={displayedAnalysisInsight}
+                  distribution={displayedAnalysisDistribution}
+                  dashboard={dashboard}
+                  locationTimezone={activeLocationTimezone}
+                  imageUrl={imageUrl}
+                  imageUpdatedAt={imageUpdatedAt}
+                  loadingInsight={loadingInsight}
+                  loadingDistribution={loadingDistribution}
+                  insightError={insightError}
+                  distributionError={distributionError}
+                  actualTemperatureC={routeState.actualTemperatureC}
+                  warnings={translatedWarnings}
+                  peakSummary={peakSummary}
+                  analysisKey={currentAnalysisKey}
+                  lastConsistentAnalysisKey={lastConsistentAnalysisKey}
+                  onTabChange={(tabValue) =>
+                    updateRouteState(
+                      (current) => ({
+                        ...current,
+                        path: "/analysis",
+                        tab: tabValue,
+                      }),
+                      "push",
+                    )
+                  }
+                />
+              </Suspense>
             </div>
           ) : isKelly ? (
             <div className={`workspace-shell workspace-shell-kelly-stage ${railExpanded || isLocationTransitionPending ? "workspace-shell-muted" : ""}`}>
-              <KellyWorkbench
-                snapshot={kellySnapshot}
-                locations={dashboard.locationDirectory}
-                activeLocationId={routeState.locationId}
-                timezone={activeLocationTimezone}
-                bankrollInput={kellyDraftControls.bankrollInput}
-                riskMode={kellyDraftControls.riskMode}
-                minEdgeInput={kellyDraftControls.minEdgeInput}
-                actualTemperatureText={kellyDraftControls.actualTemperatureText}
-                draftDirty={kellyDraftDirty}
-                fieldErrors={kellyFieldErrors}
-                loading={loadingKelly}
-                refreshing={manualRefreshingKelly}
-                refreshDisabled={kellyRefreshDisabled}
-                error={kellyError}
-                streamState={kellyStreamState}
-                onLocationChange={(locationId) => {
-                  void transitionToLocation(locationId, "push");
-                }}
-                onTargetDateChange={(targetDate) =>
-                  updateRouteState(
-                    (current) => ({
+              <Suspense
+                fallback={
+                  <RouteSurfaceFallback
+                    title="Kelly 实验台加载中..."
+                    detail="正在按需加载盘口决策工作面。"
+                  />
+                }
+              >
+                <LazyKellyWorkbench
+                  snapshot={kellySnapshot}
+                  locations={dashboard.locationDirectory}
+                  activeLocationId={routeState.locationId}
+                  timezone={activeLocationTimezone}
+                  bankrollInput={kellyDraftControls.bankrollInput}
+                  riskMode={kellyDraftControls.riskMode}
+                  minEdgeInput={kellyDraftControls.minEdgeInput}
+                  actualTemperatureText={kellyDraftControls.actualTemperatureText}
+                  draftDirty={kellyDraftDirty}
+                  fieldErrors={kellyFieldErrors}
+                  loading={loadingKelly}
+                  refreshing={manualRefreshingKelly}
+                  refreshDisabled={kellyRefreshDisabled}
+                  error={kellyError}
+                  streamState={kellyStreamState}
+                  onLocationChange={(locationId) => {
+                    void transitionToLocation(locationId, "push");
+                  }}
+                  onTargetDateChange={(targetDate) =>
+                    updateRouteState(
+                      (current) => ({
+                        ...current,
+                        targetDate,
+                      }),
+                      "push",
+                    )
+                  }
+                  onBankrollChange={(value) => {
+                    setKellyFieldErrors((current) => ({ ...current, bankroll: null }));
+                    setKellyDraftControls((current) => ({
                       ...current,
-                      targetDate,
-                    }),
-                    "push",
-                  )
-                }
-                onBankrollChange={(value) => {
-                  setKellyFieldErrors((current) => ({ ...current, bankroll: null }));
-                  setKellyDraftControls((current) => ({
-                    ...current,
-                    bankrollInput: value,
-                  }));
-                }}
-                onRiskModeChange={(nextRiskMode) =>
-                  setKellyDraftControls((current) => ({
-                    ...current,
-                    riskMode: nextRiskMode,
-                  }))
-                }
-                onMinEdgeChange={(value) => {
-                  setKellyFieldErrors((current) => ({ ...current, minEdge: null }));
-                  setKellyDraftControls((current) => ({
-                    ...current,
-                    minEdgeInput: value,
-                  }));
-                }}
-                onActualTemperatureChange={(value) => {
-                  setKellyFieldErrors((current) => ({ ...current, actualTemperature: null }));
-                  setKellyDraftControls((current) => ({
-                    ...current,
-                    actualTemperatureText: value,
-                  }));
-                }}
-                onRefresh={applyKellyDraftControls}
-              />
+                      bankrollInput: value,
+                    }));
+                  }}
+                  onRiskModeChange={(nextRiskMode) =>
+                    setKellyDraftControls((current) => ({
+                      ...current,
+                      riskMode: nextRiskMode,
+                    }))
+                  }
+                  onMinEdgeChange={(value) => {
+                    setKellyFieldErrors((current) => ({ ...current, minEdge: null }));
+                    setKellyDraftControls((current) => ({
+                      ...current,
+                      minEdgeInput: value,
+                    }));
+                  }}
+                  onActualTemperatureChange={(value) => {
+                    setKellyFieldErrors((current) => ({ ...current, actualTemperature: null }));
+                    setKellyDraftControls((current) => ({
+                      ...current,
+                      actualTemperatureText: value,
+                    }));
+                  }}
+                  onRefresh={applyKellyDraftControls}
+                />
+              </Suspense>
             </div>
           ) : (
             <div className={`home-shell ${railExpanded || isLocationTransitionPending ? "workspace-shell-muted" : ""}`}>
-              <WeatherOverview
-                pageUrl={dashboard.hourly.pageUrl}
-                reportText={toDecisionSummaryText(homeViewModel.summaryText)}
-                items={homeViewModel.items}
-                locationTimezone={activeLocationTimezone}
-                selectedTimestamp={routeState.selectedHourlyTimestamp}
-                onSelectTimestamp={(timestamp) =>
-                  updateRouteState((current) => ({
-                    ...current,
-                    selectedHourlyTimestamp: timestamp,
-                    selectedInsightTimestamp: timestamp,
-                  }))
+              <Suspense
+                fallback={
+                  <RouteSurfaceFallback
+                    title="首页决策台加载中..."
+                    detail="正在按需加载当前地点的首页工作面。"
+                  />
                 }
-                currentItem={homeViewModel.currentItem}
-                selectedItem={homeViewModel.selectedItem}
-              />
+              >
+                <LazyWeatherOverview
+                  pageUrl={dashboard.hourly.pageUrl}
+                  reportText={toDecisionSummaryText(homeViewModel.summaryText)}
+                  items={homeViewModel.items}
+                  locationTimezone={activeLocationTimezone}
+                  selectedTimestamp={routeState.selectedHourlyTimestamp}
+                  onSelectTimestamp={(timestamp) =>
+                    updateRouteState((current) => ({
+                      ...current,
+                      selectedHourlyTimestamp: timestamp,
+                      selectedInsightTimestamp: timestamp,
+                    }))
+                  }
+                  currentItem={homeViewModel.currentItem}
+                  selectedItem={homeViewModel.selectedItem}
+                />
+              </Suspense>
 
               <aside className="home-support-column home-quick-insight-column analysis-column scrollbar-terminal overflow-y-auto pr-1">
                 <InsightCard

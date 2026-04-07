@@ -31,7 +31,7 @@ import {
   resolveKellyTargetDate,
 } from "../../kelly/workbench.js";
 import { RefreshableCache } from "../../lib/cache.js";
-import { FavoritesStore } from "../../lib/favorites-store.js";
+import { FavoritesStore, type FavoritesStoreLike } from "../../lib/favorites-store.js";
 import { fetchBinary, fetchText } from "../../lib/http.js";
 import { resolveLocation } from "./location-registry.js";
 import { extractWeekMeteogramHighchartsUrl, parseWeekMeteogramHighcharts } from "./meteogram.js";
@@ -286,11 +286,11 @@ export class MeteoblueWeatherService implements WeatherService {
   private readonly kellyMarketCaches = new Map<string, RefreshableCache<PolymarketDiscoveryResult>>();
   private readonly kellyOrderBookCaches = new Map<string, RefreshableCache<Map<string, NormalizedOrderBook>>>();
   private readonly kellyFrameHistories = new Map<string, KellyFramePoint[]>();
-  private readonly favoritesStore: FavoritesStore;
+  private readonly favoritesStore: FavoritesStoreLike;
   private readonly allowedLocationIds: Set<LocationInfo["id"]>;
   private readonly polymarketClient: PolymarketClient;
 
-  constructor(options?: { favoritesStore?: FavoritesStore }) {
+  constructor(options?: { favoritesStore?: FavoritesStoreLike }) {
     this.favoritesStore = options?.favoritesStore ?? new FavoritesStore();
     this.allowedLocationIds = new Set(Object.keys(LOCATION_REGISTRY) as LocationInfo["id"][]);
     this.polymarketClient = new PolymarketClient();

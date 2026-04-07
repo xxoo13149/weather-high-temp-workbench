@@ -3,6 +3,7 @@ import type { KellyWorkbenchData } from "./types";
 export const createKellyWorkbenchDemoData = (): KellyWorkbenchData => ({
   title: "Kelly 实验台",
   subtitle: "把天气证据、模型表现和盘口价格压到同一工作面，只先定义 UI 载体，不预设最终公式。",
+  displayUnit: "C",
   locationId: "shanghai_pvg",
   locationOptions: [
     { id: "shanghai_pvg", label: "Shanghai Pudong", labelZh: "上海浦东", shortLabel: "PVG", timezone: "Asia/Shanghai", timezoneGroup: "asia" },
@@ -122,6 +123,7 @@ export const createKellyWorkbenchDemoData = (): KellyWorkbenchData => ({
       "支持后续叠加 Polymarket 阈值、盘口中位价、你的主观 fair price。",
       "支持把实际成交密集区或盘口深度单独挂成次要图层。",
     ],
+    displayUnit: "C",
   },
   markets: [
     {

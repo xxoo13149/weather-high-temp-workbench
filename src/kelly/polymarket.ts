@@ -551,29 +551,37 @@ const detectUnit = (text: string): KellyTemperatureUnit => (/\b(?:°|deg(?:ree)?
 const toCelsius = (value: number, unit: KellyTemperatureUnit): number =>
   unit === "F" ? ((value - 32) * 5) / 9 : value;
 
+const toDisplayTemperature = (valueC: number, unit: KellyTemperatureUnit): number =>
+  unit === "F" ? (valueC * 9) / 5 + 32 : valueC;
+
 const formatBucketLabel = (
   contractType: KellyContractType,
   startC: number | null,
   endC: number | null,
+  unit: KellyTemperatureUnit,
 ): string => {
   if (startC === null && endC === null) {
     return "Unparsed";
   }
 
+  const suffix = unit === "F" ? "F" : "C";
   if (contractType === "exact" && startC !== null) {
-    return `${startC.toFixed(1)}C exact`;
+    return `${toDisplayTemperature(startC, unit).toFixed(1)}${suffix} exact`;
   }
 
   if (contractType === "atLeast" && startC !== null) {
-    return `>= ${startC.toFixed(1)}C`;
+    return `>= ${toDisplayTemperature(startC, unit).toFixed(1)}${suffix}`;
   }
 
   if (contractType === "atMost" && endC !== null) {
-    return `<= ${endC.toFixed(1)}C`;
+    return `<= ${toDisplayTemperature(endC, unit).toFixed(1)}${suffix}`;
   }
 
   if (startC !== null && endC !== null) {
-    return `${startC.toFixed(1)}C - ${endC.toFixed(1)}C`;
+    return `${toDisplayTemperature(startC, unit).toFixed(1)}${suffix} - ${toDisplayTemperature(
+      endC,
+      unit,
+    ).toFixed(1)}${suffix}`;
   }
 
   return "Unparsed";
@@ -944,6 +952,7 @@ const normalizeCandidate = (
       parsedContract?.contractType ?? "exact",
       parsedContract?.startC ?? null,
       parsedContract?.endC ?? null,
+      parsedContract?.unit ?? "C",
     ),
     lifecycle:
       lifecycleState.lifecycle === "inactive"

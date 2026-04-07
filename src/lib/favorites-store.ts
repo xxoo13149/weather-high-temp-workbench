@@ -1,9 +1,14 @@
 ﻿import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
-interface FavoritesRecord {
+export interface FavoritesRecord {
   locationIds: string[];
   updatedAt: string;
+}
+
+export interface FavoritesStoreLike {
+  getFavorites(allowedLocationIds: Set<string>): Promise<FavoritesRecord>;
+  setFavorite(locationId: string, favorite: boolean, allowedLocationIds: Set<string>): Promise<FavoritesRecord>;
 }
 
 const DEFAULT_RECORD: FavoritesRecord = {
@@ -24,7 +29,7 @@ const normalizeLocationIds = (values: string[], allowedLocationIds: Set<string>)
   return [...unique].sort((left, right) => left.localeCompare(right));
 };
 
-export class FavoritesStore {
+export class FavoritesStore implements FavoritesStoreLike {
   private readonly filePath: string;
 
   constructor(filePath = resolve(process.cwd(), "data", "favorites.json")) {

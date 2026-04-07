@@ -1,3 +1,5 @@
+import type { KellyTemperatureUnit } from "@/types";
+
 export type KellyRiskMode = "conservative" | "balanced" | "aggressive";
 
 export type KellyDirection = "yes" | "no" | "watch";
@@ -106,6 +108,7 @@ export interface KellyProbabilityPanelData {
   thresholds: KellyThresholdMarker[];
   confidenceBands?: KellyConfidenceBand[];
   notes?: string[];
+  displayUnit: KellyTemperatureUnit;
 }
 
 export interface KellyMarketRow {
@@ -195,6 +198,7 @@ export interface KellyFrameAnalysisGroup {
 export interface KellyWorkbenchData {
   title: string;
   subtitle: string;
+  displayUnit?: KellyTemperatureUnit;
   locationId: string;
   locationOptions: KellyLocationOption[];
   targetDate: string;

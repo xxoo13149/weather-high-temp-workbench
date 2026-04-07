@@ -15,6 +15,8 @@ import type {
 } from "@/lib/kelly";
 import type { KellyRecommendation, KellyWorkbenchResponse, LocationDirectoryEntry } from "../types";
 import { formatDateTime, formatTime } from "../utils";
+import type { KellyTemperatureUnit } from "@/types";
+import { convertAbsoluteTemperature, convertDeltaTemperature } from "@/components/kelly/temperature";
 
 type SnapshotMarket = KellyWorkbenchResponse["markets"][number] | KellyWorkbenchResponse["inactiveMarkets"][number];
 
@@ -53,8 +55,50 @@ const DATE_RELATIVE_LABELS = ["今天", "明天", "后天"];
 const toPercentValue = (value: number | null | undefined) =>
   typeof value === "number" && Number.isFinite(value) ? value * 100 : null;
 
-const formatTemp = (value: number | null | undefined) =>
-  typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(1)}°C` : "--";
+const formatTemp = (
+  value: number | null | undefined,
+  unit: KellyTemperatureUnit,
+  digits = 1,
+) =>
+  typeof value === "number" && Number.isFinite(value)
+    ? `${convertAbsoluteTemperature(value, unit).toFixed(digits)}°${unit}`
+    : "--";
+
+const formatDeltaTemp = (
+  value: number | null | undefined,
+  unit: KellyTemperatureUnit,
+  digits = 1,
+  signed = false,
+) => {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "--";
+  }
+
+  const converted = convertDeltaTemperature(value, unit);
+  const sign = signed ? (converted >= 0 ? "+" : "") : "";
+  return `${sign}${converted.toFixed(digits)}°${unit}`;
+};
+
+const formatRangeTemp = (
+  startC: number | null | undefined,
+  endC: number | null | undefined,
+  unit: KellyTemperatureUnit,
+  digits = 1,
+) => {
+  if (typeof startC === "number" && typeof endC === "number") {
+    return `${formatTemp(startC, unit, digits)} ~ ${formatTemp(endC, unit, digits)}`;
+  }
+
+  if (typeof startC === "number") {
+    return `>= ${formatTemp(startC, unit, digits)}`;
+  }
+
+  if (typeof endC === "number") {
+    return `<= ${formatTemp(endC, unit, digits)}`;
+  }
+
+  return "--";
+};
 
 const formatPercent = (value: number | null | undefined, digits = 1) =>
   typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(digits)}%` : "--";
@@ -84,6 +128,18 @@ const formatShortMonthDay = (value: string, timeZone?: string) => {
     timeZone: timeZone ?? "UTC",
   }).format(parsed);
 };
+
+const convertInlineTemperatureLabel = (label: string, unit: KellyTemperatureUnit): string =>
+  label.replace(/(-?\d+(?:\.\d+)?)\s*°?\s*([CF])?/gi, (_match, rawValue, rawUnit) => {
+    const parsed = Number.parseFloat(rawValue);
+    if (!Number.isFinite(parsed)) {
+      return rawValue;
+    }
+
+    const sourceUnit = (rawUnit?.toUpperCase() as KellyTemperatureUnit | undefined) ?? "C";
+    const celsiusValue = sourceUnit === "F" ? ((parsed - 32) * 5) / 9 : parsed;
+    return `${convertAbsoluteTemperature(celsiusValue, unit).toFixed(1)}°${unit}`;
+  });
 
 const resolveActionLabel = (side: KellyRecommendation["side"] | SnapshotMarket["recommendedSide"] | "watch") => {
   if (side === "yes") {
@@ -261,10 +317,13 @@ const resolveStreamDetail = (snapshot: KellyWorkbenchResponse, timeZone?: string
   return `${lastSignal} / ${lastRepriced}`;
 };
 
-const buildProbability = (snapshot: KellyWorkbenchResponse): KellyProbabilityPanelData => ({
+const buildProbability = (
+  snapshot: KellyWorkbenchResponse,
+  displayUnit: KellyTemperatureUnit,
+): KellyProbabilityPanelData => ({
   title: "概率依据（辅助）",
   subtitle: "用来解释温度分布和档位落点，不替代上面的仓位建议与主表。",
-  summary: `最可能高温区间 ${snapshot.distributionSummary.mostLikelyRangeLabel}，当前收缩 ${formatPercent(
+  summary: `最可能高温区间 ${convertInlineTemperatureLabel(snapshot.distributionSummary.mostLikelyRangeLabel, displayUnit)}，当前收缩 ${formatPercent(
     snapshot.methodology.shrink * 100,
   )}。`,
   samples: snapshot.probabilityCurve.map((point) => ({
@@ -274,7 +333,7 @@ const buildProbability = (snapshot: KellyWorkbenchResponse): KellyProbabilityPan
   thresholds: snapshot.bucketProbabilities.slice(0, 8).map((bucket) => ({
     id: bucket.marketId,
     marketId: bucket.marketId,
-    label: bucket.label,
+    label: convertInlineTemperatureLabel(bucket.label, displayUnit),
     temperatureC: bucket.bucketStartC ?? bucket.bucketEndC ?? snapshot.distributionSummary.modeTemperatureC,
     detail: `Yes 公允价 ${formatPercent(bucket.probabilityYes * 100)}`,
     tone: "neutral",
@@ -283,13 +342,19 @@ const buildProbability = (snapshot: KellyWorkbenchResponse): KellyProbabilityPan
     "先看仓位建议和主表，再回到这里核对落点。",
     "当前版本的收缩系数是启发式口径，不是假装成历史回测拟合。",
   ],
+  displayUnit,
 });
 
 const buildEvidenceSections = (
   snapshot: KellyWorkbenchResponse,
   selectedMarketId: string | null,
-  timeZone?: string,
+  timeZone: string | undefined,
+  displayUnit: KellyTemperatureUnit,
 ): KellyEvidenceSection[] => {
+  const formatEvidenceTemp = (value: number | null | undefined, digits = 1) =>
+    formatTemp(value, displayUnit, digits);
+  const formatEvidenceDelta = (value: number | null | undefined, digits = 1, signed = false) =>
+    formatDeltaTemp(value, displayUnit, digits, signed);
   const allMarkets = sortMarkets([...snapshot.markets, ...snapshot.inactiveMarkets]);
   const market = allMarkets.find((item) => item.marketId === selectedMarketId) ?? allMarkets[0] ?? null;
   const evidence = snapshot.marketEvidence.find((item) => item.marketId === market?.marketId) ?? null;
@@ -349,13 +414,13 @@ const buildEvidenceSections = (
       title: "天气证据",
       description: "核对参考温度、天气时刻、模型时刻和抓取时间。",
       items: [
-        {
-          id: "reference",
-          label: "参考温度",
-          value: formatTemp(snapshot.weatherEvidence.currentReferenceTemperatureC),
-          detail: `来源：${SOURCE_LABELS[snapshot.weatherEvidence.currentReferenceSource]}`,
-          tone: "accent",
-        },
+          {
+            id: "reference",
+            label: "参考温度",
+            value: formatEvidenceTemp(snapshot.weatherEvidence.currentReferenceTemperatureC),
+            detail: `来源：${SOURCE_LABELS[snapshot.weatherEvidence.currentReferenceSource]}`,
+            tone: "accent",
+          },
         {
           id: "timestamps",
           label: "天气 / 模型时刻",
@@ -410,7 +475,10 @@ const buildEvidenceSections = (
           id: "shrink",
           label: "收缩系数",
           value: formatPercent(snapshot.methodology.shrink * 100),
-          detail: `分歧 ${snapshot.methodology.shrinkInputs.disagreement.toFixed(2)}°C / 偏差离散 ${snapshot.methodology.shrinkInputs.biasDispersion.toFixed(2)}°C / 缺失 ${(snapshot.methodology.shrinkInputs.missingRatio * 100).toFixed(1)}%`,
+          detail: `分歧 ${formatEvidenceDelta(snapshot.methodology.shrinkInputs.disagreement, 2)} / 偏差离散 ${formatEvidenceDelta(
+            snapshot.methodology.shrinkInputs.biasDispersion,
+            2,
+          )} / 缺失 ${(snapshot.methodology.shrinkInputs.missingRatio * 100).toFixed(1)}%`,
         },
         {
           id: "probability",
@@ -420,7 +488,10 @@ const buildEvidenceSections = (
               ? `${formatPercent(probabilityStep.pRaw * 100)} → ${formatPercent(probabilityStep.pFinal * 100)}`
               : "--",
           detail: probabilityStep
-            ? `边界 ${formatTemp(probabilityStep.lowerBoundC)} ~ ${formatTemp(probabilityStep.upperBoundC)}`
+            ? `边界 ${formatEvidenceTemp(probabilityStep.lowerBoundC, 0)} ~ ${formatEvidenceTemp(
+                probabilityStep.upperBoundC,
+                0,
+              )}`
             : "当前档位没有概率积分明细。",
         },
         {
@@ -434,9 +505,11 @@ const buildEvidenceSections = (
   ];
 };
 
-const buildMethodologyNotes = (snapshot: KellyWorkbenchResponse) => [
+const buildMethodologyNotes = (snapshot: KellyWorkbenchResponse, displayUnit: KellyTemperatureUnit) => [
   "当前版本的 shrink 为启发式收缩，不是历史回测拟合。",
-  `参考温度 ${formatTemp(snapshot.methodology.referenceTemperatureC)}，来源 ${SOURCE_LABELS[snapshot.methodology.referenceSource] ?? "系统参考"}`,
+  `参考温度 ${formatTemp(snapshot.methodology.referenceTemperatureC, displayUnit)}，来源 ${SOURCE_LABELS[
+    snapshot.methodology.referenceSource
+  ] ?? "系统参考"}`,
   `权重拆解均值：bias ${snapshot.methodology.weightBreakdown.biasWeight.toFixed(2)} / consensus ${snapshot.methodology.weightBreakdown.consensusWeight.toFixed(2)} / rank ${snapshot.methodology.weightBreakdown.rankWeight.toFixed(2)} / normalized ${snapshot.methodology.weightBreakdown.normalizedWeight.toFixed(2)}`,
   snapshot.methodology.probabilitySteps.fairPriceRule,
   snapshot.methodology.probabilitySteps.edgeRule,
@@ -471,6 +544,15 @@ const buildData = ({
   streamState: string;
   timeZone?: string;
 }): KellyWorkbenchData => {
+  const displayUnit: KellyTemperatureUnit = snapshot.displayUnit ?? "C";
+  const formatTempWithUnit = (value: number | null | undefined, digits = 1) =>
+    formatTemp(value, displayUnit, digits);
+  const formatDeltaWithUnit = (
+    value: number | null | undefined,
+    digits = 1,
+    signed = false,
+  ) => formatDeltaTemp(value, displayUnit, digits, signed);
+
   const matchedMarkets = sortMarkets(snapshot.markets);
   const inactiveMarkets = sortMarkets(snapshot.inactiveMarkets);
   const selectedMarket =
@@ -558,19 +640,19 @@ const buildData = ({
     inactiveReason: resolveInactiveReason(market),
   }));
 
-  const summaryMetrics: KellySummaryMetric[] = [
+const summaryMetrics: KellySummaryMetric[] = [
     {
       id: "reference",
       label: "参考温度",
-      value: formatTemp(snapshot.weatherEvidence.currentReferenceTemperatureC),
+      value: formatTempWithUnit(snapshot.weatherEvidence.currentReferenceTemperatureC),
       detail: `来源：${SOURCE_LABELS[snapshot.weatherEvidence.currentReferenceSource]}`,
       tone: "accent",
     },
     {
       id: "range",
       label: "最可能高温区间",
-      value: snapshot.distributionSummary.mostLikelyRangeLabel,
-      detail: `模型分歧 ${snapshot.distributionSummary.peakSpreadC.toFixed(2)}°C`,
+      value: convertInlineTemperatureLabel(snapshot.distributionSummary.mostLikelyRangeLabel, displayUnit),
+      detail: `模型分歧 ${formatDeltaWithUnit(snapshot.distributionSummary.peakSpreadC, 2)}`,
       tone: "warning",
     },
     {
@@ -616,6 +698,7 @@ const buildData = ({
   return {
     title: "Kelly 实验台",
     subtitle: "先选日期，再看仓位建议和主表；完整题干退到右侧证据区。",
+    displayUnit,
     locationId: activeLocationId,
     locationOptions: locations.map((location) => ({
       id: location.id,
@@ -651,20 +734,20 @@ const buildData = ({
     summaryMetrics,
     opportunities,
     opportunityEmptyState: markets.length === 0 ? snapshot.warnings[0] ?? "当前没有可交易档位。" : "当前没有过线机会，先保留观察位。",
-    probability: buildProbability(snapshot),
+    probability: buildProbability(snapshot, displayUnit),
     markets,
     inactiveMarkets: inactiveRows,
     marketEmptyState: snapshot.warnings[0] ?? "当前没有可展示的温度档位。",
     unresolvedMarkets: [],
-    evidenceSections: buildEvidenceSections(snapshot, selectedMarketId, timeZone),
-    methodologyNotes: buildMethodologyNotes(snapshot),
+    evidenceSections: buildEvidenceSections(snapshot, selectedMarketId, timeZone, displayUnit),
+    methodologyNotes: buildMethodologyNotes(snapshot, displayUnit),
     methodologyModels: snapshot.methodology.models.map((model) => ({
       id: model.modelCode ?? model.modelName,
       modelLabel: model.modelCode ?? model.modelName,
-      currentPredictionLabel: formatTemp(model.currentPredictionC),
+      currentPredictionLabel: formatTempWithUnit(model.currentPredictionC),
       biasNowLabel:
-        typeof model.biasNowC === "number" ? `${model.biasNowC >= 0 ? "+" : ""}${model.biasNowC.toFixed(1)}°C` : "--",
-      adjustedPeakLabel: formatTemp(model.adjustedPeakTemperatureC),
+        typeof model.biasNowC === "number" ? formatDeltaWithUnit(model.biasNowC, 1, true) : "--",
+      adjustedPeakLabel: formatTempWithUnit(model.adjustedPeakTemperatureC),
       weightLabel: typeof model.weight === "number" ? `${(model.weight * 100).toFixed(1)}%` : "--",
       statusLabel: model.included ? "已纳入" : "已排除",
       detail:

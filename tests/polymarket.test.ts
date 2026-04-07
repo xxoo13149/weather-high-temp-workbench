@@ -101,6 +101,7 @@ describe("PolymarketClient", () => {
     });
     expect(result.candidates[0]?.bucketStartC).toBeCloseTo(27.78, 2);
     expect(result.candidates[0]?.bucketEndC).toBeCloseTo(28.33, 2);
+    expect(result.candidates[0]?.bucketLabel).toBe("82.0F - 83.0F");
   });
 
   test("filters closed and non-accepting markets during discovery", async () => {

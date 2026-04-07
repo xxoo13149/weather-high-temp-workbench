@@ -13,9 +13,10 @@ import type {
   KellyStreamMarketPatch,
   KellyStreamMessage,
   KellyWeatherEvidence,
-  KellyWorkbenchResponse,
   KellyFreshness,
   KellyStreamHealth,
+  KellyTemperatureUnit,
+  KellyWorkbenchResponse as DomainKellyWorkbenchResponse,
   LocationDirectoryEntry,
   LocationInfo,
   MultiModelDistributionBucket,
@@ -47,9 +48,9 @@ export type {
   KellyStreamMarketPatch,
   KellyStreamMessage,
   KellyWeatherEvidence,
-  KellyWorkbenchResponse,
   KellyFreshness,
   KellyStreamHealth,
+  KellyTemperatureUnit,
   LocationDirectoryEntry,
   LocationInfo,
   MultiModelDistributionBucket,
@@ -64,6 +65,10 @@ export type {
   MultiModelStatusResponse,
   WeatherReportMetrics,
   WeatherReportResponse,
+};
+
+export type KellyWorkbenchResponse = DomainKellyWorkbenchResponse & {
+  displayUnit?: KellyTemperatureUnit;
 };
 
 export interface ApiErrorPayload {

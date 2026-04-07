@@ -546,6 +546,7 @@ export interface KellyStreamHealth {
 export interface KellyWorkbenchResponse {
   location: LocationInfo;
   targetDate: string;
+  displayUnit: KellyTemperatureUnit;
   availableTargetDates: string[];
   generatedAt: string;
   bankroll: number;

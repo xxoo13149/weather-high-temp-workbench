@@ -1,14 +1,14 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
 import { config } from "../config.js";
 import { AppError } from "../domain/errors.js";
-
-const execFileAsync = promisify(execFile);
 
 const defaultHeaders = {
   "accept-language": "en-US,en;q=0.9",
   "user-agent": config.userAgent,
+};
+
+const isWorkerRuntime = () => {
+  const maybeNavigator = (globalThis as { navigator?: { userAgent?: string } }).navigator;
+  return maybeNavigator?.userAgent === "Cloudflare-Workers";
 };
 
 const isPolymarketUrl = (url: string) => {
@@ -81,6 +81,14 @@ const buildWindowsWebRequestCommand = (url: string, init?: RequestInit) => {
 };
 
 const fetchWithShellFallback = async (url: string, init?: RequestInit): Promise<Buffer> => {
+  if (isWorkerRuntime()) {
+    throw new AppError(502, "UPSTREAM_FETCH_FAILED", `Shell fallback is unavailable in Cloudflare Workers for ${url}`, {
+      retryable: true,
+    });
+  }
+
+  const [{ execFile }, { promisify }] = await Promise.all([import("node:child_process"), import("node:util")]);
+  const execFileAsync = promisify(execFile);
   const { command, args } =
     process.platform === "win32" ? buildWindowsWebRequestCommand(url, init) : buildCurlCommand(url, init);
 

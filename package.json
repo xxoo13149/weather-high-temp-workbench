@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:web": "npm --prefix zip run dev",
+    "dev:cloudflare": "npx wrangler dev",
     "stitch:explore": "node tools/stitch-concept.mjs explore",
     "stitch:refine": "node tools/stitch-concept.mjs refine",
     "build": "npm run build:server && npm run build:web",
@@ -17,6 +18,7 @@
     "check:encoding": "node tools/check-encoding.mjs",
     "check": "tsc --noEmit && npm --prefix zip run lint && node tools/check-encoding.mjs",
     "start": "node dist/index.js",
+    "deploy:cloudflare": "npx wrangler deploy",
     "test": "vitest run"
   },
   "dependencies": {

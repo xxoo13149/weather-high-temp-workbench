@@ -55,6 +55,7 @@ const buildSnapshot = (markets: KellyMarketRow[]): KellyWorkbenchResponse =>
   ({
     location: baseLocation,
     targetDate: "2026-03-28",
+    displayUnit: "C",
     availableTargetDates: ["2026-03-28"],
     generatedAt: "2026-03-28T00:00:00.000Z",
     bankroll: 1000,
