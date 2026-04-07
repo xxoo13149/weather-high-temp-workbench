@@ -206,6 +206,19 @@ const sanitizeKellyTemperatureText = (value: string): string =>
     .replace(/\s+/g, " ")
     .trim();
 
+const sanitizeDisplayText = (value: string | null): string | null => {
+  const sanitized = parseString(value);
+  if (!sanitized) {
+    return null;
+  }
+
+  return sanitizeTemperatureText(sanitized)
+    .replace(/\s+([?!.,:;])/g, "$1")
+    .replace(/\(\s+/g, "(")
+    .replace(/\s+\)/g, ")")
+    .trim();
+};
+
 const detectNormalizedKellyTemperatureUnit = (text: string): KellyTemperatureUnit =>
   /(?:°\s*F\b|\b-?\d+(?:\.\d+)?\s*F\b|\bFAHRENHEIT\b)/i.test(text) ? "F" : "C";
 
@@ -879,26 +892,29 @@ const normalizeCandidate = (
   location: RegisteredLocation,
   targetDate: string,
 ): PolymarketCandidate | null => {
-  const title =
+  const rawTitle =
     parseString(raw.question) ??
     parseString(raw.title) ??
     parseString(raw.groupItemTitle) ??
     parseString(raw.name);
-  if (!title) {
+  if (!rawTitle) {
     return null;
   }
 
-  const eventTitle =
+  const rawEventTitle =
     parseString(raw.eventTitle) ??
     parseString((raw.event as Record<string, unknown> | undefined)?.title);
-  const description = parseString(raw.description);
+  const rawDescription = parseString(raw.description);
+  const title = sanitizeDisplayText(rawTitle) ?? rawTitle;
+  const eventTitle = sanitizeDisplayText(rawEventTitle) ?? rawEventTitle;
+  const description = sanitizeDisplayText(rawDescription) ?? rawDescription;
   const resolutionSource =
     parseString(raw.resolutionSource) ??
     parseString(raw.resolution_source) ??
     parseString((raw.event as Record<string, unknown> | undefined)?.resolutionSource);
-  const combinedText = [title, eventTitle, description].filter(Boolean).join(" ");
+  const combinedText = [rawTitle, rawEventTitle, rawDescription].filter(Boolean).join(" ");
   const parsedContract =
-    parseTemperatureContractV2(raw, [title, eventTitle].filter(Boolean).join(" ")) ??
+    parseTemperatureContractV2(raw, [rawTitle, rawEventTitle].filter(Boolean).join(" ")) ??
     parseTemperatureContractV2(raw, combinedText) ??
     parseTemperatureContract(raw, combinedText);
   const matchedLocation = locationMatches(location, combinedText);

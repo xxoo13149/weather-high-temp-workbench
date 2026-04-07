@@ -588,6 +588,31 @@ describe("buildKellyWorkbench", () => {
     expect(result.displayUnit).toBe("F");
   });
 
+  test("prefers matched market units for display even when unresolved rows remain Celsius", () => {
+    const args = createBuildArgs();
+    args.discoveryCandidates = [
+      {
+        ...args.discoveryCandidates[0],
+        unit: "F" as const,
+        bucketLabel: ">= 60.8F",
+      },
+      {
+        ...args.discoveryCandidates[3],
+        unit: "C" as const,
+      },
+    ];
+    args.orderBooks = new Map([
+      ["yes-16", createOrderBook("yes-16", 0.35)],
+      ["no-16", createOrderBook("no-16", 0.65)],
+    ]);
+
+    const result = buildKellyWorkbench(args);
+
+    expect(result.markets).toHaveLength(1);
+    expect(result.unresolvedMarkets).toHaveLength(1);
+    expect(result.displayUnit).toBe("F");
+  });
+
   test("defaults display unit to Celsius when no markets exist", () => {
     const args = createBuildArgs();
     args.discoveryCandidates = [];

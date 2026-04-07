@@ -1430,7 +1430,6 @@ export const buildKellyWorkbench = ({
     riskMode,
     minEdge,
   });
-  const displayUnit = resolveDisplayUnit(pricedMarkets);
   const activeMarkets = pricedMarkets.filter(
     (market) => market.parseStatus === "matched" && market.lifecycle === "tradable" && hasExecutableEntry(market),
   );
@@ -1438,6 +1437,13 @@ export const buildKellyWorkbench = ({
     (market) =>
       market.parseStatus === "matched" &&
       (market.lifecycle !== "tradable" || !hasExecutableEntry(market)),
+  );
+  const displayUnit = resolveDisplayUnit(
+    activeMarkets.length > 0
+      ? activeMarkets
+      : inactiveMarkets.length > 0
+        ? inactiveMarkets
+        : pricedMarkets.filter((market) => market.parseStatus === "matched"),
   );
   const recommendations = buildRecommendations(activeMarkets, riskMode);
   const bestObservation = buildReadableObservation(activeMarkets);

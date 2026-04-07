@@ -102,6 +102,7 @@ describe("PolymarketClient", () => {
     expect(result.candidates[0]?.bucketStartC).toBeCloseTo(27.78, 2);
     expect(result.candidates[0]?.bucketEndC).toBeCloseTo(28.33, 2);
     expect(result.candidates[0]?.bucketLabel).toBe("82.0F - 83.0F");
+    expect(result.candidates[0]?.title).toBe("Will the highest temperature in Miami be between 82-83 F on April 8?");
   });
 
   test("filters closed and non-accepting markets during discovery", async () => {
