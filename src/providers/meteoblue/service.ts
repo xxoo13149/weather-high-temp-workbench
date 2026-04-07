@@ -8,6 +8,7 @@ import type {
   HourlyMode,
   HourlySourceType,
   HourlyWeatherResponse,
+  KellyFramePoint,
   KellyRequestOptions,
   KellyStreamHandle,
   KellyStreamMessage,
@@ -22,7 +23,13 @@ import type {
   WeatherService,
 } from "../../domain/weather.js";
 import { buildDiscoveryWarnings, PolymarketClient, type NormalizedOrderBook, type PolymarketDiscoveryResult } from "../../kelly/polymarket.js";
-import { applyPricingToMarkets, buildKellyWorkbench, buildStreamMarketPatches, resolveKellyTargetDate } from "../../kelly/workbench.js";
+import {
+  applyPricingToMarkets,
+  buildKellyWorkbench,
+  buildReadableFramePoints,
+  buildStreamMarketPatches,
+  resolveKellyTargetDate,
+} from "../../kelly/workbench.js";
 import { RefreshableCache } from "../../lib/cache.js";
 import { FavoritesStore } from "../../lib/favorites-store.js";
 import { fetchBinary, fetchText } from "../../lib/http.js";
@@ -278,6 +285,7 @@ export class MeteoblueWeatherService implements WeatherService {
   >();
   private readonly kellyMarketCaches = new Map<string, RefreshableCache<PolymarketDiscoveryResult>>();
   private readonly kellyOrderBookCaches = new Map<string, RefreshableCache<Map<string, NormalizedOrderBook>>>();
+  private readonly kellyFrameHistories = new Map<string, KellyFramePoint[]>();
   private readonly favoritesStore: FavoritesStore;
   private readonly allowedLocationIds: Set<LocationInfo["id"]>;
   private readonly polymarketClient: PolymarketClient;
@@ -454,6 +462,36 @@ export class MeteoblueWeatherService implements WeatherService {
 
     this.kellyOrderBookCaches.set(key, cache);
     return cache;
+  }
+
+  private rememberKellyFrameHistory(
+    locationId: LocationInfo["id"],
+    targetDate: string,
+    nextFrames: KellyFramePoint[],
+    generatedAt: string,
+  ): KellyFramePoint[] {
+    const key = buildKellyCacheKey(locationId, targetDate);
+    const existing = this.kellyFrameHistories.get(key) ?? [];
+    const merged = new Map<string, KellyFramePoint>();
+
+    for (const frame of existing) {
+      merged.set(frame.id, frame);
+    }
+
+    for (const frame of nextFrames) {
+      merged.set(frame.id, frame);
+    }
+
+    const cutoffMs = Date.parse(generatedAt) - 60 * 60 * 1000;
+    const history = [...merged.values()]
+      .filter((frame) => {
+        const frameTime = Date.parse(frame.generatedAt);
+        return Number.isNaN(frameTime) || frameTime >= cutoffMs;
+      })
+      .sort((left, right) => left.generatedAt.localeCompare(right.generatedAt));
+
+    this.kellyFrameHistories.set(key, history);
+    return history;
   }
 
   async getHourly(locationId: LocationInfo["id"], mode: HourlyMode, limit?: number): Promise<HourlyWeatherResponse> {
@@ -780,7 +818,12 @@ export class MeteoblueWeatherService implements WeatherService {
       if (marketResult.stale) {
         warnings.push("Polymarket 市场目录刷新失败，当前使用最近一次成功缓存。");
       }
-      warnings.push(...buildDiscoveryWarnings(discoveryResult.candidates));
+      warnings.push(
+        ...buildDiscoveryWarnings([
+          ...discoveryResult.candidates,
+          ...discoveryResult.inactiveCandidates,
+        ]),
+      );
     } catch {
       warnings.push("Polymarket 市场目录暂时不可用，当前仅展示天气侧推导结果。");
     }
@@ -792,7 +835,6 @@ export class MeteoblueWeatherService implements WeatherService {
       try {
         const orderBookResult = await this.getKellyOrderBookCache(locationId, targetDate).get({
           allowStaleOnError: true,
-          staleWhileRevalidate: true,
         });
         orderBooks = orderBookResult.value;
         priceFetchedAt =
@@ -805,6 +847,47 @@ export class MeteoblueWeatherService implements WeatherService {
       }
     }
 
+    const generatedAt = new Date().toISOString();
+    const cacheKey = buildKellyCacheKey(locationId, targetDate);
+    const existingFrameSeries = this.kellyFrameHistories.get(cacheKey) ?? [];
+    const hasActionableBookData = [...orderBooks.values()].some(
+      (book) => book.bestAsk !== null || book.bestBid !== null,
+    );
+
+    const baseSnapshot = buildKellyWorkbench({
+      location,
+      targetDate,
+      hourly,
+      report,
+      insight,
+      distribution,
+      discoveryCandidates: discoveryResult?.candidates ?? [],
+      inactiveCandidates: discoveryResult?.inactiveCandidates ?? [],
+      discoveryFetchedAt,
+      sourceLinks:
+        discoveryResult?.sourceLinks ?? {
+          meteoblueWeekUrl: location.weekPageUrl,
+          meteoblueMultimodelUrl: location.multimodelPageUrl,
+          polymarketSearchUrl: `${config.polymarketGammaBaseUrl}/public-search?q=${encodeURIComponent(
+            `${location.cityName} weather ${targetDate}`,
+          )}`,
+          marketUrls: [],
+      },
+      orderBooks,
+      priceFetchedAt,
+      generatedAt,
+      repricedAt: hasActionableBookData ? generatedAt : null,
+      frameSeries: existingFrameSeries,
+      options,
+      warnings,
+    });
+    const frameSeries = this.rememberKellyFrameHistory(
+      locationId,
+      targetDate,
+      buildReadableFramePoints(baseSnapshot.markets, generatedAt),
+      generatedAt,
+    );
+
     return buildKellyWorkbench({
       location,
       targetDate,
@@ -813,6 +896,7 @@ export class MeteoblueWeatherService implements WeatherService {
       insight,
       distribution,
       discoveryCandidates: discoveryResult?.candidates ?? [],
+      inactiveCandidates: discoveryResult?.inactiveCandidates ?? [],
       discoveryFetchedAt,
       sourceLinks:
         discoveryResult?.sourceLinks ?? {
@@ -825,6 +909,9 @@ export class MeteoblueWeatherService implements WeatherService {
         },
       orderBooks,
       priceFetchedAt,
+      generatedAt,
+      repricedAt: hasActionableBookData ? generatedAt : null,
+      frameSeries,
       options,
       warnings,
     });
@@ -836,12 +923,14 @@ export class MeteoblueWeatherService implements WeatherService {
     onMessage: (message: KellyStreamMessage) => void,
   ): Promise<KellyStreamHandle> {
     const location = this.requireLocation(locationId);
+    const service = this;
     const targetDate = resolveKellyTargetDate(location.timezone, options.targetDate);
     const snapshot = await this.getKellyWorkbench(locationId, {
       ...options,
       targetDate,
     });
-    const matchedMarkets = snapshot.markets.filter(
+    const trackedMarkets = [...snapshot.markets, ...snapshot.inactiveMarkets];
+    const matchedMarkets = trackedMarkets.filter(
       (market) => market.parseStatus === "matched" && market.yesTokenId && market.noTokenId,
     );
 
@@ -850,7 +939,10 @@ export class MeteoblueWeatherService implements WeatherService {
         type: "status",
         generatedAt: new Date().toISOString(),
         state: "unavailable",
+        reasonCode: "no_matched_markets",
         message: "当前没有可订阅的 Polymarket 盘口。",
+        lastSignalAt: null,
+        lastRepricedAt: null,
       });
       return {
         close() {},
@@ -860,36 +952,113 @@ export class MeteoblueWeatherService implements WeatherService {
     let closed = false;
     let pendingTimer: NodeJS.Timeout | null = null;
     let lastTriggeredAt: string | null = null;
+    let fallbackTimer: NodeJS.Timeout | null = null;
+    let lastRepricedAt: string | null = null;
 
-    const emitSnapshot = async () => {
+    async function emitSnapshot(): Promise<string | null> {
       try {
-        const books = await this.polymarketClient.fetchOrderBooks(
+        const books = await service.polymarketClient.fetchOrderBooks(
           matchedMarkets.flatMap((market) => [market.yesTokenId!, market.noTokenId!]),
         );
-        const repriced = applyPricingToMarkets(snapshot.markets, books, {
+        const generatedAt = new Date().toISOString();
+        const repriced = applyPricingToMarkets(trackedMarkets, books, {
           bankroll: snapshot.bankroll,
           riskMode: snapshot.riskMode,
           minEdge: snapshot.minEdge,
         });
+        const frames = service.rememberKellyFrameHistory(
+          locationId,
+          targetDate,
+          buildReadableFramePoints(repriced, generatedAt),
+          generatedAt,
+        );
 
-        onMessage({
+        sendStreamMessage({
           type: "markets",
-          generatedAt: new Date().toISOString(),
+          generatedAt,
           markets: buildStreamMarketPatches(repriced),
+          frames,
+          lastSignalAt: lastTriggeredAt,
+          lastRepricedAt: generatedAt,
         });
+        lastRepricedAt = generatedAt;
+        return generatedAt;
       } catch {
-        onMessage({
+        const failedAt = new Date().toISOString();
+        sendStreamMessage({
           type: "status",
-          generatedAt: new Date().toISOString(),
+          generatedAt: failedAt,
           state: "degraded",
+          reasonCode: "reprice_failed",
           message: "实时流收到信号，但本轮盘口同步失败。",
+          lastSignalAt: lastTriggeredAt,
+          lastRepricedAt: null,
         });
+        startPollingFallback();
+        return null;
       }
-    };
+    }
+
+    function startPollingFallback() {
+      if (fallbackTimer) {
+        return;
+      }
+      const fallbackTime = new Date().toISOString();
+      onMessage({
+        type: "status",
+        generatedAt: fallbackTime,
+        state: "degraded",
+        reasonCode: "polling_fallback",
+        message: "实时流异常，已回退到轮询盘口同步。",
+        lastSignalAt: lastTriggeredAt,
+        lastRepricedAt,
+      });
+      fallbackTimer = setInterval(async () => {
+        if (closed) {
+          return;
+        }
+        const repricedAt = await emitSnapshot();
+        if (repricedAt) {
+          onMessage({
+            type: "status",
+            generatedAt: new Date().toISOString(),
+            state: "degraded",
+            reasonCode: "polling_fallback",
+            message: "实时流异常，当前已回退到轮询；最近一次轮询重定价成功。",
+            lastSignalAt: lastTriggeredAt,
+            lastRepricedAt: repricedAt,
+          });
+        }
+      }, 30_000);
+    }
+
+    function stopPollingFallback() {
+      if (fallbackTimer) {
+        clearInterval(fallbackTimer);
+        fallbackTimer = null;
+      }
+    }
+
+    function handleStreamStatus(message: KellyStreamMessage) {
+      if (message.type !== "status") {
+        return;
+      }
+
+      if (message.state === "connected") {
+        stopPollingFallback();
+      } else if (message.state === "degraded" || message.state === "disconnected") {
+        startPollingFallback();
+      }
+    }
+
+    function sendStreamMessage(message: KellyStreamMessage) {
+      handleStreamStatus(message);
+      onMessage(message);
+    }
 
     const upstreamStream = this.polymarketClient.createMarketStream(
       matchedMarkets.flatMap((market) => [market.yesTokenId!, market.noTokenId!]),
-      onMessage,
+      sendStreamMessage,
       (occurredAt) => {
         lastTriggeredAt = occurredAt;
         if (pendingTimer) {
@@ -901,20 +1070,34 @@ export class MeteoblueWeatherService implements WeatherService {
           if (closed) {
             return;
           }
-          await emitSnapshot();
-          if (lastTriggeredAt) {
-            onMessage({
+          const repricedAt = await emitSnapshot();
+          if (lastTriggeredAt && repricedAt) {
+            sendStreamMessage({
               type: "status",
               generatedAt: new Date().toISOString(),
-              state: "fresh",
+              state: "connected",
+              reasonCode: "ws_connected",
               message: `已根据 ${lastTriggeredAt} 的上游事件刷新盘口。`,
+              lastSignalAt: lastTriggeredAt,
+              lastRepricedAt: repricedAt,
             });
           }
         }, 300);
       },
     );
 
-    await emitSnapshot();
+    const initialRepricedAt = await emitSnapshot();
+    if (initialRepricedAt && !closed) {
+      sendStreamMessage({
+        type: "status",
+        generatedAt: new Date().toISOString(),
+        state: "connected",
+        reasonCode: "no_recent_market_motion",
+        message: "实时流已连接，最近还没有新的盘口变动。",
+        lastSignalAt: lastTriggeredAt,
+        lastRepricedAt: initialRepricedAt,
+      });
+    }
 
     return {
       async close() {
@@ -923,6 +1106,7 @@ export class MeteoblueWeatherService implements WeatherService {
           clearTimeout(pendingTimer);
           pendingTimer = null;
         }
+        stopPollingFallback();
         await upstreamStream.close();
       },
     };

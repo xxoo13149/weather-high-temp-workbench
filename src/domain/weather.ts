@@ -258,6 +258,28 @@ export type KellyRiskMode = "conservative" | "balanced" | "aggressive";
 export type KellyContractType = "range" | "atLeast" | "atMost" | "exact";
 export type KellyTemperatureUnit = "C" | "F";
 export type KellySourceState = "fresh" | "stale" | "degraded" | "unavailable" | "connected" | "disconnected";
+export type KellyMarketLifecycle = "tradable" | "inactive" | "unresolved";
+export type KellyInactiveReason =
+  | "closed"
+  | "accepting_orders_disabled"
+  | "archived"
+  | "expired"
+  | "missing_tokens"
+  | "no_orderbook"
+  | "no_executable_prices";
+export type KellyEntrySource = "best-ask" | "midpoint" | "unavailable";
+export type KellyMarketMotionState = "live" | "still" | "polling-fallback" | "unavailable";
+export type KellyStreamReasonCode =
+  | "awaiting_client_subscription"
+  | "no_matched_markets"
+  | "missing_tokens"
+  | "ws_connected"
+  | "ws_error"
+  | "upstream_error"
+  | "reprice_failed"
+  | "polling_fallback"
+  | "no_recent_market_motion"
+  | "snapshot_loaded";
 
 export interface KellySourceStatus {
   kind: "weather" | "market-discovery" | "orderbooks" | "stream";
@@ -319,10 +341,14 @@ export interface KellyMarketRow {
   bucketStartC: number | null;
   bucketEndC: number | null;
   bucketLabel: string;
+  lifecycle: KellyMarketLifecycle;
+  inactiveReason: KellyInactiveReason | null;
   parseStatus: "matched" | "unresolved";
   exclusionReason: string | null;
   yesTokenId: string | null;
   noTokenId: string | null;
+  entrySourceYes: KellyEntrySource;
+  entrySourceNo: KellyEntrySource;
   yesPrice: number | null;
   noPrice: number | null;
   yesBestBid: number | null;
@@ -330,6 +356,8 @@ export interface KellyMarketRow {
   noBestBid: number | null;
   noBestAsk: number | null;
   spreadPct: number | null;
+  rawProbabilityYes: number;
+  rawProbabilityNo: number;
   fairYes: number;
   fairNo: number;
   edgeYes: number;
@@ -341,8 +369,10 @@ export interface KellyMarketRow {
   updatedAt: string | null;
 }
 
+export type KellyRecommendationSlot = "primary" | "secondary" | "observation";
+
 export interface KellyRecommendation {
-  slot: "primary" | "secondary";
+  slot: KellyRecommendationSlot;
   marketId: string;
   title: string;
   marketUrl: string | null;
@@ -353,6 +383,129 @@ export interface KellyRecommendation {
   kellyFraction: number;
   suggestedStake: number;
   reason: string;
+}
+
+export interface KellyMethodologyFormulaSummary {
+  referenceRule: string;
+  adjustmentRule: string;
+  weightRule: string;
+  shrinkRule: string;
+  pricingRule: string;
+  observationRule: string;
+}
+
+export interface KellyMethodologyModel {
+  modelName: string;
+  modelCode: string | null;
+  currentPredictionC: number | null;
+  dayPeakTemperatureC: number | null;
+  biasNowC: number | null;
+  adjustedPeakTemperatureC: number | null;
+  sigmaC: number | null;
+  weight: number | null;
+  weightBreakdown:
+    | {
+        biasWeight: number;
+        consensusWeight: number;
+        rankWeight: number;
+        normalizedWeight: number;
+      }
+    | null;
+  included: boolean;
+  exclusionReason: string | null;
+}
+
+export interface KellyMethodologyShrinkInputs {
+  disagreement: number;
+  biasDispersion: number;
+  missingRatio: number;
+  stalePenalty: number;
+  disagreementFactor: number;
+  biasDispersionFactor: number;
+  missingRatioFactor: number;
+  clampFloor: number;
+  clampCeiling: number;
+  rawShrink: number;
+}
+
+export interface KellyMethodologyWeightBreakdown {
+  biasWeight: number;
+  consensusWeight: number;
+  rankWeight: number;
+  normalizedWeight: number;
+}
+
+export interface KellyProbabilityStep {
+  marketId: string;
+  contractType: KellyContractType;
+  lowerBoundC: number | null;
+  upperBoundC: number | null;
+  pRaw: number;
+  pFinal: number;
+}
+
+export interface KellyMethodologyProbabilitySteps {
+  gridStepC: number;
+  referencePriority: string[];
+  contractProbabilityRule: string;
+  shrinkRule: string;
+  fairPriceRule: string;
+  entryPriceRule: string;
+  edgeRule: string;
+  kellyRule: string;
+  details?: KellyProbabilityStep[];
+}
+
+export type KellyShrinkMode = "heuristic";
+
+export interface KellyMethodology {
+  generatedAt: string;
+  formulaVersion: string;
+  referenceTemperatureC: number | null;
+  referenceSource: KellyWeatherEvidence["currentReferenceSource"];
+  shrink: number;
+  shrinkMode: KellyShrinkMode;
+  shrinkInputs: KellyMethodologyShrinkInputs;
+  weightBreakdown: KellyMethodologyWeightBreakdown;
+  peakSpreadC: number;
+  usableModelCount: number;
+  totalModelCount: number;
+  summaries: KellyMethodologyFormulaSummary;
+  probabilitySteps: KellyMethodologyProbabilitySteps;
+  formulaNotes: string[];
+  models: KellyMethodologyModel[];
+}
+
+export interface KellyMarketEvidence {
+  marketId: string;
+  title: string;
+  eventTitle: string | null;
+  marketUrl: string | null;
+  eventUrl: string | null;
+  lifecycle: KellyMarketLifecycle;
+  inactiveReason: KellyInactiveReason | null;
+  parseStatus: "matched" | "unresolved";
+  exclusionReason: string | null;
+  ruleSummary: string | null;
+  resolutionSource: string | null;
+  pageFetchedAt: string | null;
+}
+
+export interface KellyFramePoint {
+  id: string;
+  marketId: string;
+  generatedAt: string;
+  marketPrice: number | null;
+  fairPrice: number | null;
+  yesMarketPrice: number | null;
+  noMarketPrice: number | null;
+  fairYes: number;
+  fairNo: number;
+  yesEdge: number;
+  noEdge: number;
+  spreadPct: number | null;
+  selectedSide: "yes" | "no" | "watch";
+  note: string | null;
 }
 
 export interface KellyDistributionSummary {
@@ -373,6 +526,23 @@ export interface KellySourceLinks {
   marketUrls: string[];
 }
 
+export interface KellyFreshness {
+  weatherGeneratedAt: string | null;
+  marketDiscoveredAt: string | null;
+  orderbookFetchedAt: string | null;
+  repricedAt: string | null;
+  lastStreamEventAt: string | null;
+  marketMotionState: KellyMarketMotionState;
+}
+
+export interface KellyStreamHealth {
+  state: KellySourceState;
+  reasonCode: KellyStreamReasonCode;
+  message: string;
+  lastSignalAt: string | null;
+  lastRepricedAt: string | null;
+}
+
 export interface KellyWorkbenchResponse {
   location: LocationInfo;
   targetDate: string;
@@ -387,14 +557,26 @@ export interface KellyWorkbenchResponse {
   probabilityCurve: KellyProbabilityCurvePoint[];
   bucketProbabilities: KellyBucketProbability[];
   markets: KellyMarketRow[];
+  inactiveMarkets: KellyMarketRow[];
   recommendations: KellyRecommendation[];
+  bestObservation: KellyRecommendation | null;
+  unresolvedMarkets: KellyMarketRow[];
+  marketEvidence: KellyMarketEvidence[];
+  methodology: KellyMethodology;
+  frameSeries: KellyFramePoint[];
   sourceLinks: KellySourceLinks;
+  freshness: KellyFreshness;
+  streamHealth: KellyStreamHealth;
   sourceStatus: KellySourceStatus[];
   warnings: string[];
 }
 
 export interface KellyStreamMarketPatch {
   marketId: string;
+  lifecycle: KellyMarketLifecycle;
+  inactiveReason: KellyInactiveReason | null;
+  entrySourceYes: KellyEntrySource;
+  entrySourceNo: KellyEntrySource;
   yesPrice: number | null;
   noPrice: number | null;
   yesBestBid: number | null;
@@ -416,12 +598,18 @@ export type KellyStreamMessage =
       type: "status";
       generatedAt: string;
       state: KellySourceState;
+      reasonCode: KellyStreamReasonCode;
       message: string;
+      lastSignalAt?: string | null;
+      lastRepricedAt?: string | null;
     }
   | {
       type: "markets";
       generatedAt: string;
       markets: KellyStreamMarketPatch[];
+      frames: KellyFramePoint[];
+      lastSignalAt?: string | null;
+      lastRepricedAt?: string | null;
     };
 
 export interface KellyRequestOptions {

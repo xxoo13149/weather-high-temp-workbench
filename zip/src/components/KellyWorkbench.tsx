@@ -1,103 +1,680 @@
-import { Activity, ArrowUpRight, Gauge, RefreshCw, Search, ShieldCheck, TrendingUp } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { deriveKellyRecommendations } from "../kelly";
-import type { KellyRecommendation, KellyRiskMode, KellyWorkbenchResponse, LocationDirectoryEntry } from "../types";
-import { formatDateTime, formatTime, valueOrDash } from "../utils";
+import { KellyWorkbench as KellyWorkbenchShell } from "./kelly";
+import type {
+  KellyDateChip,
+  KellyEvidenceSection,
+  KellyFieldErrors,
+  KellyMarketStatus,
+  KellyOpportunity,
+  KellyProbabilityPanelData,
+  KellyRiskMode,
+  KellySummaryMetric,
+  KellySyncMetric,
+  KellyWorkbenchData,
+} from "@/lib/kelly";
+import type { KellyRecommendation, KellyWorkbenchResponse, LocationDirectoryEntry } from "../types";
+import { formatDateTime, formatTime } from "../utils";
 
-const RISK_OPTIONS: Array<{ value: KellyRiskMode; label: string }> = [
-  { value: "conservative", label: "保守" },
-  { value: "balanced", label: "平衡" },
-  { value: "aggressive", label: "进取" },
-];
+type SnapshotMarket = KellyWorkbenchResponse["markets"][number] | KellyWorkbenchResponse["inactiveMarkets"][number];
 
-type FrameEntry = {
-  id: string;
-  marketId: string;
-  title: string;
-  side: KellyRecommendation["side"];
-  generatedAt: string;
-  edge: number;
-  fairPrice: number;
-  marketPrice: number;
+const SOURCE_LABELS: Record<KellyWorkbenchResponse["weatherEvidence"]["currentReferenceSource"], string> = {
+  manual: "手动输入",
+  "hourly-current": "当前实况",
+  "hourly-selected": "选中小时",
+  "model-mean": "模型均值",
 };
 
-const percent = (value: number | null | undefined, digits = 1) =>
-  typeof value === "number" && Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : "--";
-const price = (value: number | null | undefined) =>
-  typeof value === "number" && Number.isFinite(value) ? value.toFixed(3) : "--";
-const usd = (value: number | null | undefined) =>
-  typeof value === "number" && Number.isFinite(value) ? `$${value.toFixed(0)}` : "--";
+const RISK_MODE_LABELS: Record<KellyRiskMode, string> = {
+  conservative: "保守",
+  balanced: "均衡",
+  aggressive: "进取",
+};
 
-const buildFrameEntry = (recommendation: KellyRecommendation | null, generatedAt: string): FrameEntry | null =>
-  recommendation
-    ? {
-        id: `${generatedAt}:${recommendation.marketId}:${recommendation.side}`,
-        marketId: recommendation.marketId,
-        title: recommendation.title,
-        side: recommendation.side,
-        generatedAt,
-        edge: recommendation.edge,
-        fairPrice: recommendation.fairPrice,
-        marketPrice: recommendation.marketPrice,
-      }
-    : null;
+const INACTIVE_REASON_LABELS: Record<NonNullable<SnapshotMarket["inactiveReason"]>, string> = {
+  closed: "该档位已结束",
+  accepting_orders_disabled: "当前不再接受下单",
+  archived: "该档位已归档",
+  expired: "结束时间已过",
+  missing_tokens: "缺少完整 token 标识",
+  no_orderbook: "当前没有可用 orderbook",
+  no_executable_prices: "Yes / No 两侧都没有可执行价格",
+};
 
-const KellyChart = ({
+const CONTRACT_TYPE_LABELS: Record<SnapshotMarket["contractType"], string> = {
+  range: "区间",
+  atLeast: "至少",
+  atMost: "至多",
+  exact: "精确",
+};
+
+const DATE_RELATIVE_LABELS = ["今天", "明天", "后天"];
+
+const toPercentValue = (value: number | null | undefined) =>
+  typeof value === "number" && Number.isFinite(value) ? value * 100 : null;
+
+const formatTemp = (value: number | null | undefined) =>
+  typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(1)}°C` : "--";
+
+const formatPercent = (value: number | null | undefined, digits = 1) =>
+  typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(digits)}%` : "--";
+
+const formatSignedPercent = (value: number | null | undefined, digits = 1) =>
+  typeof value === "number" && Number.isFinite(value) ? `${value >= 0 ? "+" : ""}${value.toFixed(digits)}%` : "--";
+
+const formatUsd = (value: number | null | undefined) =>
+  typeof value === "number" && Number.isFinite(value)
+    ? new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        maximumFractionDigits: 0,
+      }).format(value)
+    : "--";
+
+const formatShortMonthDay = (value: string, timeZone?: string) => {
+  const iso = value.includes("T") ? value : `${value}T00:00:00Z`;
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: timeZone ?? "UTC",
+  }).format(parsed);
+};
+
+const resolveActionLabel = (side: KellyRecommendation["side"] | SnapshotMarket["recommendedSide"] | "watch") => {
+  if (side === "yes") {
+    return "买 Yes";
+  }
+  if (side === "no") {
+    return "买 No";
+  }
+  return "观察";
+};
+
+const resolveEntrySourceLabel = (source: SnapshotMarket["entrySourceYes"]) => {
+  if (source === "best-ask") {
+    return "best ask";
+  }
+  if (source === "midpoint") {
+    return "midpoint";
+  }
+  return "不可执行";
+};
+
+const resolveInactiveReason = (market: SnapshotMarket) =>
+  market.inactiveReason ? INACTIVE_REASON_LABELS[market.inactiveReason] : "当前不可交易";
+
+const sortMarkets = (markets: SnapshotMarket[]) =>
+  [...markets].sort((left, right) => {
+    const leftStart = left.bucketStartC ?? left.bucketEndC ?? Number.POSITIVE_INFINITY;
+    const rightStart = right.bucketStartC ?? right.bucketEndC ?? Number.POSITIVE_INFINITY;
+    if (leftStart !== rightStart) {
+      return leftStart - rightStart;
+    }
+    return left.title.localeCompare(right.title);
+  });
+
+const buildDateChips = (dates: string[], selectedDate: string, timeZone?: string): KellyDateChip[] =>
+  dates.slice(0, 3).map((date, index) => {
+    const shortLabel = formatShortMonthDay(date, timeZone);
+    const relativeLabel = DATE_RELATIVE_LABELS[index];
+    return {
+      value: date,
+      shortLabel,
+      label: relativeLabel ? `${relativeLabel} · ${shortLabel}` : shortLabel,
+      selected: date === selectedDate,
+    };
+  });
+
+const buildShortMarketLabel = (market: SnapshotMarket, targetDate: string, timeZone?: string) =>
+  `${market.bucketLabel} ${formatShortMonthDay(targetDate, timeZone)}`;
+
+const getContractTypeLabel = (contractType: SnapshotMarket["contractType"] | null | undefined) =>
+  contractType ? CONTRACT_TYPE_LABELS[contractType] ?? contractType : null;
+
+const buildOpportunityReasons = (market: SnapshotMarket | null, recommendation: KellyRecommendation, minEdge: number) => {
+  if (!market) {
+    return ["当前市场快照缺失，先保留观察位。"];
+  }
+
+  const entryPricePct = toPercentValue(
+    recommendation.side === "yes" ? (market.yesBestAsk ?? market.yesPrice) : (market.noBestAsk ?? market.noPrice),
+  );
+  const fairPricePct = toPercentValue(recommendation.fairPrice);
+  const edgePct = toPercentValue(recommendation.edge);
+
+  return [
+    `${resolveActionLabel(recommendation.side)} 可买价 ${formatPercent(entryPricePct)}，我们估值 ${formatPercent(fairPricePct)}。`,
+    `当前优势 ${formatSignedPercent(edgePct)}，最小优势阈值 ${formatPercent(minEdge * 100)}。`,
+    `建议金额 ${formatUsd(recommendation.suggestedStake)}，Kelly ${formatPercent(toPercentValue(recommendation.kellyFraction))}。`,
+  ];
+};
+
+const toOpportunity = (
+  snapshot: KellyWorkbenchResponse,
+  recommendation: KellyRecommendation,
+  tier: KellyOpportunity["tier"],
+  title: string,
+): KellyOpportunity => {
+  const market =
+    [...snapshot.markets, ...snapshot.inactiveMarkets].find((item) => item.marketId === recommendation.marketId) ?? null;
+
+  return {
+    id: `${tier}:${recommendation.marketId}:${recommendation.side}`,
+    marketId: recommendation.marketId,
+    tier,
+    title,
+    marketLabel: market ? buildShortMarketLabel(market, snapshot.targetDate, snapshot.location.timezone) : recommendation.title,
+    side: recommendation.side,
+    thesis:
+      tier === "watch"
+        ? "这档最接近执行线，先作为观察位保留。"
+        : `当前更适合 ${resolveActionLabel(recommendation.side)}，已按 ${RISK_MODE_LABELS[snapshot.riskMode]} 模式给出仓位。`,
+    confidenceLabel: tier === "watch" ? "仅观察" : `${RISK_MODE_LABELS[snapshot.riskMode]}模式`,
+    edgePct: toPercentValue(recommendation.edge),
+    fairPricePct: toPercentValue(recommendation.fairPrice),
+    marketPricePct: toPercentValue(recommendation.marketPrice),
+    kellyPct: toPercentValue(recommendation.kellyFraction),
+    suggestedStakeUsd: recommendation.suggestedStake,
+    reasons: buildOpportunityReasons(market, recommendation, snapshot.minEdge),
+    tags:
+      tier === "watch"
+        ? ["仅观察", "建议金额 = 0"]
+        : [resolveActionLabel(recommendation.side), `Kelly ${formatPercent(toPercentValue(recommendation.kellyFraction))}`],
+  };
+};
+
+const resolveSelectedSide = (market: SnapshotMarket | null): KellyRecommendation["side"] | "watch" => {
+  if (!market || market.recommendedSide === "none") {
+    if (!market) {
+      return "watch";
+    }
+    if (market.edgeYes > market.edgeNo) {
+      return "yes";
+    }
+    if (market.edgeNo > market.edgeYes) {
+      return "no";
+    }
+    return "watch";
+  }
+
+  return market.recommendedSide;
+};
+
+const resolveStreamTone = (snapshot: KellyWorkbenchResponse, streamState: string): KellySyncMetric["tone"] => {
+  if (streamState === "connecting") {
+    return "accent";
+  }
+  if (snapshot.streamHealth.reasonCode === "polling_fallback") {
+    return "warning";
+  }
+  if (snapshot.streamHealth.state === "connected") {
+    return snapshot.streamHealth.reasonCode === "no_recent_market_motion" ? "neutral" : "success";
+  }
+  if (snapshot.streamHealth.state === "degraded") {
+    return "warning";
+  }
+  if (snapshot.streamHealth.state === "disconnected") {
+    return "danger";
+  }
+  return "neutral";
+};
+
+const resolveStreamLabel = (snapshot: KellyWorkbenchResponse, streamState: string) => {
+  if (streamState === "connecting") {
+    return "正在建立订阅";
+  }
+
+  switch (snapshot.streamHealth.reasonCode) {
+    case "no_recent_market_motion":
+      return "已连接，最近无新盘口";
+    case "polling_fallback":
+      return "已回退到轮询";
+    case "no_matched_markets":
+      return "当前没有可订阅市场";
+    case "missing_tokens":
+      return "缺少可订阅 token";
+    case "reprice_failed":
+      return "收到信号，但重定价失败";
+    case "ws_error":
+      return snapshot.streamHealth.state === "disconnected" ? "实时流已断开" : "实时流异常";
+    case "upstream_error":
+      return "上游实时流异常";
+    case "ws_connected":
+      return "实时流已连接";
+    default:
+      return snapshot.streamHealth.message || "实时状态暂不可用";
+  }
+};
+
+const resolveStreamDetail = (snapshot: KellyWorkbenchResponse, timeZone?: string) => {
+  const lastSignal = snapshot.streamHealth.lastSignalAt
+    ? `最后流事件 ${formatDateTime(snapshot.streamHealth.lastSignalAt, timeZone)}`
+    : "最近还没有流事件";
+  const lastRepriced = snapshot.streamHealth.lastRepricedAt
+    ? `最后重定价 ${formatDateTime(snapshot.streamHealth.lastRepricedAt, timeZone)}`
+    : "最近还没有实时重定价";
+  return `${lastSignal} / ${lastRepriced}`;
+};
+
+const buildProbability = (snapshot: KellyWorkbenchResponse): KellyProbabilityPanelData => ({
+  title: "概率依据（辅助）",
+  subtitle: "用来解释温度分布和档位落点，不替代上面的仓位建议与主表。",
+  summary: `最可能高温区间 ${snapshot.distributionSummary.mostLikelyRangeLabel}，当前收缩 ${formatPercent(
+    snapshot.methodology.shrink * 100,
+  )}。`,
+  samples: snapshot.probabilityCurve.map((point) => ({
+    temperatureC: point.temperatureC,
+    probabilityPct: point.density * 100,
+  })),
+  thresholds: snapshot.bucketProbabilities.slice(0, 8).map((bucket) => ({
+    id: bucket.marketId,
+    marketId: bucket.marketId,
+    label: bucket.label,
+    temperatureC: bucket.bucketStartC ?? bucket.bucketEndC ?? snapshot.distributionSummary.modeTemperatureC,
+    detail: `Yes 公允价 ${formatPercent(bucket.probabilityYes * 100)}`,
+    tone: "neutral",
+  })),
+  notes: [
+    "先看仓位建议和主表，再回到这里核对落点。",
+    "当前版本的收缩系数是启发式口径，不是假装成历史回测拟合。",
+  ],
+});
+
+const buildEvidenceSections = (
+  snapshot: KellyWorkbenchResponse,
+  selectedMarketId: string | null,
+  timeZone?: string,
+): KellyEvidenceSection[] => {
+  const allMarkets = sortMarkets([...snapshot.markets, ...snapshot.inactiveMarkets]);
+  const market = allMarkets.find((item) => item.marketId === selectedMarketId) ?? allMarkets[0] ?? null;
+  const evidence = snapshot.marketEvidence.find((item) => item.marketId === market?.marketId) ?? null;
+  const probabilityStep =
+    snapshot.methodology.probabilitySteps.details?.find((item) => item.marketId === market?.marketId) ?? null;
+  const selectedSide = resolveSelectedSide(market);
+  const entryPrice = toPercentValue(
+    selectedSide === "yes"
+      ? (market?.yesBestAsk ?? market?.yesPrice)
+      : selectedSide === "no"
+        ? (market?.noBestAsk ?? market?.noPrice)
+        : null,
+  );
+  const fairPrice = toPercentValue(
+    selectedSide === "yes" ? market?.fairYes : selectedSide === "no" ? market?.fairNo : null,
+  );
+  const edge = toPercentValue(selectedSide === "yes" ? market?.edgeYes : selectedSide === "no" ? market?.edgeNo : null);
+  const kelly = toPercentValue(
+    selectedSide === "yes" ? market?.kellyYes : selectedSide === "no" ? market?.kellyNo : null,
+  );
+
+  return [
+    {
+      id: "decision",
+      title: "当前这档为什么值得看",
+      description: "先看当前建议、可买价、我们的估值和优势。",
+      items: [
+        {
+          id: "contract",
+          label: "当前档位",
+          value: market ? buildShortMarketLabel(market, snapshot.targetDate, timeZone) : "--",
+          detail: market?.bucketLabel ?? "当前还没有选中档位。",
+          tone: "accent",
+        },
+        {
+          id: "side",
+          label: "当前建议",
+          value: resolveActionLabel(selectedSide),
+          detail: market?.recommendedSide === "none" ? "未过执行阈值，先保留观察。" : "已进入执行路径。",
+        },
+        {
+          id: "pricing",
+          label: "可买价 / 我们估值",
+          value: `${formatPercent(entryPrice)} / ${formatPercent(fairPrice)}`,
+          detail: "默认取 best ask；缺失时该侧视为当前不可执行。",
+        },
+        {
+          id: "edge",
+          label: "优势 / Kelly",
+          value: `${formatSignedPercent(edge)} / ${formatPercent(kelly)}`,
+          detail: `建议金额 ${formatUsd(market?.suggestedStake ?? 0)}`,
+        },
+      ],
+    },
+    {
+      id: "weather",
+      title: "天气证据",
+      description: "核对参考温度、天气时刻、模型时刻和抓取时间。",
+      items: [
+        {
+          id: "reference",
+          label: "参考温度",
+          value: formatTemp(snapshot.weatherEvidence.currentReferenceTemperatureC),
+          detail: `来源：${SOURCE_LABELS[snapshot.weatherEvidence.currentReferenceSource]}`,
+          tone: "accent",
+        },
+        {
+          id: "timestamps",
+          label: "天气 / 模型时刻",
+          value: formatTime(snapshot.weatherEvidence.currentWeatherTimestamp, timeZone),
+          detail: `分析使用模型时刻 ${formatTime(snapshot.weatherEvidence.targetModelTimestamp, timeZone)}`,
+        },
+        {
+          id: "summary",
+          label: "中文摘要",
+          value: snapshot.weatherEvidence.sourceSummaryZh ?? "暂无摘要",
+          detail: `天气快照抓取于 ${formatDateTime(snapshot.weatherEvidence.fetchedAt, timeZone)}`,
+          sourceLabel: "回查 meteoblue 小时页",
+          sourceUrl: snapshot.weatherEvidence.hourlyPageUrl,
+        },
+      ],
+    },
+    {
+      id: "market",
+      title: "市场证据",
+      description: "完整题干、规则摘要和 resolution source 只放在这里回查。",
+      items: [
+        {
+          id: "title",
+          label: "完整标题",
+          value: evidence?.title ?? market?.title ?? "--",
+          detail: evidence?.eventTitle ?? undefined,
+          sourceLabel: "打开 Polymarket",
+          sourceUrl: evidence?.marketUrl ?? market?.marketUrl ?? undefined,
+        },
+        {
+          id: "rule",
+          label: "规则摘要",
+          value: evidence?.ruleSummary ?? "暂无规则摘要",
+          detail: evidence?.resolutionSource ?? undefined,
+        },
+        {
+          id: "lifecycle",
+          label: "交易状态",
+          value: market?.lifecycle === "tradable" ? "可交易" : "附录档位",
+          detail: market ? resolveInactiveReason(market) : "当前没有选中市场。",
+          sourceLabel: evidence?.eventUrl ? "事件页" : undefined,
+          sourceUrl: evidence?.eventUrl ?? undefined,
+        },
+      ],
+    },
+    {
+      id: "formula",
+      title: "公式口径",
+      description: "这不是官方公式，是我们当前版本的启发式定价口径。",
+      items: [
+        {
+          id: "shrink",
+          label: "收缩系数",
+          value: formatPercent(snapshot.methodology.shrink * 100),
+          detail: `分歧 ${snapshot.methodology.shrinkInputs.disagreement.toFixed(2)}°C / 偏差离散 ${snapshot.methodology.shrinkInputs.biasDispersion.toFixed(2)}°C / 缺失 ${(snapshot.methodology.shrinkInputs.missingRatio * 100).toFixed(1)}%`,
+        },
+        {
+          id: "probability",
+          label: "p_raw → p_final",
+          value:
+            probabilityStep !== null
+              ? `${formatPercent(probabilityStep.pRaw * 100)} → ${formatPercent(probabilityStep.pFinal * 100)}`
+              : "--",
+          detail: probabilityStep
+            ? `边界 ${formatTemp(probabilityStep.lowerBoundC)} ~ ${formatTemp(probabilityStep.upperBoundC)}`
+            : "当前档位没有概率积分明细。",
+        },
+        {
+          id: "pricing",
+          label: "fair / edge / Kelly",
+          value: `${formatPercent(fairPrice)} / ${formatSignedPercent(edge)} / ${formatPercent(kelly)}`,
+          detail: snapshot.methodology.probabilitySteps.kellyRule,
+        },
+      ],
+    },
+  ];
+};
+
+const buildMethodologyNotes = (snapshot: KellyWorkbenchResponse) => [
+  "当前版本的 shrink 为启发式收缩，不是历史回测拟合。",
+  `参考温度 ${formatTemp(snapshot.methodology.referenceTemperatureC)}，来源 ${SOURCE_LABELS[snapshot.methodology.referenceSource] ?? "系统参考"}`,
+  `权重拆解均值：bias ${snapshot.methodology.weightBreakdown.biasWeight.toFixed(2)} / consensus ${snapshot.methodology.weightBreakdown.consensusWeight.toFixed(2)} / rank ${snapshot.methodology.weightBreakdown.rankWeight.toFixed(2)} / normalized ${snapshot.methodology.weightBreakdown.normalizedWeight.toFixed(2)}`,
+  snapshot.methodology.probabilitySteps.fairPriceRule,
+  snapshot.methodology.probabilitySteps.edgeRule,
+  snapshot.methodology.probabilitySteps.kellyRule,
+];
+
+const buildData = ({
   snapshot,
+  locations,
+  activeLocationId,
+  draftControls,
+  draftDirty,
+  fieldErrors,
+  refreshDisabled,
   selectedMarketId,
-  onSelect,
+  streamState,
+  timeZone,
 }: {
   snapshot: KellyWorkbenchResponse;
+  locations: LocationDirectoryEntry[];
+  activeLocationId: string;
+  draftControls: {
+    bankrollInput: string;
+    minEdgeInput: string;
+    riskMode: KellyRiskMode;
+    actualTemperatureText: string;
+  };
+  draftDirty: boolean;
+  fieldErrors: KellyFieldErrors;
+  refreshDisabled: boolean;
   selectedMarketId: string | null;
-  onSelect: (marketId: string) => void;
-}) => {
-  const curve = snapshot.probabilityCurve;
-  const width = 900;
-  const height = 300;
-  const padding = { top: 18, right: 18, bottom: 34, left: 24 };
-  const minT = curve[0]?.temperatureC ?? 0;
-  const maxT = curve[curve.length - 1]?.temperatureC ?? 1;
-  const maxDensity = Math.max(...curve.map((point) => point.density), 0.01);
-  const span = Math.max(maxT - minT, 1);
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
-  const x = (value: number) => padding.left + ((value - minT) / span) * plotWidth;
-  const y = (value: number) => padding.top + plotHeight - (value / maxDensity) * plotHeight;
-  const path = curve.map((point, index) => `${index === 0 ? "M" : "L"} ${x(point.temperatureC).toFixed(2)} ${y(point.density).toFixed(2)}`).join(" ");
+  streamState: string;
+  timeZone?: string;
+}): KellyWorkbenchData => {
+  const matchedMarkets = sortMarkets(snapshot.markets);
+  const inactiveMarkets = sortMarkets(snapshot.inactiveMarkets);
+  const selectedMarket =
+    matchedMarkets.find((item) => item.marketId === selectedMarketId) ??
+    inactiveMarkets.find((item) => item.marketId === selectedMarketId) ??
+    matchedMarkets[0] ??
+    inactiveMarkets[0] ??
+    null;
+  const bestHighlighted = snapshot.recommendations[0] ?? snapshot.bestObservation ?? null;
+  const targetDateLabel = formatShortMonthDay(snapshot.targetDate, timeZone);
 
-  return (
-    <svg className="h-[260px] w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Kelly probability curve">
-      <defs>
-        <linearGradient id="kellyCurveFill" x1="0%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%" stopColor="rgba(154,230,110,0.34)" />
-          <stop offset="100%" stopColor="rgba(154,230,110,0.02)" />
-        </linearGradient>
-      </defs>
-      {snapshot.markets.filter((market) => market.parseStatus === "matched").slice(0, 8).map((market) => {
-        const start = market.contractType === "atMost" ? minT : (market.bucketStartC ?? minT);
-        const end = market.contractType === "atLeast" ? maxT : (market.bucketEndC ?? maxT);
-        return (
-          <rect
-            key={market.marketId}
-            x={x(start)}
-            y={padding.top}
-            width={Math.max(2, x(end) - x(start))}
-            height={plotHeight}
-            rx="12"
-            fill={market.marketId === selectedMarketId ? "rgba(255,200,107,0.14)" : "rgba(107,231,255,0.06)"}
-            stroke={market.marketId === selectedMarketId ? "rgba(255,200,107,0.4)" : "rgba(107,231,255,0.14)"}
-            onClick={() => onSelect(market.marketId)}
-            style={{ cursor: "pointer" }}
-          />
-        );
-      })}
-      <path d={`${path} L ${x(maxT)} ${padding.top + plotHeight} L ${x(minT)} ${padding.top + plotHeight} Z`} fill="url(#kellyCurveFill)" />
-      <path d={path} fill="none" stroke="rgba(154,230,110,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
+  const opportunities: KellyOpportunity[] = [
+    ...(snapshot.recommendations[0] ? [toOpportunity(snapshot, snapshot.recommendations[0], "primary", "主仓建议")] : []),
+    ...(snapshot.recommendations[1] ? [toOpportunity(snapshot, snapshot.recommendations[1], "secondary", "副仓建议")] : []),
+    ...(snapshot.bestObservation ? [toOpportunity(snapshot, snapshot.bestObservation, "watch", "观察位")] : []),
+  ];
+
+  const markets = matchedMarkets.map((market) => {
+    const dominantSide =
+      market.recommendedSide === "yes"
+        ? "yes"
+        : market.recommendedSide === "no"
+          ? "no"
+          : market.edgeYes >= market.edgeNo
+            ? "yes"
+            : "no";
+    const status: KellyMarketStatus =
+      market.lifecycle === "tradable"
+        ? typeof market.spreadPct === "number" && market.spreadPct > 0.08
+          ? "thin"
+          : "tradable"
+        : "locked";
+
+    return {
+      id: market.marketId,
+      marketId: market.marketId,
+      label: buildShortMarketLabel(market, snapshot.targetDate, timeZone),
+      rangeLabel: getContractTypeLabel(market.contractType) ?? market.bucketLabel,
+      yesPricePct: toPercentValue(market.yesBestAsk ?? market.yesPrice),
+      noPricePct: toPercentValue(market.noBestAsk ?? market.noPrice),
+      fairYesPct: toPercentValue(market.fairYes),
+      fairNoPct: toPercentValue(market.fairNo),
+      yesEdgePct: toPercentValue(market.edgeYes),
+      noEdgePct: toPercentValue(market.edgeNo),
+      yesKellyPct: toPercentValue(market.kellyYes),
+      noKellyPct: toPercentValue(market.kellyNo),
+      spreadPct: toPercentValue(market.spreadPct),
+      suggestedStakeUsd: market.recommendedSide === "none" ? 0 : market.suggestedStake,
+      recommendation: market.recommendedSide === "none" ? "观察" : "执行",
+      recommendationSide: resolveActionLabel(market.recommendedSide),
+      status,
+      detail:
+        market.recommendedSide === "none"
+          ? `当前最佳优势 ${formatSignedPercent(toPercentValue(dominantSide === "yes" ? market.edgeYes : market.edgeNo))}，先保留观察。`
+          : `${resolveActionLabel(market.recommendedSide)}，建议金额 ${formatUsd(market.suggestedStake)}。`,
+      spreadLabel: formatPercent(toPercentValue(market.spreadPct)),
+      updatedAtLabel: formatTime(market.updatedAt, timeZone),
+      note: `Yes ${resolveEntrySourceLabel(market.entrySourceYes)} / No ${resolveEntrySourceLabel(market.entrySourceNo)}`,
+    };
+  });
+
+  const inactiveRows = inactiveMarkets.map((market) => ({
+    id: market.marketId,
+    marketId: market.marketId,
+    label: buildShortMarketLabel(market, snapshot.targetDate, timeZone),
+    rangeLabel: getContractTypeLabel(market.contractType) ?? market.bucketLabel,
+    yesPricePct: toPercentValue(market.yesBestAsk ?? market.yesPrice),
+    noPricePct: toPercentValue(market.noBestAsk ?? market.noPrice),
+    fairYesPct: toPercentValue(market.fairYes),
+    fairNoPct: toPercentValue(market.fairNo),
+    yesEdgePct: toPercentValue(market.edgeYes),
+    noEdgePct: toPercentValue(market.edgeNo),
+    yesKellyPct: toPercentValue(market.kellyYes),
+    noKellyPct: toPercentValue(market.kellyNo),
+    spreadPct: toPercentValue(market.spreadPct),
+    suggestedStakeUsd: 0,
+    recommendation: "附录",
+    recommendationSide: "当前不可交易",
+    status: "locked" as const,
+    detail: resolveInactiveReason(market),
+    spreadLabel: formatPercent(toPercentValue(market.spreadPct)),
+    updatedAtLabel: formatTime(market.updatedAt, timeZone),
+    note: "已移出主表，仅保留回查。",
+    isInactive: true,
+    inactiveReason: resolveInactiveReason(market),
+  }));
+
+  const summaryMetrics: KellySummaryMetric[] = [
+    {
+      id: "reference",
+      label: "参考温度",
+      value: formatTemp(snapshot.weatherEvidence.currentReferenceTemperatureC),
+      detail: `来源：${SOURCE_LABELS[snapshot.weatherEvidence.currentReferenceSource]}`,
+      tone: "accent",
+    },
+    {
+      id: "range",
+      label: "最可能高温区间",
+      value: snapshot.distributionSummary.mostLikelyRangeLabel,
+      detail: `模型分歧 ${snapshot.distributionSummary.peakSpreadC.toFixed(2)}°C`,
+      tone: "warning",
+    },
+    {
+      id: "best",
+      label: "当前最值得看",
+      value: bestHighlighted ? `${resolveActionLabel(bestHighlighted.side)} ${formatSignedPercent(toPercentValue(bestHighlighted.edge))}` : "--",
+      detail: bestHighlighted?.title ?? "当前还没有可交易档位。",
+      tone: bestHighlighted ? "success" : "neutral",
+    },
+  ];
+
+  const syncMetrics: KellySyncMetric[] = [
+    {
+      id: "weather",
+      label: "天气分析时间",
+      value: formatDateTime(snapshot.freshness.weatherGeneratedAt, timeZone),
+      detail: `参考口径：${SOURCE_LABELS[snapshot.weatherEvidence.currentReferenceSource]}`,
+      tone: snapshot.weatherEvidence.stale ? "warning" : "success",
+    },
+    {
+      id: "discovery",
+      label: "市场目录时间",
+      value: formatDateTime(snapshot.freshness.marketDiscoveredAt, timeZone),
+      detail: "Polymarket 市场发现快照时间",
+      tone: snapshot.freshness.marketDiscoveredAt ? "accent" : "warning",
+    },
+    {
+      id: "orderbook",
+      label: "盘口快照时间",
+      value: formatDateTime(snapshot.freshness.orderbookFetchedAt, timeZone),
+      detail: selectedMarket ? `当前选中档位更新时间 ${formatDateTime(selectedMarket.updatedAt, timeZone)}` : "当前还没有盘口快照。",
+      tone: snapshot.freshness.orderbookFetchedAt ? "success" : "warning",
+    },
+    {
+      id: "stream",
+      label: "实时状态",
+      value: resolveStreamLabel(snapshot, streamState),
+      detail: resolveStreamDetail(snapshot, timeZone),
+      tone: resolveStreamTone(snapshot, streamState),
+    },
+  ];
+
+  return {
+    title: "Kelly 实验台",
+    subtitle: "先选日期，再看仓位建议和主表；完整题干退到右侧证据区。",
+    locationId: activeLocationId,
+    locationOptions: locations.map((location) => ({
+      id: location.id,
+      label: location.displayName,
+      labelZh: location.displayNameZh,
+      shortLabel: location.shortLabel,
+      timezone: location.timezone,
+      timezoneGroup: location.timezoneGroup,
+      disabled: !location.enabled,
+    })),
+    targetDate: snapshot.targetDate,
+    dateOptions: snapshot.availableTargetDates,
+    dateChips: buildDateChips(
+      snapshot.availableTargetDates.length ? snapshot.availableTargetDates : [snapshot.targetDate],
+      snapshot.targetDate,
+      timeZone,
+    ),
+    bankrollInput: draftControls.bankrollInput,
+    minEdgeInput: draftControls.minEdgeInput,
+    actualTemperatureInput: draftControls.actualTemperatureText,
+    riskMode: draftControls.riskMode,
+    riskModeOptions: [
+      { value: "conservative", label: "保守", hint: "0.25x Kelly，单市场上限 5%" },
+      { value: "balanced", label: "均衡", hint: "0.5x Kelly，单市场上限 10%" },
+      { value: "aggressive", label: "进取", hint: "0.75x Kelly，单市场上限 15%" },
+    ],
+    refreshDisabled,
+    draftDirty,
+    statusNote: draftDirty ? "参数已修改，点击“刷新分析”后应用。" : snapshot.warnings[0] ?? snapshot.streamHealth.message ?? null,
+    fieldErrors,
+    marketUrl: selectedMarket?.marketUrl ?? snapshot.sourceLinks.marketUrls[0] ?? snapshot.sourceLinks.polymarketSearchUrl,
+    syncMetrics,
+    summaryMetrics,
+    opportunities,
+    opportunityEmptyState: markets.length === 0 ? snapshot.warnings[0] ?? "当前没有可交易档位。" : "当前没有过线机会，先保留观察位。",
+    probability: buildProbability(snapshot),
+    markets,
+    inactiveMarkets: inactiveRows,
+    marketEmptyState: snapshot.warnings[0] ?? "当前没有可展示的温度档位。",
+    unresolvedMarkets: [],
+    evidenceSections: buildEvidenceSections(snapshot, selectedMarketId, timeZone),
+    methodologyNotes: buildMethodologyNotes(snapshot),
+    methodologyModels: snapshot.methodology.models.map((model) => ({
+      id: model.modelCode ?? model.modelName,
+      modelLabel: model.modelCode ?? model.modelName,
+      currentPredictionLabel: formatTemp(model.currentPredictionC),
+      biasNowLabel:
+        typeof model.biasNowC === "number" ? `${model.biasNowC >= 0 ? "+" : ""}${model.biasNowC.toFixed(1)}°C` : "--",
+      adjustedPeakLabel: formatTemp(model.adjustedPeakTemperatureC),
+      weightLabel: typeof model.weight === "number" ? `${(model.weight * 100).toFixed(1)}%` : "--",
+      statusLabel: model.included ? "已纳入" : "已排除",
+      detail:
+        model.included && model.weightBreakdown
+          ? `bias ${model.weightBreakdown.biasWeight.toFixed(2)} / consensus ${model.weightBreakdown.consensusWeight.toFixed(2)} / rank ${model.weightBreakdown.rankWeight.toFixed(2)}`
+          : model.exclusionReason ?? "本轮未纳入计算。",
+      included: model.included,
+    })),
+    frameAnalysisGroups: [],
+  };
 };
 
 export const KellyWorkbench = ({
@@ -105,11 +682,15 @@ export const KellyWorkbench = ({
   locations,
   activeLocationId,
   timezone,
-  bankroll,
+  bankrollInput,
   riskMode,
-  minEdge,
+  minEdgeInput,
   actualTemperatureText,
+  draftDirty = false,
+  fieldErrors = {},
   loading,
+  refreshing = false,
+  refreshDisabled = false,
   error,
   streamState,
   onLocationChange,
@@ -124,86 +705,119 @@ export const KellyWorkbench = ({
   locations: LocationDirectoryEntry[];
   activeLocationId: string;
   timezone?: string;
-  bankroll: number;
+  bankrollInput: string;
   riskMode: KellyRiskMode;
-  minEdge: number;
+  minEdgeInput: string;
   actualTemperatureText: string;
+  draftDirty?: boolean;
+  fieldErrors?: KellyFieldErrors;
   loading: boolean;
+  refreshing?: boolean;
+  refreshDisabled?: boolean;
   error: string | null;
   streamState: string;
   onLocationChange: (locationId: string) => void;
   onTargetDateChange: (targetDate: string) => void;
-  onBankrollChange: (bankroll: number | null) => void;
+  onBankrollChange: (value: string) => void;
   onRiskModeChange: (riskMode: KellyRiskMode) => void;
-  onMinEdgeChange: (minEdge: number | null) => void;
+  onMinEdgeChange: (value: string) => void;
   onActualTemperatureChange: (value: string) => void;
   onRefresh: () => void;
 }) => {
   const [selectedMarketId, setSelectedMarketId] = useState<string | null>(null);
-  const [frames, setFrames] = useState<FrameEntry[]>([]);
-  const lastFrameIdRef = useRef<string | null>(null);
-  const recommendations = useMemo(() => deriveKellyRecommendations(snapshot?.markets ?? [], bankroll, riskMode, minEdge), [bankroll, minEdge, riskMode, snapshot?.markets]);
-  const activeRecommendations = recommendations.length > 0 ? recommendations : snapshot?.recommendations ?? [];
+  const [selectedOpportunityId, setSelectedOpportunityId] = useState<string | null>(null);
 
   useEffect(() => {
-    setFrames([]);
-    lastFrameIdRef.current = null;
+    setSelectedMarketId(null);
+    setSelectedOpportunityId(null);
   }, [snapshot?.location.id, snapshot?.targetDate]);
 
   useEffect(() => {
-    if (!snapshot?.markets.length) {
+    if (!snapshot) {
       setSelectedMarketId(null);
       return;
     }
-    if (selectedMarketId && snapshot.markets.some((market) => market.marketId === selectedMarketId)) {
+
+    const allMarkets = [...snapshot.markets, ...snapshot.inactiveMarkets];
+    if (selectedMarketId && allMarkets.some((market) => market.marketId === selectedMarketId)) {
       return;
     }
-    setSelectedMarketId(snapshot.recommendations[0]?.marketId ?? snapshot.markets[0]?.marketId ?? null);
+
+    setSelectedMarketId(
+      snapshot.recommendations[0]?.marketId ??
+        snapshot.bestObservation?.marketId ??
+        snapshot.markets[0]?.marketId ??
+        snapshot.inactiveMarkets[0]?.marketId ??
+        null,
+    );
   }, [selectedMarketId, snapshot]);
 
-  useEffect(() => {
-    if (!snapshot) {
-      return;
-    }
-    const focus = activeRecommendations.find((item) => item.marketId === selectedMarketId) ?? activeRecommendations[0] ?? null;
-    const frame = buildFrameEntry(focus, snapshot.generatedAt);
-    if (!frame || frame.id === lastFrameIdRef.current) {
-      return;
-    }
-    lastFrameIdRef.current = frame.id;
-    setFrames((current) => [frame, ...current].slice(0, 10));
-  }, [activeRecommendations, selectedMarketId, snapshot]);
+  const data = useMemo(
+    () =>
+      snapshot
+        ? buildData({
+            snapshot,
+            locations,
+            activeLocationId,
+            draftControls: {
+              bankrollInput,
+              minEdgeInput,
+              riskMode,
+              actualTemperatureText,
+            },
+            draftDirty,
+            fieldErrors,
+            refreshDisabled,
+            selectedMarketId,
+            streamState,
+            timeZone: timezone,
+          })
+        : null,
+    [
+      actualTemperatureText,
+      activeLocationId,
+      bankrollInput,
+      draftDirty,
+      fieldErrors,
+      locations,
+      minEdgeInput,
+      refreshDisabled,
+      riskMode,
+      selectedMarketId,
+      snapshot,
+      streamState,
+      timezone,
+    ],
+  );
 
-  const selectedMarket = snapshot?.markets.find((market) => market.marketId === selectedMarketId) ?? null;
-  const locationLabel = locations.find((item) => item.id === activeLocationId)?.displayNameZh ?? locations.find((item) => item.id === activeLocationId)?.displayName ?? snapshot?.location.name ?? "--";
-
-  if (!snapshot && loading) {
-    return <section className="terminal-panel flex min-h-[420px] items-center justify-center px-6 py-10"><div className="panel-section text-center"><div className="eyebrow">Kelly 实验台</div><div className="mt-3 text-3xl font-semibold text-white">正在同步天气与盘口</div><div className="mt-3 text-sm text-white/56">先拉取天气证据，再匹配市场并建立实时流。</div></div></section>;
-  }
-  if (!snapshot) {
-    return <section className="terminal-panel flex min-h-[380px] items-center justify-center px-6 py-10"><div className="panel-section max-w-xl text-center"><div className="rounded-full border border-[rgba(255,107,107,0.24)] bg-[rgba(255,107,107,0.08)] px-3 py-1 text-xs text-[var(--danger)]">Kelly 实验台暂不可用</div><div className="mt-4 text-sm leading-6 text-white/62">{error ?? "当前还没有可用的 Kelly 快照。"}</div></div></section>;
+  if (!snapshot || !data) {
+    return (
+      <section className="terminal-panel">
+        <div className="panel-section">
+          <div className="eyebrow">Kelly 实验台</div>
+          <h2 className="mt-3 text-xl font-semibold text-white">{loading ? "正在加载 Kelly 分析..." : "Kelly 实验台暂不可用"}</h2>
+          <p className="mt-3 text-sm text-white/64">{error ?? "当前还没有可展示的 Kelly 快照。"}</p>
+        </div>
+      </section>
+    );
   }
 
   return (
-    <section className="flex min-h-0 flex-col gap-4">
-      <div className="terminal-panel"><div className="panel-section grid gap-4 px-4 py-4 md:grid-cols-[1.2fr_repeat(6,minmax(0,1fr))] md:px-5">
-        <div className="space-y-2"><div className="eyebrow">Kelly 实验台</div><h2 className="text-[clamp(1.35rem,2vw,1.85rem)] font-semibold tracking-[-0.02em] text-white">{locationLabel}</h2><p className="text-sm leading-6 text-white/56">把天气证据、公允概率、盘口价格和 Kelly 建议放到同一工作面。</p><div className="flex flex-wrap gap-2 text-xs text-white/52"><span className="rounded-full border border-white/10 px-2.5 py-1">分析 {formatDateTime(snapshot.generatedAt, timezone)}</span><span className="rounded-full border border-white/10 px-2.5 py-1">实时流 {streamState}</span></div></div>
-        <label className="space-y-1.5 text-sm text-white/70"><span className="text-[11px] uppercase tracking-[0.16em] text-white/38">地点</span><select value={activeLocationId} onChange={(event) => onLocationChange(event.target.value)} className="h-11 w-full rounded-[16px] border border-white/10 bg-black/20 px-3 text-white outline-none">{locations.map((location) => <option key={location.id} value={location.id}>{location.displayNameZh || location.displayName}</option>)}</select></label>
-        <label className="space-y-1.5 text-sm text-white/70"><span className="text-[11px] uppercase tracking-[0.16em] text-white/38">目标日期</span><select value={snapshot.targetDate} onChange={(event) => onTargetDateChange(event.target.value)} className="h-11 w-full rounded-[16px] border border-white/10 bg-black/20 px-3 text-white outline-none">{snapshot.availableTargetDates.map((date) => <option key={date} value={date}>{date}</option>)}</select></label>
-        <label className="space-y-1.5 text-sm text-white/70"><span className="text-[11px] uppercase tracking-[0.16em] text-white/38">本金</span><Input type="number" min="1" step="1" value={Number.isFinite(bankroll) ? String(bankroll) : ""} onChange={(event) => onBankrollChange(event.target.value ? Number.parseFloat(event.target.value) : null)} /></label>
-        <label className="space-y-1.5 text-sm text-white/70"><span className="text-[11px] uppercase tracking-[0.16em] text-white/38">风险模式</span><select value={riskMode} onChange={(event) => onRiskModeChange(event.target.value as KellyRiskMode)} className="h-11 w-full rounded-[16px] border border-white/10 bg-black/20 px-3 text-white outline-none">{RISK_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-        <label className="space-y-1.5 text-sm text-white/70"><span className="text-[11px] uppercase tracking-[0.16em] text-white/38">最小 Edge</span><Input type="number" min="0" max="100" step="0.1" value={Number.isFinite(minEdge) ? String(minEdge * 100) : ""} onChange={(event) => onMinEdgeChange(event.target.value ? Number.parseFloat(event.target.value) / 100 : null)} /></label>
-        <label className="space-y-1.5 text-sm text-white/70"><span className="text-[11px] uppercase tracking-[0.16em] text-white/38">参考温度</span><Input value={actualTemperatureText} placeholder="留空则使用系统参考温度" onChange={(event) => onActualTemperatureChange(event.target.value)} /></label>
-        <div className="flex flex-col gap-2"><Button type="button" onClick={onRefresh} disabled={loading} className="h-11 justify-center"><RefreshCw className={`mr-2 h-4 w-4 ${loading ? "animate-spin" : ""}`} />刷新分析</Button><div className="flex items-center justify-center gap-2 rounded-[16px] border border-white/8 bg-white/[0.03] px-3 py-2 text-xs text-white/56"><Activity className="h-4 w-4" />实时流 {streamState}</div></div>
-      </div></div>
-
-      {error ? <div className="rounded-[18px] border border-[rgba(255,107,107,0.22)] bg-[rgba(255,107,107,0.08)] px-4 py-3 text-sm text-[var(--danger)]">{error}</div> : null}
-
-      <div className="grid gap-4 xl:grid-cols-[0.92fr_1.35fr_0.95fr]">
-        <div className="terminal-panel"><div className="panel-section flex h-full flex-col gap-3 px-4 py-4 md:px-5"><div className="flex items-center gap-2 text-white/62"><ShieldCheck className="h-4 w-4 text-[var(--accent)]" /><span className="text-sm font-medium">主副仓建议</span></div>{[activeRecommendations[0] ?? null, activeRecommendations[1] ?? null].map((recommendation, index) => <button key={recommendation?.marketId ?? index} type="button" onClick={() => recommendation && setSelectedMarketId(recommendation.marketId)} className="rounded-[20px] border border-white/8 bg-white/[0.03] p-4 text-left"><div className="text-[11px] uppercase tracking-[0.18em] text-white/40">{index === 0 ? "Primary" : "Secondary"}</div>{recommendation ? <><div className="mt-3 text-base font-semibold text-white">{recommendation.title}</div><div className="mt-2 flex flex-wrap gap-2 text-xs text-white/54"><span className="rounded-full border border-white/10 px-2 py-0.5 uppercase tracking-[0.12em]">{recommendation.side}</span><span>公允 {price(recommendation.fairPrice)}</span><span>入场 {price(recommendation.marketPrice)}</span></div><div className="mt-3 flex items-end justify-between gap-3"><div className="text-[var(--accent)]">{percent(recommendation.edge, 1)}</div><div className="text-white">{usd(recommendation.suggestedStake)}</div></div><div className="mt-3 text-sm text-white/56">{recommendation.reason}</div></> : <div className="mt-3 text-sm text-white/48">当前没有达到阈值的机会。</div>}</button>)}<div className="rounded-[20px] border border-white/8 bg-white/[0.03] p-4"><div className="text-[11px] uppercase tracking-[0.18em] text-white/40">摘要</div><div className="mt-3 grid gap-3 sm:grid-cols-2 text-sm text-white/62"><div><div className="text-white/40">最可能区间</div><div className="mt-1 text-lg font-semibold text-white">{snapshot.distributionSummary.mostLikelyRangeLabel}</div></div><div><div className="text-white/40">参考温度</div><div className="mt-1 text-lg font-semibold text-white">{valueOrDash(snapshot.weatherEvidence.currentReferenceTemperatureC, "°C")}</div></div><div><div className="text-white/40">模型参与数</div><div className="mt-1 text-lg font-semibold text-white">{snapshot.weatherEvidence.participatingModelCount}</div></div><div><div className="text-white/40">收缩系数</div><div className="mt-1 text-lg font-semibold text-white">{percent(snapshot.distributionSummary.shrink, 1)}</div></div></div></div></div></div>
-        <div className="terminal-panel"><div className="panel-section flex h-full flex-col gap-4 px-4 py-4 md:px-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="eyebrow">连续温度分布</div><div className="mt-2 text-lg font-semibold text-white">{snapshot.distributionSummary.mostLikelyRangeLabel}</div><div className="mt-1 text-sm text-white/54">中位 {valueOrDash(snapshot.distributionSummary.medianTemperatureC, "°C")} · 模式 {valueOrDash(snapshot.distributionSummary.modeTemperatureC, "°C")} · 分歧 {valueOrDash(snapshot.distributionSummary.peakSpreadC, "°C")}</div></div><div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/58"><TrendingUp className="h-3.5 w-3.5 text-[var(--accent)]" />先看高温落点，再看市场定价</div></div><div className="overflow-hidden rounded-[24px] border border-white/8 bg-[linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01))] p-3"><KellyChart snapshot={snapshot} selectedMarketId={selectedMarketId} onSelect={setSelectedMarketId} /></div><div className="overflow-x-auto"><table className="min-w-full text-left text-sm text-white/72"><thead className="text-[11px] uppercase tracking-[0.14em] text-white/38"><tr><th className="pb-3 pr-4">合约</th><th className="pb-3 pr-4">盘口</th><th className="pb-3 pr-4">公允</th><th className="pb-3 pr-4">Yes edge</th><th className="pb-3 pr-4">No edge</th><th className="pb-3 pr-4">仓位</th></tr></thead><tbody>{[...snapshot.markets].sort((a, b) => Math.max(b.edgeYes, b.edgeNo) - Math.max(a.edgeYes, a.edgeNo)).map((market) => <tr key={market.marketId} className={`border-t border-white/6 ${market.marketId === selectedMarketId ? "bg-white/[0.04]" : ""}`}><td className="py-3 pr-4"><button type="button" className="text-left" onClick={() => setSelectedMarketId(market.marketId)}><div className="font-medium text-white">{market.title}</div><div className="mt-1 text-xs text-white/44">{market.bucketLabel}</div></button></td><td className="py-3 pr-4 data-mono"><div>Yes {price(market.yesBestAsk ?? market.yesPrice)}</div><div className="text-white/46">No {price(market.noBestAsk ?? market.noPrice)}</div></td><td className="py-3 pr-4 data-mono"><div>Yes {price(market.fairYes)}</div><div className="text-white/46">No {price(market.fairNo)}</div></td><td className="py-3 pr-4 data-mono text-[var(--accent)]">{percent(market.edgeYes, 1)}</td><td className="py-3 pr-4 data-mono">{percent(market.edgeNo, 1)}</td><td className="py-3 pr-4 data-mono"><div>{usd(market.suggestedStake)}</div><div className="text-white/46">{market.recommendedSide}</div></td></tr>)}</tbody></table></div></div></div>
-        <div className="terminal-panel"><div className="panel-section flex h-full flex-col gap-3 px-4 py-4 md:px-5"><div className="flex items-center gap-2 text-white/62"><Search className="h-4 w-4 text-[var(--accent)]" /><span className="text-sm font-medium">证据与逐帧分析</span></div><div className="rounded-[20px] border border-white/8 bg-white/[0.03] p-4 text-sm text-white/62"><div className="text-[11px] uppercase tracking-[0.18em] text-white/40">天气证据</div><div className="mt-3 space-y-2"><div className="flex justify-between gap-3"><span>参考来源</span><strong className="text-white">{snapshot.weatherEvidence.currentReferenceSource}</strong></div><div className="flex justify-between gap-3"><span>天气时刻</span><strong className="text-white">{formatTime(snapshot.weatherEvidence.currentWeatherTimestamp, timezone)}</strong></div><div className="flex justify-between gap-3"><span>模型时刻</span><strong className="text-white">{formatTime(snapshot.weatherEvidence.targetModelTimestamp, timezone)}</strong></div><div className="flex justify-between gap-3"><span>抓取时间</span><strong className="text-white">{formatDateTime(snapshot.weatherEvidence.fetchedAt, timezone)}</strong></div></div>{snapshot.weatherEvidence.sourceSummaryZh ? <div className="mt-3 rounded-[16px] border border-white/8 bg-black/20 px-3 py-2 leading-6 text-white/58">{snapshot.weatherEvidence.sourceSummaryZh}</div> : null}</div><div className="rounded-[20px] border border-white/8 bg-white/[0.03] p-4 text-sm text-white/62"><div className="text-[11px] uppercase tracking-[0.18em] text-white/40">回查与状态</div><div className="mt-3 space-y-2">{snapshot.sourceStatus.map((status) => <div key={status.kind} className="flex items-start justify-between gap-3"><div><div className="font-medium text-white">{status.label}</div><div className="mt-1 text-xs leading-5 text-white/46">{status.kind === "stream" ? (status.state === "fresh" || streamState === "connected" ? "已收到实时盘口更新。" : "等待前端建立实时订阅。") : (status.detail ?? "--")}</div></div><div className="rounded-full border border-white/10 px-2.5 py-1 text-[11px] uppercase tracking-[0.12em] text-white/56">{status.state}</div></div>)}</div><div className="mt-3 grid gap-2"><a href={snapshot.sourceLinks.meteoblueWeekUrl} target="_blank" rel="noreferrer" className="flex items-center justify-between rounded-[14px] border border-white/8 bg-black/20 px-3 py-2 text-white/72"><span>meteoblue 周页</span><ArrowUpRight className="h-4 w-4" /></a><a href={snapshot.sourceLinks.polymarketSearchUrl} target="_blank" rel="noreferrer" className="flex items-center justify-between rounded-[14px] border border-white/8 bg-black/20 px-3 py-2 text-white/72"><span>Polymarket 搜索</span><ArrowUpRight className="h-4 w-4" /></a></div></div>{selectedMarket ? <div className="rounded-[20px] border border-white/8 bg-white/[0.03] p-4 text-sm text-white/62"><div className="flex items-center gap-2 text-white/68"><Gauge className="h-4 w-4 text-[var(--accent)]" />当前聚焦</div><div className="mt-2 text-base font-semibold text-white">{selectedMarket.title}</div><div className="mt-2 grid gap-2"><div className="flex justify-between gap-3"><span>推荐方向</span><strong className="text-white">{selectedMarket.recommendedSide}</strong></div><div className="flex justify-between gap-3"><span>盘口 spread</span><strong className="text-white">{percent(selectedMarket.spreadPct, 1)}</strong></div><div className="flex justify-between gap-3"><span>最后更新</span><strong className="text-white">{formatDateTime(selectedMarket.updatedAt, timezone)}</strong></div></div></div> : null}<div className="flex-1 space-y-2 overflow-y-auto pr-1">{frames.length > 0 ? frames.map((frame) => <button key={frame.id} type="button" onClick={() => setSelectedMarketId(frame.marketId)} className={`w-full rounded-[18px] border px-4 py-3 text-left ${frame.marketId === selectedMarketId ? "border-[rgba(154,230,110,0.28)] bg-[rgba(154,230,110,0.08)]" : "border-white/8 bg-white/[0.03]"}`}><div className="flex items-start justify-between gap-3"><div><div className="font-medium text-white">{frame.title}</div><div className="mt-1 text-xs text-white/46">{formatTime(frame.generatedAt, timezone)} · {frame.side.toUpperCase()}</div></div><div className="data-mono text-[var(--accent)]">{percent(frame.edge, 1)}</div></div><div className="mt-2 grid grid-cols-2 gap-2 text-xs text-white/56"><div>市场价 {price(frame.marketPrice)}</div><div>公允价 {price(frame.fairPrice)}</div></div></button>) : <div className="rounded-[18px] border border-white/8 bg-white/[0.03] px-4 py-6 text-sm text-white/56">等待第一帧实时更新，这里会滚动记录盘口和公允价的变化。</div>}</div></div></div>
-      </div>
-    </section>
+    <KellyWorkbenchShell
+      data={data}
+      disabled={loading || refreshing}
+      refreshing={refreshing}
+      selectedMarketId={selectedMarketId}
+      selectedOpportunityId={selectedOpportunityId}
+      onLocationChange={onLocationChange}
+      onTargetDateChange={onTargetDateChange}
+      onBankrollChange={onBankrollChange}
+      onMinEdgeChange={onMinEdgeChange}
+      onActualTemperatureChange={onActualTemperatureChange}
+      onRiskModeChange={onRiskModeChange}
+      onRefresh={onRefresh}
+      onSelectOpportunity={setSelectedOpportunityId}
+      onSelectMarket={setSelectedMarketId}
+    />
   );
 };

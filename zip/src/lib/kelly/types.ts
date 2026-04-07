@@ -25,6 +25,19 @@ export interface KellySelectOption<T extends string = string> {
   disabled?: boolean;
 }
 
+export interface KellyDateChip {
+  value: string;
+  label: string;
+  shortLabel: string;
+  selected?: boolean;
+}
+
+export interface KellyFieldErrors {
+  bankroll?: string | null;
+  minEdge?: string | null;
+  actualTemperature?: string | null;
+}
+
 export interface KellySyncMetric {
   id: string;
   label: string;
@@ -44,7 +57,7 @@ export interface KellySummaryMetric {
 export interface KellyOpportunity {
   id: string;
   marketId?: string | null;
-  tier: "primary" | "secondary";
+  tier: "primary" | "secondary" | "watch";
   title: string;
   marketLabel: string;
   side: KellyDirection;
@@ -57,6 +70,9 @@ export interface KellyOpportunity {
   suggestedStakeUsd: number | null;
   reasons: string[];
   tags?: string[];
+  shortLabel?: string;
+  dateLabel?: string;
+  contractTypeLabel?: string | null;
 }
 
 export interface KellyCurvePoint {
@@ -94,6 +110,7 @@ export interface KellyProbabilityPanelData {
 
 export interface KellyMarketRow {
   id: string;
+  marketId?: string | null;
   label: string;
   rangeLabel: string;
   yesPricePct: number | null;
@@ -104,10 +121,21 @@ export interface KellyMarketRow {
   noEdgePct: number | null;
   yesKellyPct: number | null;
   noKellyPct: number | null;
+  spreadPct?: number | null;
   suggestedStakeUsd?: number | null;
   recommendation?: string | null;
+  recommendationSide?: string | null;
   status?: KellyMarketStatus;
   detail?: string | null;
+  spreadLabel?: string | null;
+  updatedAtLabel?: string | null;
+  note?: string | null;
+  isInactive?: boolean;
+  inactiveReason?: string | null;
+  contractType?: string | null;
+  shortLabel?: string;
+  dateLabel?: string;
+  contractTypeLabel?: string;
 }
 
 export interface KellyEvidenceItem {
@@ -127,15 +155,32 @@ export interface KellyEvidenceSection {
   items: KellyEvidenceItem[];
 }
 
+export interface KellyMethodologyModelRow {
+  id: string;
+  modelLabel: string;
+  currentPredictionLabel: string;
+  biasNowLabel: string;
+  adjustedPeakLabel: string;
+  weightLabel: string;
+  statusLabel: string;
+  detail?: string | null;
+  included: boolean;
+}
+
 export interface KellyFrameAnalysisRow {
   id: string;
   label: string;
   timestampLabel?: string | null;
   marketLabel: string;
+  yesPricePct: number | null;
+  noPricePct: number | null;
+  fairYesPct: number | null;
+  fairNoPct: number | null;
   marketPricePct: number | null;
   fairPricePct: number | null;
   yesEdgePct: number | null;
   noEdgePct: number | null;
+  spreadPct: number | null;
   weatherSignal: string;
   note?: string | null;
 }
@@ -154,19 +199,29 @@ export interface KellyWorkbenchData {
   locationOptions: KellyLocationOption[];
   targetDate: string;
   dateOptions: string[];
+  dateChips: KellyDateChip[];
   bankrollInput: string;
   minEdgeInput: string;
+  actualTemperatureInput: string;
   riskMode: KellyRiskMode;
   riskModeOptions: KellySelectOption<KellyRiskMode>[];
   refreshDisabled?: boolean;
+  draftDirty?: boolean;
+  statusNote?: string | null;
+  fieldErrors?: KellyFieldErrors;
   marketUrl?: string | null;
   syncMetrics: KellySyncMetric[];
   summaryMetrics: KellySummaryMetric[];
   opportunities: KellyOpportunity[];
+  opportunityEmptyState?: string | null;
   probability: KellyProbabilityPanelData;
   markets: KellyMarketRow[];
+  inactiveMarkets?: KellyMarketRow[];
+  marketEmptyState?: string | null;
+  unresolvedMarkets: KellyMarketRow[];
   evidenceSections: KellyEvidenceSection[];
   methodologyNotes?: string[];
+  methodologyModels?: KellyMethodologyModelRow[];
   frameAnalysisGroups: KellyFrameAnalysisGroup[];
 }
 
@@ -182,6 +237,7 @@ export interface KellyWorkbenchProps {
   onTargetDateChange?: (targetDate: string) => void;
   onBankrollChange?: (value: string) => void;
   onMinEdgeChange?: (value: string) => void;
+  onActualTemperatureChange?: (value: string) => void;
   onRiskModeChange?: (riskMode: KellyRiskMode) => void;
   onRefresh?: () => void;
   onSelectOpportunity?: (opportunityId: string) => void;

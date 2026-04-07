@@ -3,6 +3,7 @@ import type {
   HourlyWeatherResponse,
   KellyBucketProbability,
   KellyDistributionSummary,
+  KellyFramePoint,
   KellyMarketRow,
   KellyRecommendation,
   KellyRequestOptions,
@@ -13,6 +14,8 @@ import type {
   KellyStreamMessage,
   KellyWeatherEvidence,
   KellyWorkbenchResponse,
+  KellyFreshness,
+  KellyStreamHealth,
   LocationDirectoryEntry,
   LocationInfo,
   MultiModelDistributionBucket,
@@ -34,6 +37,7 @@ export type {
   HourlyWeatherResponse,
   KellyBucketProbability,
   KellyDistributionSummary,
+  KellyFramePoint,
   KellyMarketRow,
   KellyRecommendation,
   KellyRequestOptions,
@@ -44,6 +48,8 @@ export type {
   KellyStreamMessage,
   KellyWeatherEvidence,
   KellyWorkbenchResponse,
+  KellyFreshness,
+  KellyStreamHealth,
   LocationDirectoryEntry,
   LocationInfo,
   MultiModelDistributionBucket,
@@ -94,6 +100,8 @@ export interface UserFavoritesResponse {
   locationIds: LocationInfo["id"][];
 }
 
+export type DockTimezoneGroup = LocationDirectoryEntry["timezoneGroup"];
+
 export interface DockLocation {
   id: string;
   code: string;
@@ -103,7 +111,7 @@ export interface DockLocation {
   cityName: string;
   countryName: string;
   timezone: string;
-  timezoneGroup: LocationDirectoryEntry["timezoneGroup"];
+  timezoneGroup: DockTimezoneGroup;
   temp: number | null;
   isFavorite: boolean;
   isActive: boolean;
@@ -112,7 +120,7 @@ export interface DockLocation {
 }
 
 export interface DockLocationGroup {
-  group: LocationDirectoryEntry["timezoneGroup"];
+  group: DockTimezoneGroup;
   label: string;
   items: DockLocation[];
 }

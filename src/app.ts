@@ -255,7 +255,7 @@ export const createApp = (
   const app = Fastify({
     logger: false,
   });
-  void app.register(websocket);
+  app.register(websocket);
 
   const frontendDistDir = options.frontendDistDir ?? defaultFrontendDistDir;
   const buildId = process.env.BUILD_ID ?? `local-${Date.now().toString(36)}`;
@@ -386,67 +386,75 @@ export const createApp = (
     });
   });
 
-  app.get(
-    "/api/weather/kelly/stream",
-    { websocket: true },
-    async (socket, request) => {
-      if (!service.createKellyStream) {
-        socket.send(
-          JSON.stringify({
+  app.register(async (wsApp) => {
+    wsApp.get(
+      "/api/weather/kelly/stream",
+      { websocket: true },
+      async (socket, request) => {
+        const sendMessage = (message: Record<string, unknown>) => {
+          if (socket.readyState !== socket.OPEN) {
+            return;
+          }
+
+          socket.send(JSON.stringify(message));
+        };
+
+        if (!service.createKellyStream) {
+          sendMessage({
             type: "status",
             generatedAt: new Date().toISOString(),
             state: "unavailable",
-            message: "Kelly stream is not configured.",
-          }),
-        );
-        socket.close();
-        return;
-      }
+            reasonCode: "upstream_error",
+            message: "Kelly 实时流当前不可用。",
+          });
+          socket.close();
+          return;
+        }
 
-      const query = (request.query as Record<string, unknown> | undefined) ?? {};
+        const query = (request.query as Record<string, unknown> | undefined) ?? {};
 
-      try {
-        const locationId = parseQueryLocationId(query.locationId);
-        const targetDate = parseKellyTargetDate(query.targetDate);
-        const bankroll = parseBankroll(query.bankroll);
-        const riskMode = parseKellyRiskMode(query.riskMode);
-        const minEdge = parseKellyMinEdge(query.minEdge);
-        const actualTemperatureC = parseActualTemperatureC(query.actualTemperatureC);
-        const selectedHourTimestamp = parseTimestamp(query.selectedHour);
+        try {
+          const locationId = parseQueryLocationId(query.locationId);
+          const targetDate = parseKellyTargetDate(query.targetDate);
+          const bankroll = parseBankroll(query.bankroll);
+          const riskMode = parseKellyRiskMode(query.riskMode);
+          const minEdge = parseKellyMinEdge(query.minEdge);
+          const actualTemperatureC = parseActualTemperatureC(query.actualTemperatureC);
+          const selectedHourTimestamp = parseTimestamp(query.selectedHour);
 
-        const stream = await service.createKellyStream(
-          locationId,
-          {
-            targetDate,
-            bankroll,
-            riskMode,
-            minEdge,
-            actualTemperatureC,
-            selectedHourTimestamp,
-          },
-          (message) => {
-            socket.send(JSON.stringify(message));
-          },
-        );
+          const stream = await service.createKellyStream(
+            locationId,
+            {
+              targetDate,
+              bankroll,
+              riskMode,
+              minEdge,
+              actualTemperatureC,
+              selectedHourTimestamp,
+            },
+            (message) => {
+              sendMessage(message);
+            },
+          );
 
-        socket.on("close", async () => {
-          await stream.close();
-        });
-      } catch (error) {
-        const appError =
-          error instanceof AppError ? error : new AppError(500, "KELLY_STREAM_ERROR", "Kelly stream failed to initialize.");
-        socket.send(
-          JSON.stringify({
+          socket.on("close", async () => {
+            await stream.close();
+          });
+        } catch (error) {
+          const appError =
+            error instanceof AppError ? error : new AppError(500, "KELLY_STREAM_ERROR", "Kelly 实时流初始化失败。");
+          sendMessage({
             type: "status",
             generatedAt: new Date().toISOString(),
             state: "degraded",
+            reasonCode: "upstream_error",
             message: appError.message,
-          }),
-        );
-        socket.close();
-      }
-    },
-  );
+          });
+          socket.close();
+        }
+      },
+    );
+  });
 
   app.get("/api/user/favorites", async () => {
     if (!service.getUserFavorites) {

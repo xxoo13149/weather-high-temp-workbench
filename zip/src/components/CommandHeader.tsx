@@ -1,4 +1,15 @@
-import { CheckCheck, ChevronLeft, ChevronRight, Home, Radar, RefreshCw, SignalHigh, Star, TriangleAlert, TrendingUp } from "lucide-react";
+import {
+  CheckCheck,
+  ChevronLeft,
+  ChevronRight,
+  Home,
+  Radar,
+  RefreshCw,
+  SignalHigh,
+  Star,
+  TriangleAlert,
+  TrendingUp,
+} from "lucide-react";
 import { motion } from "motion/react";
 
 import { Button } from "@/components/ui/button";
@@ -60,8 +71,8 @@ export const CommandHeader = ({
       data-page={currentPage}
       data-sync-state={syncState}
     >
-      <div className="panel-section command-header-grid flex flex-wrap items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-2.5 md:items-center md:gap-3">
+      <div className="panel-section command-header-grid">
+        <div className="command-header-leading">
           <Button
             type="button"
             variant="secondary"
@@ -73,13 +84,13 @@ export const CommandHeader = ({
             {railExpanded ? <ChevronLeft className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
           </Button>
 
-          <div className="min-w-0 command-header-main space-y-2">
+          <div className="command-header-main">
             <div className="eyebrow flex items-center gap-2 text-white/56">
               <SignalHigh className="h-3.5 w-3.5 text-[rgba(107,231,255,0.92)]" />
               {UI_TEXT.header.productName}
             </div>
 
-            <div className="flex min-w-0 flex-wrap items-center gap-2.5 md:gap-3">
+            <div className="command-header-title-row">
               <h1 className="truncate text-[clamp(1.18rem,1.8vw,1.68rem)] font-semibold tracking-[-0.02em] text-white">
                 {locationName}
               </h1>
@@ -93,7 +104,9 @@ export const CommandHeader = ({
                 aria-label={favorite ? UI_TEXT.header.unfavorite : UI_TEXT.header.favorite}
                 className="h-8.5 w-8.5 rounded-full border-white/12 bg-[rgba(12,17,26,0.78)]"
               >
-                <Star className={`h-4 w-4 ${favorite ? "fill-[var(--warning)] text-[var(--warning)]" : "text-white/58"}`} />
+                <Star
+                  className={`h-4 w-4 ${favorite ? "fill-[var(--warning)] text-[var(--warning)]" : "text-white/58"}`}
+                />
               </Button>
 
               <div
@@ -104,78 +117,93 @@ export const CommandHeader = ({
                 <span className="text-xs uppercase tracking-[0.12em] text-white/72">
                   {syncState === "stale" ? UI_TEXT.header.stale : UI_TEXT.header.synced}
                 </span>
-                <span className="data-mono text-[11px] text-white/50">{updatedAt ? formatDateTime(updatedAt, locationTimezone) : "--"}</span>
+                <span className="data-mono text-[11px] text-white/50">
+                  {updatedAt ? formatDateTime(updatedAt, locationTimezone) : "--"}
+                </span>
               </div>
             </div>
 
             {favoriteError ? (
-              <div className="command-header-favorite-error rounded-[10px] border border-[rgba(255,200,107,0.26)] bg-[rgba(255,200,107,0.08)] px-2.5 py-1.5 text-xs text-[var(--warning)]" aria-live="polite">
+              <div
+                className="command-header-favorite-error rounded-[10px] border border-[rgba(255,200,107,0.26)] bg-[rgba(255,200,107,0.08)] px-2.5 py-1.5 text-xs text-[var(--warning)]"
+                aria-live="polite"
+              >
                 {favoriteError}
               </div>
             ) : null}
           </div>
         </div>
 
-        <div className="command-header-actions flex flex-wrap items-center justify-end gap-2">
-          <Button
-            type="button"
-            variant={currentPage === "home" ? "default" : "ghost"}
-            size="sm"
-            onClick={onNavigateHome}
-            className="command-header-nav"
-            data-active={currentPage === "home"}
-          >
-            <Home className="mr-2 h-4 w-4" />
-            {UI_TEXT.header.home}
-          </Button>
+        <div className="command-header-actions">
+          <div className="command-header-nav-shell">
+            <div className="command-header-nav-cluster">
+              <Button
+                type="button"
+                variant={currentPage === "home" ? "default" : "ghost"}
+                size="sm"
+                onClick={onNavigateHome}
+                className="command-header-nav"
+                data-active={currentPage === "home"}
+              >
+                <Home className="mr-2 h-4 w-4" />
+                {UI_TEXT.header.home}
+              </Button>
 
-          <Button
-            type="button"
-            variant={currentPage === "analysis" ? "default" : "secondary"}
-            size="sm"
-            onClick={onNavigateAnalysis}
-            className="command-header-nav"
-            data-active={currentPage === "analysis"}
-          >
-            <Radar className="mr-2 h-4 w-4" />
-            {UI_TEXT.header.analysis}
-          </Button>
+              <Button
+                type="button"
+                variant={currentPage === "analysis" ? "default" : "secondary"}
+                size="sm"
+                onClick={onNavigateAnalysis}
+                className="command-header-nav"
+                data-active={currentPage === "analysis"}
+              >
+                <Radar className="mr-2 h-4 w-4" />
+                {UI_TEXT.header.analysis}
+              </Button>
 
-          <Button
-            type="button"
-            variant={currentPage === "kelly" ? "default" : "secondary"}
-            size="sm"
-            onClick={onNavigateKelly}
-            className="command-header-nav"
-            data-active={currentPage === "kelly"}
-          >
-            <TrendingUp className="mr-2 h-4 w-4" />
-            Kelly 实验台
-          </Button>
+              <Button
+                type="button"
+                variant={currentPage === "kelly" ? "default" : "secondary"}
+                size="sm"
+                onClick={onNavigateKelly}
+                className="command-header-nav"
+                data-active={currentPage === "kelly"}
+              >
+                <TrendingUp className="mr-2 h-4 w-4" />
+                Kelly 实验台
+              </Button>
+            </div>
+          </div>
 
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={onRefresh}
-            disabled={refreshDisabled}
-            className="command-header-refresh min-w-[156px] justify-start border border-white/12 bg-[rgba(12,17,26,0.76)] text-white/84 hover:border-white/20 hover:bg-[rgba(14,20,31,0.9)]"
-            data-refresh-state={refreshState}
-          >
-            {refreshState === "success" ? (
-              <CheckCheck className="mr-2 h-4 w-4 text-[var(--success)]" />
-            ) : refreshState === "error" ? (
-              <TriangleAlert className="mr-2 h-4 w-4 text-[var(--danger)]" />
-            ) : (
-              <RefreshCw className={`mr-2 h-4 w-4 ${refreshState === "pending" ? "animate-spin text-[var(--accent)]" : ""}`} />
-            )}
-            <span>{UI_TEXT.header.refresh}</span>
-            <span className="ml-2 text-[11px] text-white/52" aria-live="polite">
-              {refreshLabel}
-            </span>
-          </Button>
+          <div className="command-header-utility">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={onRefresh}
+              disabled={refreshDisabled}
+              className="command-header-refresh justify-start border border-white/12 bg-[rgba(12,17,26,0.76)] text-white/84 hover:border-white/20 hover:bg-[rgba(14,20,31,0.9)]"
+              data-refresh-state={refreshState}
+            >
+              {refreshState === "success" ? (
+                <CheckCheck className="mr-2 h-4 w-4 text-[var(--success)]" />
+              ) : refreshState === "error" ? (
+                <TriangleAlert className="mr-2 h-4 w-4 text-[var(--danger)]" />
+              ) : (
+                <RefreshCw
+                  className={`mr-2 h-4 w-4 ${refreshState === "pending" ? "animate-spin text-[var(--accent)]" : ""}`}
+                />
+              )}
+              <span>{UI_TEXT.header.refresh}</span>
+              <span className="ml-2 text-[11px] text-white/52" aria-live="polite">
+                {refreshLabel}
+              </span>
+            </Button>
+          </div>
         </div>
       </div>
     </motion.header>
   );
 };
+
+

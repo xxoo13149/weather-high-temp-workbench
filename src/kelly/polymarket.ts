@@ -3,6 +3,8 @@ import WebSocket, { type RawData } from "ws";
 import { config, type RegisteredLocation } from "../config.js";
 import type {
   KellyContractType,
+  KellyInactiveReason,
+  KellyMarketLifecycle,
   KellyMarketRow,
   KellySourceLinks,
   KellyStreamHandle,
@@ -13,7 +15,7 @@ import { fetchJson } from "../lib/http.js";
 
 const POLYMARKET_EVENT_BASE_URL = "https://polymarket.com/event";
 const POLYMARKET_DISCOVERY_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 2_500);
-const POLYMARKET_MAX_SEARCH_TERMS = 4;
+const POLYMARKET_MAX_SEARCH_TERMS = 6;
 
 type RawOrderLevel = {
   price?: string | number | null;
@@ -26,6 +28,7 @@ export type NormalizedOrderBook = {
   bestAsk: number | null;
   midpoint: number | null;
   updatedAt: string;
+  status: "available" | "no-orderbook";
 };
 
 export interface PolymarketCandidate extends Pick<
@@ -40,6 +43,8 @@ export interface PolymarketCandidate extends Pick<
   | "bucketStartC"
   | "bucketEndC"
   | "bucketLabel"
+  | "lifecycle"
+  | "inactiveReason"
   | "parseStatus"
   | "exclusionReason"
   | "yesTokenId"
@@ -50,11 +55,20 @@ export interface PolymarketCandidate extends Pick<
   eventUrl: string | null;
   liquidity: number | null;
   volume24h: number | null;
+  description?: string | null;
+  resolutionSource?: string | null;
+  active?: boolean | null;
+  closed?: boolean | null;
+  acceptingOrders?: boolean | null;
+  archived?: boolean | null;
+  enableOrderBook?: boolean | null;
+  endsAt?: string | null;
 }
 
 export interface PolymarketDiscoveryResult {
   fetchedAt: string;
   candidates: PolymarketCandidate[];
+  inactiveCandidates: PolymarketCandidate[];
   sourceLinks: KellySourceLinks;
 }
 
@@ -89,6 +103,24 @@ const parseNumber = (value: unknown): number | null => {
   if (typeof value === "string" && value.trim()) {
     const parsed = Number.parseFloat(value);
     return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+};
+
+const parseBoolean = (value: unknown): boolean | null => {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") {
+      return true;
+    }
+    if (normalized === "false") {
+      return false;
+    }
   }
 
   return null;
@@ -140,12 +172,209 @@ const toLocalDate = (isoLike: string, timeZone: string): string | null => {
 
 const unique = <T>(values: T[]): T[] => Array.from(new Set(values));
 
+const sanitizeTemperatureText = (value: string): string =>
+  value
+    .normalize("NFKC")
+    .replace(/\u00c2/g, "")
+    .replace(/[℃]/g, " C ")
+    .replace(/[℉]/g, " F ")
+    .replace(/[°º˚]/g, " degree ")
+    .replace(/\bfahrenheit\b/gi, " F ")
+    .replace(/\bcelsius\b/gi, " C ")
+    .replace(/[–—−]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const detectKellyTemperatureUnit = (text: string): KellyTemperatureUnit => {
+  const sanitized = sanitizeTemperatureText(text);
+  return /\b(?:fahrenheit|f)\b/i.test(sanitized) ? "F" : "C";
+};
+
+const sanitizeKellyTemperatureText = (value: string): string =>
+  value
+    .normalize("NFKC")
+    .replace(/[Â]/g, "")
+    .replace(/℃/g, " °C ")
+    .replace(/℉/g, " °F ")
+    .replace(/([0-9])\s*[°º˚]\s*c\b/gi, "$1 °C")
+    .replace(/([0-9])\s*[°º˚]\s*f\b/gi, "$1 °F")
+    .replace(/\bdegrees?\s*c(?:elsius)?\b/gi, " °C ")
+    .replace(/\bdegrees?\s*f(?:ahrenheit)?\b/gi, " °F ")
+    .replace(/\bcelsius\b/gi, " C ")
+    .replace(/\bfahrenheit\b/gi, " F ")
+    .replace(/[–—−]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const detectNormalizedKellyTemperatureUnit = (text: string): KellyTemperatureUnit =>
+  /(?:°\s*F\b|\b-?\d+(?:\.\d+)?\s*F\b|\bFAHRENHEIT\b)/i.test(text) ? "F" : "C";
+
 const clamp01 = (value: number | null | undefined): number | null => {
   if (typeof value !== "number" || Number.isNaN(value)) {
     return null;
   }
 
   return Math.max(0, Math.min(1, value));
+};
+
+const parseOrderPrice = (value: unknown): number | null => {
+  const parsed = parseNumber(value);
+  if (parsed === null || parsed < 0 || parsed > 1) {
+    return null;
+  }
+
+  return parsed;
+};
+
+const resolveOrderBookUpdatedAt = (record: Record<string, unknown> | null | undefined): string => {
+  const numericTimestamp = parseNumber(record?.timestamp);
+  if (numericTimestamp !== null) {
+    const millis = numericTimestamp > 1e12 ? numericTimestamp : numericTimestamp * 1000;
+    const parsed = new Date(millis);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+
+  const isoLike = parseString(record?.updatedAt) ?? parseString(record?.timestampIso);
+  if (isoLike) {
+    const parsed = new Date(isoLike);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+
+  return new Date().toISOString();
+};
+
+const resolveWsRecordOccurredAt = (record: Record<string, unknown>): string | null => {
+  const numericTimestamp =
+    parseNumber(record.timestamp) ??
+    parseNumber(record.ts) ??
+    parseNumber(record.created_at) ??
+    parseNumber(record.updated_at);
+  if (numericTimestamp !== null) {
+    const millis = numericTimestamp > 1e12 ? numericTimestamp : numericTimestamp * 1000;
+    const parsed = new Date(millis);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+
+  const isoLike =
+    parseString(record.timestampIso) ??
+    parseString(record.timestamp_iso) ??
+    parseString(record.createdAt) ??
+    parseString(record.updatedAt);
+  if (isoLike) {
+    const parsed = new Date(isoLike);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+
+  return null;
+};
+
+const resolveWsOccurredAt = (records: Record<string, unknown>[], fallbackIso: string): string => {
+  const resolved = records
+    .map((record) => resolveWsRecordOccurredAt(record))
+    .filter((value): value is string => Boolean(value))
+    .sort();
+
+  return resolved.at(-1) ?? fallbackIso;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const toWsRecords = (value: unknown): Record<string, unknown>[] => {
+  if (Array.isArray(value)) {
+    return value.filter(isRecord);
+  }
+
+  return isRecord(value) ? [value] : [];
+};
+
+const resolveWsRecordType = (record: Record<string, unknown>): string | null =>
+  [
+    parseString(record.event_type),
+    parseString(record.type),
+    parseString(record.event),
+    parseString(record.channel),
+    parseString(record.message_type),
+  ]
+    .find((value): value is string => Boolean(value))
+    ?.toLowerCase() ?? null;
+
+const isKeepaliveText = (value: string): boolean => /^(?:ping|pong)$/i.test(value.trim());
+
+const isUpstreamWsErrorRecord = (record: Record<string, unknown>): boolean => {
+  const type = resolveWsRecordType(record);
+  if (type === "error") {
+    return true;
+  }
+
+  const status = parseString(record.status)?.toLowerCase();
+  if (status === "error") {
+    return true;
+  }
+
+  if (parseString(record.error)) {
+    return true;
+  }
+
+  return /\berror\b/i.test(parseString(record.message) ?? "");
+};
+
+const isMarketSignalRecord = (record: Record<string, unknown>): boolean => {
+  const type = resolveWsRecordType(record);
+  if (
+    type &&
+    [
+      "book",
+      "orderbook",
+      "price_change",
+      "trade",
+      "last_trade_price",
+      "tick_size_change",
+      "best_bid_ask",
+      "market_resolved",
+      "new_market",
+    ].includes(type)
+  ) {
+    return true;
+  }
+
+  return [
+    "asset_id",
+    "assetId",
+    "token_id",
+    "tokenId",
+    "best_bid",
+    "best_ask",
+    "price",
+    "last_trade_price",
+    "bids",
+    "asks",
+  ].some((key) => key in record);
+};
+
+const hasExplicitTimeComponent = (value: string): boolean => /(?:[t\s]\d{2}:\d{2}(?::\d{2})?)/i.test(value);
+
+const resolveExpiryTimestamp = (values: Array<string | null | undefined>): number | null => {
+  for (const value of values) {
+    if (!value || !hasExplicitTimeComponent(value)) {
+      continue;
+    }
+
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+
+  return null;
 };
 
 const buildTargetDateTokens = (targetDate: string): string[] => {
@@ -169,6 +398,75 @@ const buildTargetDateTokens = (targetDate: string): string[] => {
   ]);
 };
 
+const MONTH_NAME_TO_NUMBER: Record<string, number> = {
+  january: 1,
+  jan: 1,
+  february: 2,
+  feb: 2,
+  march: 3,
+  mar: 3,
+  april: 4,
+  apr: 4,
+  may: 5,
+  june: 6,
+  jun: 6,
+  july: 7,
+  jul: 7,
+  august: 8,
+  aug: 8,
+  september: 9,
+  sep: 9,
+  sept: 9,
+  october: 10,
+  oct: 10,
+  november: 11,
+  nov: 11,
+  december: 12,
+  dec: 12,
+};
+
+const formatIsoDate = (year: number, month: number, day: number): string | null => {
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+    return null;
+  }
+  if (month < 1 || month > 12 || day < 1 || day > 31) {
+    return null;
+  }
+
+  const isoMonth = String(month).padStart(2, "0");
+  const isoDay = String(day).padStart(2, "0");
+  return `${year}-${isoMonth}-${isoDay}`;
+};
+
+const extractExplicitDatesFromText = (text: string, defaultYear: number): string[] => {
+  const matches = new Set<string>();
+
+  const isoRegex = /\b(\d{4})-(\d{2})-(\d{2})\b/g;
+  for (const match of text.matchAll(isoRegex)) {
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const iso = formatIsoDate(year, month, day);
+    if (iso) {
+      matches.add(iso);
+    }
+  }
+
+  const monthRegex = /\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?\b/gi;
+  for (const match of text.matchAll(monthRegex)) {
+    const monthToken = match[1].toLowerCase();
+    const monthNumber = MONTH_NAME_TO_NUMBER[monthToken];
+    const day = Number(match[2]);
+    const year = match[3] ? Number(match[3]) : defaultYear;
+    const iso = formatIsoDate(year, monthNumber, day);
+    if (iso) {
+      matches.add(iso);
+    }
+  }
+
+  return Array.from(matches);
+};
+
 const buildLocationTokens = (location: RegisteredLocation): string[] =>
   unique(
     [
@@ -186,18 +484,20 @@ const buildLocationTokens = (location: RegisteredLocation): string[] =>
   );
 
 const buildSearchTerms = (location: RegisteredLocation, targetDate: string): string[] => {
-  const dateTokens = buildTargetDateTokens(targetDate);
+  const [isoDate, shortDateWithYear, longDateWithYear, shortDate, longDate] = buildTargetDateTokens(targetDate);
   const city = location.cityName;
 
   return unique(
     [
-      `${city} high temperature ${targetDate}`,
-      `${city} weather ${targetDate}`,
-      `${city} temperature ${targetDate}`,
-      `${city} weather`,
-      `${city} high temperature`,
-      `${location.code} weather`,
-      `${city} ${dateTokens[1] ?? targetDate}`,
+      `highest temperature in ${city} on ${longDateWithYear ?? isoDate}`,
+      `highest temperature in ${city} on ${longDate ?? shortDate ?? isoDate}`,
+      `highest temperature ${city} ${isoDate}`,
+      `${city} daily temperature ${longDateWithYear ?? isoDate}`,
+      `${city} high temperature ${isoDate}`,
+      `${city} high temperature ${longDate ?? shortDateWithYear ?? isoDate}`,
+      `${city} temperature ${isoDate}`,
+      `${location.code} temperature ${isoDate}`,
+      `${city} weather ${isoDate}`,
     ]
       .map((value) => value.trim())
       .filter(Boolean),
@@ -229,7 +529,17 @@ const unwrapMarketCollection = (value: unknown): Record<string, unknown>[] => {
         return [];
       }
 
-      return unwrapMarketCollection((event as Record<string, unknown>).markets);
+      const eventRecord = event as Record<string, unknown>;
+      return unwrapMarketCollection(eventRecord.markets).map((market) => ({
+        ...market,
+        event:
+          typeof (market as Record<string, unknown>).event === "object" &&
+          (market as Record<string, unknown>).event !== null
+            ? (market as Record<string, unknown>).event
+            : eventRecord,
+        eventTitle: parseString((market as Record<string, unknown>).eventTitle) ?? parseString(eventRecord.title),
+        eventSlug: parseString((market as Record<string, unknown>).eventSlug) ?? parseString(eventRecord.slug),
+      }));
     });
   }
 
@@ -299,29 +609,37 @@ const parseFromBounds = (
 const parseTemperatureContract = (
   raw: Record<string, unknown>,
   combinedText: string,
+): { contractType: KellyContractType; startC: number | null; endC: number | null; unit: KellyTemperatureUnit } | null =>
+  parseTemperatureContractV2(raw, combinedText);
+
+const parseTemperatureContractV2 = (
+  raw: Record<string, unknown>,
+  combinedText: string,
 ): { contractType: KellyContractType; startC: number | null; endC: number | null; unit: KellyTemperatureUnit } | null => {
-  const unit = detectUnit(combinedText);
+  const sanitizedText = sanitizeKellyTemperatureText(combinedText);
+  const unit = detectNormalizedKellyTemperatureUnit(sanitizedText);
   const bounds = parseFromBounds(raw, unit);
   if (bounds) {
     return { ...bounds, unit };
   }
 
   const threshold = parseNumber(raw.groupItemThreshold) ?? parseNumber(raw.line);
-  if (threshold !== null) {
+  const hasExplicitTemperature = /(-?\d+(?:\.\d+)?)\s*(?:°\s*)?[cf]\b/i.test(sanitizedText);
+  if (threshold !== null && !hasExplicitTemperature) {
     const thresholdC = toCelsius(threshold, unit);
-    if (/(at least|or above|above|over|higher|>=)/i.test(combinedText)) {
+    if (/(at least|or above|above|over|higher|>=)/i.test(sanitizedText)) {
       return { contractType: "atLeast", startC: thresholdC, endC: null, unit };
     }
-    if (/(at most|or below|below|under|less than|<=)/i.test(combinedText)) {
+    if (/(at most|or below|below|under|less than|<=)/i.test(sanitizedText)) {
       return { contractType: "atMost", startC: null, endC: thresholdC, unit };
     }
-    if (/exact/i.test(combinedText)) {
+    if (/exact/i.test(sanitizedText)) {
       return { contractType: "exact", startC: thresholdC, endC: thresholdC, unit };
     }
   }
 
-  const rangeMatch = combinedText.match(
-    /(-?\d+(?:\.\d+)?)\s*(?:°|º|deg(?:ree)?s?)?\s*([cf])?\s*(?:to|-|–|—)\s*(-?\d+(?:\.\d+)?)\s*(?:°|º|deg(?:ree)?s?)?\s*([cf])?/i,
+  const rangeMatch = sanitizedText.match(
+    /(?:between\s+|from\s+)?(-?\d+(?:\.\d+)?)\s*(?:°\s*)?([cf])?\s*(?:to|through|and|-)\s*(-?\d+(?:\.\d+)?)\s*(?:°\s*)?([cf])?\b/i,
   );
   if (rangeMatch) {
     const explicitUnit = (rangeMatch[2] ?? rangeMatch[4] ?? unit).toUpperCase() as KellyTemperatureUnit;
@@ -330,19 +648,54 @@ const parseTemperatureContract = (
     return { contractType: "range", startC: Math.min(startC, endC), endC: Math.max(startC, endC), unit: explicitUnit };
   }
 
-  const singleMatch = combinedText.match(/(-?\d+(?:\.\d+)?)\s*(?:°|º|deg(?:ree)?s?)?\s*([cf])?/i);
-  if (singleMatch) {
-    const explicitUnit = (singleMatch[2] ?? unit).toUpperCase() as KellyTemperatureUnit;
-    const valueC = toCelsius(Number.parseFloat(singleMatch[1] ?? "0"), explicitUnit);
-    if (/(at least|or above|above|over|higher|>=)/i.test(combinedText)) {
+  const comparatorPrefixMatch = sanitizedText.match(
+    /(at least|or above|and above|above|over|higher|at most|or below|and below|below|under|lower|less than|exact(?:ly)?|>=|<=)\s*(-?\d+(?:\.\d+)?)\s*(?:°\s*)?([cf])?\b/i,
+  );
+  if (comparatorPrefixMatch) {
+    const explicitUnit = (comparatorPrefixMatch[3] ?? unit).toUpperCase() as KellyTemperatureUnit;
+    const valueC = toCelsius(Number.parseFloat(comparatorPrefixMatch[2] ?? "0"), explicitUnit);
+    const comparator = comparatorPrefixMatch[1]?.toLowerCase() ?? "";
+    if (/(at least|or above|above|over|higher|>=)/i.test(comparator)) {
       return { contractType: "atLeast", startC: valueC, endC: null, unit: explicitUnit };
     }
-    if (/(at most|or below|below|under|less than|<=)/i.test(combinedText)) {
+    if (/(at most|or below|below|under|less than|<=)/i.test(comparator)) {
       return { contractType: "atMost", startC: null, endC: valueC, unit: explicitUnit };
     }
-    if (/exact/i.test(combinedText)) {
+    if (/exact/i.test(comparator)) {
       return { contractType: "exact", startC: valueC, endC: valueC, unit: explicitUnit };
     }
+  }
+
+  const comparatorSuffixMatch = sanitizedText.match(
+    /(-?\d+(?:\.\d+)?)\s*(?:°\s*)?([cf])?\s*(or above|or below|and above|and below|above|below|over|under|higher|lower)\b/i,
+  );
+  if (comparatorSuffixMatch) {
+    const explicitUnit = (comparatorSuffixMatch[2] ?? unit).toUpperCase() as KellyTemperatureUnit;
+    const valueC = toCelsius(Number.parseFloat(comparatorSuffixMatch[1] ?? "0"), explicitUnit);
+    const comparator = comparatorSuffixMatch[3]?.toLowerCase() ?? "";
+    if (/(above|over|higher)/i.test(comparator)) {
+      return { contractType: "atLeast", startC: valueC, endC: null, unit: explicitUnit };
+    }
+    if (/(below|under|lower)/i.test(comparator)) {
+      return { contractType: "atMost", startC: null, endC: valueC, unit: explicitUnit };
+    }
+  }
+
+  const exactMatch = sanitizedText.match(/(-?\d+(?:\.\d+)?)\s*(?:°\s*)?([cf])\b/i);
+  if (exactMatch) {
+    const explicitUnit = exactMatch[2].toUpperCase() as KellyTemperatureUnit;
+    const valueC = toCelsius(Number.parseFloat(exactMatch[1] ?? "0"), explicitUnit);
+    const comparatorHint = sanitizedText.match(/\b(or above|or below|and above|and below|above|below|over|under|higher|lower)\b/i);
+    if (comparatorHint) {
+      const comparator = comparatorHint[1]?.toLowerCase() ?? "";
+      if (/(above|over|higher)/i.test(comparator)) {
+        return { contractType: "atLeast", startC: valueC, endC: null, unit: explicitUnit };
+      }
+      if (/(below|under|lower)/i.test(comparator)) {
+        return { contractType: "atMost", startC: null, endC: valueC, unit: explicitUnit };
+      }
+    }
+    return { contractType: "exact", startC: valueC, endC: valueC, unit: explicitUnit };
   }
 
   return null;
@@ -352,9 +705,15 @@ const hasWeatherKeywords = (text: string): boolean =>
   /\b(weather|temperature|high temp|high temperature|daily high|forecast high)\b/i.test(text);
 
 const dateMatches = (location: RegisteredLocation, targetDate: string, raw: Record<string, unknown>, text: string): boolean => {
+  const normalizedText = normalizeText(text);
+  const targetYear = Number.parseInt(targetDate.slice(0, 4), 10);
+  const explicitDates = extractExplicitDatesFromText(normalizedText, Number.isFinite(targetYear) ? targetYear : new Date().getUTCFullYear());
+
+  if (explicitDates.length > 0) {
+    return explicitDates.includes(targetDate);
+  }
+
   const candidateDates = [
-    parseString(raw.endDateIso),
-    parseString(raw.endDate),
     parseString(raw.resolveDate),
     parseString(raw.resolutionDate),
     parseString(raw.eventStartDate),
@@ -367,7 +726,8 @@ const dateMatches = (location: RegisteredLocation, targetDate: string, raw: Reco
     return true;
   }
 
-  return buildTargetDateTokens(targetDate).some((token) => normalizeText(text).includes(normalizeText(token)));
+  const normalizedTokens = buildTargetDateTokens(targetDate).map((token) => normalizeText(token));
+  return normalizedTokens.some((token) => normalizedText.includes(token));
 };
 
 const locationMatches = (location: RegisteredLocation, text: string): boolean => {
@@ -394,6 +754,118 @@ const buildEventUrl = (raw: Record<string, unknown>): string | null => {
   return `${POLYMARKET_EVENT_BASE_URL}/${eventSlug}`;
 };
 
+const partitionDiscoveryCandidates = (candidates: PolymarketCandidate[]): {
+  active: PolymarketCandidate[];
+  inactive: PolymarketCandidate[];
+} => {
+  const active: PolymarketCandidate[] = [];
+  const inactive: PolymarketCandidate[] = [];
+
+  for (const candidate of candidates) {
+    if (candidate.lifecycle === "inactive") {
+      inactive.push(candidate);
+      continue;
+    }
+
+    active.push(candidate);
+  }
+
+  return { active, inactive };
+};
+
+const resolveLifecycle = (raw: Record<string, unknown>): {
+  lifecycle: KellyMarketLifecycle;
+  inactiveReason: KellyInactiveReason | null;
+  active: boolean | null;
+  closed: boolean | null;
+  acceptingOrders: boolean | null;
+  archived: boolean | null;
+  enableOrderBook: boolean | null;
+  endsAt: string | null;
+} => {
+  const eventRecord =
+    typeof raw.event === "object" && raw.event !== null ? (raw.event as Record<string, unknown>) : undefined;
+  const active = parseBoolean(raw.active) ?? parseBoolean(eventRecord?.active);
+  const closed = parseBoolean(raw.closed) ?? parseBoolean(eventRecord?.closed);
+  const acceptingOrders =
+    parseBoolean(raw.acceptingOrders) ??
+    parseBoolean(raw.accepting_orders) ??
+    parseBoolean(eventRecord?.acceptingOrders) ??
+    parseBoolean(eventRecord?.accepting_orders);
+  const archived = parseBoolean(raw.archived) ?? parseBoolean(eventRecord?.archived);
+  const enableOrderBook =
+    parseBoolean(raw.enableOrderBook) ??
+    parseBoolean(raw.enable_order_book) ??
+    parseBoolean(eventRecord?.enableOrderBook) ??
+    parseBoolean(eventRecord?.enable_order_book);
+  const endsAt =
+    parseString(raw.closedTime) ??
+    parseString(raw.endDateIso) ??
+    parseString(raw.endDate) ??
+    parseString(raw.umaEndDate) ??
+    parseString(raw.resolveDate) ??
+    parseString(raw.resolutionDate) ??
+    parseString(raw.gameStartTime) ??
+    parseString(eventRecord?.closedTime) ??
+    parseString(eventRecord?.endDateIso) ??
+    parseString(eventRecord?.endDate) ??
+    parseString(eventRecord?.umaEndDate) ??
+    parseString(eventRecord?.resolveDate);
+  const expiryAt = resolveExpiryTimestamp([
+    parseString(raw.closedTime),
+    parseString(raw.endDateIso),
+    parseString(raw.endDate),
+    parseString(raw.umaEndDate),
+    parseString(eventRecord?.closedTime),
+    parseString(eventRecord?.endDateIso),
+    parseString(eventRecord?.endDate),
+    parseString(eventRecord?.umaEndDate),
+  ]);
+
+  if (closed === true) {
+    return { lifecycle: "inactive", inactiveReason: "closed", active, closed, acceptingOrders, archived, enableOrderBook, endsAt };
+  }
+
+  if (acceptingOrders === false) {
+    return {
+      lifecycle: "inactive",
+      inactiveReason: "accepting_orders_disabled",
+      active,
+      closed,
+      acceptingOrders,
+      archived,
+      enableOrderBook,
+      endsAt,
+    };
+  }
+
+  if (archived === true) {
+    return { lifecycle: "inactive", inactiveReason: "archived", active, closed, acceptingOrders, archived, enableOrderBook, endsAt };
+  }
+
+  if (enableOrderBook === false) {
+    return {
+      lifecycle: "inactive",
+      inactiveReason: "accepting_orders_disabled",
+      active,
+      closed,
+      acceptingOrders,
+      archived,
+      enableOrderBook,
+      endsAt,
+    };
+  }
+
+  const hasExplicitTradableSignal =
+    closed === false || acceptingOrders === true || archived === false || enableOrderBook === true;
+
+  if (!hasExplicitTradableSignal && expiryAt !== null && expiryAt < Date.now()) {
+    return { lifecycle: "inactive", inactiveReason: "expired", active, closed, acceptingOrders, archived, enableOrderBook, endsAt };
+  }
+
+  return { lifecycle: "tradable", inactiveReason: null, active, closed, acceptingOrders, archived, enableOrderBook, endsAt };
+};
+
 const normalizeCandidate = (
   raw: Record<string, unknown>,
   location: RegisteredLocation,
@@ -412,8 +884,15 @@ const normalizeCandidate = (
     parseString(raw.eventTitle) ??
     parseString((raw.event as Record<string, unknown> | undefined)?.title);
   const description = parseString(raw.description);
+  const resolutionSource =
+    parseString(raw.resolutionSource) ??
+    parseString(raw.resolution_source) ??
+    parseString((raw.event as Record<string, unknown> | undefined)?.resolutionSource);
   const combinedText = [title, eventTitle, description].filter(Boolean).join(" ");
-  const parsedContract = parseTemperatureContract(raw, combinedText);
+  const parsedContract =
+    parseTemperatureContractV2(raw, [title, eventTitle].filter(Boolean).join(" ")) ??
+    parseTemperatureContractV2(raw, combinedText) ??
+    parseTemperatureContract(raw, combinedText);
   const matchedLocation = locationMatches(location, combinedText);
   const matchedDate = dateMatches(location, targetDate, raw, combinedText);
   const weatherKeywords = hasWeatherKeywords(combinedText);
@@ -426,20 +905,29 @@ const normalizeCandidate = (
   const marketUrl = buildEventUrl(raw);
   const eventUrl = buildEventUrl(raw);
   const conditionId = parseString(raw.conditionId);
+  const lifecycleState = resolveLifecycle(raw);
   const status =
     matchedLocation && matchedDate && weatherKeywords && parsedContract && yesTokenId && noTokenId ? "matched" : "unresolved";
 
   let exclusionReason: string | null = null;
   if (!matchedLocation) {
-    exclusionReason = "Location alias did not match the market text.";
+    exclusionReason = "市场标题或规则文本里没有稳定命中当前地点别名。";
   } else if (!matchedDate) {
-    exclusionReason = "Target date could not be confirmed from market metadata.";
+    exclusionReason = "市场元数据里无法稳定确认目标日期。";
   } else if (!weatherKeywords) {
-    exclusionReason = "Market text does not look like a weather high-temperature contract.";
+    exclusionReason = "市场文本看起来不是天气最高温合约。";
   } else if (!parsedContract) {
-    exclusionReason = "Temperature bucket could not be parsed into a supported contract type.";
+    exclusionReason = "温度档位暂时无法解析成支持的合约类型。";
   } else if (!yesTokenId || !noTokenId) {
-    exclusionReason = "Polymarket token ids were not available for both outcomes.";
+    exclusionReason = "Polymarket 没有提供完整的 Yes/No token 标识。";
+  } else if (lifecycleState.inactiveReason === "closed") {
+    exclusionReason = "该市场已结束，不再纳入当前可交易主表。";
+  } else if (lifecycleState.inactiveReason === "accepting_orders_disabled") {
+    exclusionReason = "该市场当前不再接受下单。";
+  } else if (lifecycleState.inactiveReason === "archived") {
+    exclusionReason = "该市场已归档。";
+  } else if (lifecycleState.inactiveReason === "expired") {
+    exclusionReason = "该市场结束时间已过。";
   }
 
   return {
@@ -457,6 +945,18 @@ const normalizeCandidate = (
       parsedContract?.startC ?? null,
       parsedContract?.endC ?? null,
     ),
+    lifecycle:
+      lifecycleState.lifecycle === "inactive"
+        ? "inactive"
+        : status === "unresolved"
+          ? "unresolved"
+          : lifecycleState.lifecycle,
+    inactiveReason:
+      lifecycleState.lifecycle === "inactive"
+        ? lifecycleState.inactiveReason
+        : status === "unresolved"
+          ? (!yesTokenId || !noTokenId ? "missing_tokens" : null)
+          : lifecycleState.inactiveReason,
     parseStatus: status,
     exclusionReason,
     yesTokenId,
@@ -470,6 +970,14 @@ const normalizeCandidate = (
     eventUrl,
     liquidity: parseNumber(raw.liquidity),
     volume24h: parseNumber(raw.volume24hr) ?? parseNumber(raw.volume24h) ?? parseNumber(raw.volume),
+    description,
+    resolutionSource,
+    active: lifecycleState.active,
+    closed: lifecycleState.closed,
+    acceptingOrders: lifecycleState.acceptingOrders,
+    archived: lifecycleState.archived,
+    enableOrderBook: lifecycleState.enableOrderBook,
+    endsAt: lifecycleState.endsAt,
   };
 };
 
@@ -483,8 +991,22 @@ const normalizeOrderBook = (tokenId: string, payload: unknown): NormalizedOrderB
 
   const bids = Array.isArray(record?.bids) ? (record?.bids as RawOrderLevel[]) : [];
   const asks = Array.isArray(record?.asks) ? (record?.asks as RawOrderLevel[]) : [];
-  const bestBid = clamp01(parseNumber(bids[0]?.price));
-  const bestAsk = clamp01(parseNumber(asks[0]?.price));
+  const bestBid =
+    bids.reduce<number | null>((best, level) => {
+      const price = parseOrderPrice(level?.price);
+      if (price === null) {
+        return best;
+      }
+      return best === null ? price : Math.max(best, price);
+    }, null);
+  const bestAsk =
+    asks.reduce<number | null>((best, level) => {
+      const price = parseOrderPrice(level?.price);
+      if (price === null) {
+        return best;
+      }
+      return best === null ? price : Math.min(best, price);
+    }, null);
   const midpoint =
     bestBid !== null && bestAsk !== null ? (bestBid + bestAsk) / 2 : (bestAsk ?? bestBid ?? null);
 
@@ -493,7 +1015,8 @@ const normalizeOrderBook = (tokenId: string, payload: unknown): NormalizedOrderB
     bestBid,
     bestAsk,
     midpoint,
-    updatedAt: new Date().toISOString(),
+    updatedAt: resolveOrderBookUpdatedAt(record),
+    status: "available",
   };
 };
 
@@ -582,16 +1105,19 @@ export class PolymarketClient {
         return (right.volume24h ?? 0) - (left.volume24h ?? 0);
       });
 
+    const { active: visibleCandidates, inactive: inactiveCandidates } = partitionDiscoveryCandidates(candidates);
+
     return {
       fetchedAt: new Date().toISOString(),
-      candidates,
+      candidates: visibleCandidates,
+      inactiveCandidates,
       sourceLinks: {
         meteoblueWeekUrl: location.weekPageUrl,
         meteoblueMultimodelUrl: location.multimodelPageUrl,
         polymarketSearchUrl: `${this.gammaBaseUrl}/public-search?q=${encodeURIComponent(
-          `${location.cityName} weather ${targetDate}`,
+          searchTerms[0] ?? `${location.cityName} high temperature ${targetDate}`,
         )}`,
-        marketUrls: candidates
+        marketUrls: visibleCandidates
           .map((candidate) => candidate.marketUrl)
           .filter((value): value is string => Boolean(value))
           .slice(0, 12),
@@ -601,19 +1127,34 @@ export class PolymarketClient {
 
   async fetchOrderBooks(tokenIds: string[]): Promise<Map<string, NormalizedOrderBook>> {
     const uniqueTokenIds = unique(tokenIds.filter(Boolean));
-    const entries = await Promise.allSettled(
+    const entries = await Promise.all(
       uniqueTokenIds.map(async (tokenId) => {
-        const payload = await fetchJson<unknown>(toOrderBookUrl(this.clobBaseUrl, tokenId), {
-          signal: AbortSignal.timeout(POLYMARKET_DISCOVERY_TIMEOUT_MS),
-        });
-        return normalizeOrderBook(tokenId, payload);
+        try {
+          const payload = await fetchJson<unknown>(toOrderBookUrl(this.clobBaseUrl, tokenId), {
+            signal: AbortSignal.timeout(POLYMARKET_DISCOVERY_TIMEOUT_MS),
+          });
+          return normalizeOrderBook(tokenId, payload);
+        } catch (error) {
+          if (String(error).toLowerCase().includes("no orderbook exists")) {
+            return {
+              tokenId,
+              bestBid: null,
+              bestAsk: null,
+              midpoint: null,
+              updatedAt: new Date().toISOString(),
+              status: "no-orderbook" as const,
+            };
+          }
+
+          return null;
+        }
       }),
     );
 
     return new Map(
       entries
-        .filter((entry): entry is PromiseFulfilledResult<NormalizedOrderBook> => entry.status === "fulfilled")
-        .map((entry) => [entry.value.tokenId, entry.value]),
+        .filter((entry): entry is NormalizedOrderBook => Boolean(entry))
+        .map((entry) => [entry.tokenId, entry]),
     );
   }
 
@@ -628,7 +1169,8 @@ export class PolymarketClient {
         type: "status",
         generatedAt: new Date().toISOString(),
         state: "unavailable",
-        message: "No token ids were available for the matched markets.",
+        reasonCode: "missing_tokens",
+        message: "当前匹配到的市场没有完整 token 标识，无法建立实时流。",
       });
       return {
         close() {},
@@ -637,70 +1179,125 @@ export class PolymarketClient {
 
     const socket = new WebSocket(this.clobWsUrl);
     let closed = false;
+    let heartbeatTimer: NodeJS.Timeout | null = null;
+
+    const clearHeartbeat = () => {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
 
     socket.on("open", () => {
       onMessage({
         type: "status",
         generatedAt: new Date().toISOString(),
         state: "connected",
-        message: "Connected to Polymarket market feed.",
+        reasonCode: "ws_connected",
+        message: "已连接 Polymarket 市场实时流。",
       });
 
       socket.send(
         JSON.stringify({
-          type: "subscribe",
-          channel: "market",
-          asset_ids: uniqueTokenIds,
           assets_ids: uniqueTokenIds,
+          type: "market",
+          custom_feature_enabled: true,
         }),
       );
+
+      heartbeatTimer = setInterval(() => {
+        if (socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+
+        try {
+          socket.send("PING");
+        } catch {
+          // ignore heartbeat send errors; error/close handlers publish status
+        }
+      }, 10_000);
     });
 
     socket.on("message", (payload: RawData) => {
-      const occurredAt = new Date().toISOString();
-      onSignal(occurredAt);
-
-      let parsed: unknown = null;
-      try {
-        parsed = JSON.parse(payload.toString());
-      } catch {
-        parsed = null;
+      const rawText = payload.toString();
+      if (!rawText.trim() || isKeepaliveText(rawText)) {
+        return;
       }
 
-      const normalized = JSON.stringify(parsed ?? payload.toString()).toLowerCase();
+      let parsed: unknown = rawText;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        if (/\berror\b/i.test(rawText)) {
+          onMessage({
+            type: "status",
+            generatedAt: new Date().toISOString(),
+            state: "degraded",
+            reasonCode: "upstream_error",
+            message: "Polymarket 上游实时流返回异常文本，当前回退到轮询盘口同步。",
+          });
+        }
+        return;
+      }
+
+      const records = toWsRecords(parsed);
+      const occurredAt = resolveWsOccurredAt(records, new Date().toISOString());
+      if (records.some(isUpstreamWsErrorRecord)) {
+        onMessage({
+          type: "status",
+          generatedAt: occurredAt,
+          state: "degraded",
+          reasonCode: "upstream_error",
+          message: "Polymarket 上游实时流返回错误，当前回退到轮询盘口同步。",
+        });
+        return;
+      }
+
+      if (records.some(isMarketSignalRecord)) {
+        onSignal(occurredAt);
+        return;
+      }
+
+      const normalized = JSON.stringify(parsed).toLowerCase();
       if (normalized.includes("error")) {
         onMessage({
           type: "status",
           generatedAt: occurredAt,
           state: "degraded",
-          message: "Polymarket market stream reported an upstream error. Falling back to periodic price sync.",
+          reasonCode: "upstream_error",
+          message: "Polymarket 上游实时流返回异常，当前回退到周期性盘口同步。",
         });
       }
     });
 
     socket.on("close", () => {
+      clearHeartbeat();
       if (!closed) {
         onMessage({
           type: "status",
           generatedAt: new Date().toISOString(),
-          state: "disconnected",
-          message: "Polymarket market feed disconnected.",
+          state: "degraded",
+          reasonCode: "polling_fallback",
+          message: "Polymarket 市场实时流已断开，当前回退到轮询盘口同步。",
         });
       }
     });
 
     socket.on("error", () => {
+      clearHeartbeat();
       onMessage({
         type: "status",
         generatedAt: new Date().toISOString(),
         state: "degraded",
-        message: "Polymarket market feed connection failed.",
+        reasonCode: "polling_fallback",
+        message: "Polymarket 市场实时流连接失败，当前回退到轮询盘口同步。",
       });
     });
 
     return {
       close() {
         closed = true;
+        clearHeartbeat();
         try {
           socket.close();
         } catch {
@@ -713,12 +1310,19 @@ export class PolymarketClient {
 
 export const buildDiscoveryWarnings = (candidates: PolymarketCandidate[]): string[] => {
   const matchedCount = candidates.filter((candidate) => candidate.parseStatus === "matched").length;
-  if (matchedCount > 0) {
+  const tradableCount = candidates.filter(
+    (candidate) => candidate.parseStatus === "matched" && candidate.lifecycle === "tradable",
+  ).length;
+  if (tradableCount > 0) {
     return [];
   }
 
   if (candidates.length === 0) {
     return ["未找到可解析的 Polymarket 天气高温合约。"];
+  }
+
+  if (matchedCount > 0) {
+    return ["已匹配到市场，但当前都已结束或暂不可交易。"];
   }
 
   return ["已发现候选市场，但未能稳定解析出符合当前地点和日期的温度档位。"];

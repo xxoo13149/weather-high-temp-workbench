@@ -2,7 +2,10 @@ import type {
   KellyBucketProbability,
   KellyContractType,
   KellyDistributionSummary,
+  KellyEntrySource,
+  KellyInactiveReason,
   KellyMarketRow,
+  KellyMarketLifecycle,
   KellyProbabilityCurvePoint,
   KellyRecommendation,
   KellyRiskMode,
@@ -30,10 +33,14 @@ export interface KellyMarketInput {
   bucketStartC: number | null;
   bucketEndC: number | null;
   bucketLabel: string;
+  lifecycle?: KellyMarketLifecycle;
+  inactiveReason?: KellyInactiveReason | null;
   parseStatus: "matched" | "unresolved";
   exclusionReason: string | null;
   yesTokenId: string | null;
   noTokenId: string | null;
+  entrySourceYes?: KellyEntrySource;
+  entrySourceNo?: KellyEntrySource;
   yesPrice: number | null;
   noPrice: number | null;
   yesBestBid: number | null;
@@ -82,6 +89,18 @@ const safeEntryPrice = (bestAsk: number | null, midpoint: number | null): number
   }
 
   return null;
+};
+
+const resolveEntrySource = (bestAsk: number | null, midpoint: number | null): KellyEntrySource => {
+  if (typeof bestAsk === "number" && Number.isFinite(bestAsk) && bestAsk > 0 && bestAsk < 1) {
+    return "best-ask";
+  }
+
+  if (typeof midpoint === "number" && Number.isFinite(midpoint) && midpoint > 0 && midpoint < 1) {
+    return "midpoint";
+  }
+
+  return "unavailable";
 };
 
 const computeKellyFraction = (fairSide: number, entryPrice: number | null): number => {
@@ -390,6 +409,12 @@ export const buildKellyAnalytics = ({
 
     return {
       ...market,
+      lifecycle: market.lifecycle ?? "tradable",
+      inactiveReason: market.inactiveReason ?? null,
+      entrySourceYes: market.entrySourceYes ?? resolveEntrySource(market.yesBestAsk, market.yesPrice),
+      entrySourceNo: market.entrySourceNo ?? resolveEntrySource(market.noBestAsk, market.noPrice),
+      rawProbabilityYes: round4(fairYes),
+      rawProbabilityNo: round4(fairNo),
       fairYes: round4(fairYes),
       fairNo: round4(fairNo),
       edgeYes,

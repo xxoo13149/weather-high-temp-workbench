@@ -1,4 +1,4 @@
-import { ArrowUpRight, CalendarDays, MapPin, RefreshCw, ShieldCheck, Sigma, WalletCards } from "lucide-react";
+import { ArrowUpRight, MapPin, RefreshCw, Sigma, Thermometer, WalletCards } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import type { KellyRiskMode, KellyWorkbenchData } from "@/lib/kelly";
@@ -12,6 +12,7 @@ type KellyControlBarProps = {
   onTargetDateChange?: (targetDate: string) => void;
   onBankrollChange?: (value: string) => void;
   onMinEdgeChange?: (value: string) => void;
+  onActualTemperatureChange?: (value: string) => void;
   onRiskModeChange?: (riskMode: KellyRiskMode) => void;
   onRefresh?: () => void;
 };
@@ -19,29 +20,37 @@ type KellyControlBarProps = {
 const fieldClassName =
   "kelly-field-control data-mono w-full rounded-[16px] border border-white/8 bg-black/20 px-3 py-3 text-sm text-white outline-none transition placeholder:text-white/28 focus:border-[var(--border-strong)]";
 
+const renderFieldError = (message?: string | null) =>
+  message ? <span className="kelly-field__error">{message}</span> : null;
+
 export const KellyControlBar = ({
   data,
   disabled = false,
   refreshing = false,
   onLocationChange,
-  onTargetDateChange,
   onBankrollChange,
   onMinEdgeChange,
+  onActualTemperatureChange,
   onRiskModeChange,
   onRefresh,
 }: KellyControlBarProps) => (
   <section className="kelly-block">
     <div className="kelly-block__header">
       <div>
-        <div className="eyebrow">Controls</div>
-        <h3 className="kelly-block__title">实验参数</h3>
+        <div className="eyebrow">控制条</div>
+        <h3 className="kelly-block__title">地点和日期立即切换，参数改动先草稿，点击刷新分析后应用</h3>
       </div>
-      <div className="text-sm text-white/48">只定义 UI 控件与交互口子，主线程后续再接真实公式和行情层。</div>
+      <div className="text-sm text-white/52">
+        优势 = 我们估值 - 当前可买价。建议金额 = Kelly × 本金，`minEdge` 只影响高亮和执行建议。
+      </div>
     </div>
 
     <div className="kelly-controls-grid">
       <label className="kelly-field">
-        <span className="kelly-field__label"><MapPin className="h-4 w-4 text-[var(--accent)]" /> 城市</span>
+        <span className="kelly-field__label">
+          <MapPin className="h-4 w-4 text-[var(--accent)]" />
+          地点
+        </span>
         <select
           className={cn(fieldClassName, "appearance-none")}
           value={data.locationId}
@@ -57,36 +66,58 @@ export const KellyControlBar = ({
       </label>
 
       <label className="kelly-field">
-        <span className="kelly-field__label"><CalendarDays className="h-4 w-4 text-[var(--accent-secondary)]" /> 目标日期</span>
-        <select
-          className={cn(fieldClassName, "appearance-none")}
-          value={data.targetDate}
-          disabled={disabled}
-          onChange={(event) => onTargetDateChange?.(event.target.value)}
-        >
-          {data.dateOptions.map((option) => (
-            <option key={option} value={option}>
-              {option}
-            </option>
-          ))}
-        </select>
-      </label>
-
-      <label className="kelly-field">
-        <span className="kelly-field__label"><WalletCards className="h-4 w-4 text-[var(--warning)]" /> 本金</span>
+        <span className="kelly-field__label">
+          <WalletCards className="h-4 w-4 text-[var(--warning)]" />
+          本金
+        </span>
         <input
           className={fieldClassName}
           type="text"
           inputMode="decimal"
-          placeholder="2500"
+          placeholder="1000"
           value={data.bankrollInput}
           disabled={disabled}
           onChange={(event) => onBankrollChange?.(event.target.value)}
         />
+        {renderFieldError(data.fieldErrors?.bankroll)}
       </label>
 
       <label className="kelly-field">
-        <span className="kelly-field__label"><ShieldCheck className="h-4 w-4 text-[var(--success)]" /> 风险模式</span>
+        <span className="kelly-field__label">
+          <Sigma className="h-4 w-4 text-[var(--accent-secondary)]" />
+          最小优势 %
+        </span>
+        <input
+          className={fieldClassName}
+          type="text"
+          inputMode="decimal"
+          placeholder="2.0"
+          value={data.minEdgeInput}
+          disabled={disabled}
+          onChange={(event) => onMinEdgeChange?.(event.target.value)}
+        />
+        {renderFieldError(data.fieldErrors?.minEdge)}
+      </label>
+
+      <label className="kelly-field">
+        <span className="kelly-field__label">
+          <Thermometer className="h-4 w-4 text-[var(--success)]" />
+          参考温度
+        </span>
+        <input
+          className={fieldClassName}
+          type="text"
+          inputMode="decimal"
+          placeholder="留空则使用系统参考值"
+          value={data.actualTemperatureInput}
+          disabled={disabled}
+          onChange={(event) => onActualTemperatureChange?.(event.target.value)}
+        />
+        {renderFieldError(data.fieldErrors?.actualTemperature)}
+      </label>
+
+      <label className="kelly-field">
+        <span className="kelly-field__label">风险模式</span>
         <select
           className={cn(fieldClassName, "appearance-none")}
           value={data.riskMode}
@@ -101,19 +132,6 @@ export const KellyControlBar = ({
         </select>
       </label>
 
-      <label className="kelly-field">
-        <span className="kelly-field__label"><Sigma className="h-4 w-4 text-[var(--accent)]" /> 最小 edge</span>
-        <input
-          className={fieldClassName}
-          type="text"
-          inputMode="decimal"
-          placeholder="2.5"
-          value={data.minEdgeInput}
-          disabled={disabled}
-          onChange={(event) => onMinEdgeChange?.(event.target.value)}
-        />
-      </label>
-
       <div className="kelly-field">
         <span className="kelly-field__label">动作</span>
         <div className="kelly-control-actions">
@@ -125,19 +143,19 @@ export const KellyControlBar = ({
             onClick={() => onRefresh?.()}
           >
             <RefreshCw className={cn("h-4 w-4", refreshing && "animate-spin")} />
-            {refreshing ? "刷新中" : "刷新分析"}
+            {refreshing ? "正在刷新" : data.draftDirty ? "应用并刷新" : "刷新分析"}
           </Button>
 
           {data.marketUrl ? (
             <Button type="button" variant="outline" className="kelly-action-button" asChild>
               <a href={data.marketUrl} target="_blank" rel="noreferrer">
-                打开盘口
+                打开市场
                 <ArrowUpRight className="h-4 w-4" />
               </a>
             </Button>
           ) : (
             <Button type="button" variant="outline" className="kelly-action-button" disabled>
-              打开盘口
+              打开市场
             </Button>
           )}
         </div>

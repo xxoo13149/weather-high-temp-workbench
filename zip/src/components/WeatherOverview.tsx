@@ -128,6 +128,26 @@ const InspectorStat = ({
   </div>
 );
 
+const ConfidenceCard = ({
+  title,
+  score,
+  label,
+  detail,
+}: {
+  title: string;
+  score: number | null;
+  label: string;
+  detail: string;
+}) => (
+  <div className="min-w-[220px] rounded-[20px] border border-white/8 bg-black/20 px-4 py-3">
+    <div className="eyebrow">{title}</div>
+    <div className="mt-3">
+      <PredictabilityDots score={score} label={label} />
+    </div>
+    <div className="mt-3 text-xs leading-6 text-white/52">{detail}</div>
+  </div>
+);
+
 export const WeatherOverview = ({
   pageUrl,
   reportText,
@@ -210,6 +230,37 @@ export const WeatherOverview = ({
 
   const summaryText = reportText.trim() || UI_TEXT.weatherOverview.summarySyncing;
   const inspectorSummary = summarizeHour(selectedOrHoveredItem);
+  const availableTemperatureHours = items.filter((item) => typeof item.temperatureC === "number").length;
+  const totalHours = Math.max(items.length, 1);
+  const summaryReady = summaryText !== UI_TEXT.weatherOverview.summarySyncing;
+  const sourceConfidenceScore = useMemo(() => {
+    let score = 4;
+
+    if (availableTemperatureHours / totalHours < 0.9) {
+      score -= 1;
+    }
+
+    if (availableTemperatureHours / totalHours < 0.65) {
+      score -= 1;
+    }
+
+    if (!currentItem || !selectedOrHoveredItem) {
+      score -= 1;
+    }
+
+    if (!summaryReady) {
+      score -= 1;
+    }
+
+    return Math.max(1, Math.min(4, score));
+  }, [availableTemperatureHours, currentItem, selectedOrHoveredItem, summaryReady, totalHours]);
+  const sourceConfidenceLabel =
+    {
+      4: "数据源置信度 完整",
+      3: "数据源置信度 可用",
+      2: "数据源置信度 偏弱",
+      1: "数据源置信度 谨慎",
+    }[sourceConfidenceScore as 1 | 2 | 3 | 4] ?? "数据源置信度 暂缺";
 
   const trackGradient = useMemo(() => {
     if (!items.length) {
@@ -319,14 +370,22 @@ export const WeatherOverview = ({
 
           <p className="mt-4 max-w-4xl text-[15px] leading-7 text-white/82">{summaryText}</p>
 
-          <div className="mt-4 flex flex-wrap items-center gap-3">
-            {predictabilityScore !== undefined && predictabilityLabel !== undefined ? (
-              <PredictabilityDots
-                score={predictabilityScore}
-                label={`${UI_TEXT.analysis.predictabilityPrefix} ${predictabilityLabel}`}
-              />
-            ) : null}
+          <div className="mt-4 flex flex-wrap gap-3">
+            <ConfidenceCard
+              title="当天最高温判断置信度"
+              score={predictabilityScore ?? null}
+              label={`最高温判断 ${predictabilityLabel ?? "--"}`}
+              detail="复用源站 predictability 口径，专门用于当天最高温判断，不把它当成营销指标。"
+            />
+            <ConfidenceCard
+              title="数据源置信度"
+              score={sourceConfidenceScore}
+              label={sourceConfidenceLabel}
+              detail={`温度时序覆盖 ${availableTemperatureHours}/${totalHours} 个小时点；${summaryReady ? "中文摘要已就绪" : "中文摘要仍在同步"}`}
+            />
+          </div>
 
+          <div className="mt-4 flex flex-wrap items-center gap-3">
             <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/66">
               <CloudRain className="h-4 w-4 text-[var(--accent-secondary)]" />
               {UI_TEXT.weatherOverview.currentPrecipitation}

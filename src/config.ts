@@ -182,7 +182,7 @@ export const config = {
   multimodelDistributionTtlMs: readNumber("MULTIMODEL_STATS_TTL_MS", 120_000),
   polymarketMarketTtlMs: readNumber("POLYMARKET_MARKET_TTL_MS", 60_000),
   polymarketOrderbookTtlMs: readNumber("POLYMARKET_ORDERBOOK_TTL_MS", 5_000),
-  httpTimeoutMs: readNumber("HTTP_TIMEOUT_MS", 15_000),
+  httpTimeoutMs: readNumber("HTTP_TIMEOUT_MS", 30_000),
   polymarketGammaBaseUrl: process.env.POLYMARKET_GAMMA_BASE_URL ?? "https://gamma-api.polymarket.com",
   polymarketClobBaseUrl: process.env.POLYMARKET_CLOB_BASE_URL ?? "https://clob.polymarket.com",
   polymarketClobWsUrl:

@@ -18,10 +18,10 @@ export const KellyFrameAnalysis = ({
   <section className="kelly-block kelly-side-block">
     <div className="kelly-block__header">
       <div>
-        <div className="eyebrow">Frames</div>
+        <div className="eyebrow">逐帧回看</div>
         <h3 className="kelly-block__title">逐帧分析</h3>
       </div>
-      <div className="text-sm text-white/48">保留批次级轨迹，用于后续记录盘口价、fair 价和天气证据怎样一起移动。</div>
+      <div className="text-sm text-white/48">记录盘口价、公允价、优势和 spread 的变化，帮助判断市场怎么移动。</div>
     </div>
 
     <div className="kelly-frame-stack">
@@ -58,20 +58,32 @@ export const KellyFrameAnalysis = ({
 
                   <div className="kelly-frame-row__metrics">
                     <div>
-                      <span>Market</span>
-                      <strong className="data-mono">{formatKellyPercent(row.marketPricePct)}</strong>
+                      <span>Yes 盘口</span>
+                      <strong className="data-mono">{formatKellyPercent(row.yesPricePct)}</strong>
                     </div>
                     <div>
-                      <span>Fair</span>
-                      <strong className="data-mono">{formatKellyPercent(row.fairPricePct)}</strong>
+                      <span>Fair Yes</span>
+                      <strong className="data-mono">{formatKellyPercent(row.fairYesPct)}</strong>
                     </div>
                     <div>
-                      <span>Yes edge</span>
+                      <span>No 盘口</span>
+                      <strong className="data-mono">{formatKellyPercent(row.noPricePct)}</strong>
+                    </div>
+                    <div>
+                      <span>Fair No</span>
+                      <strong className="data-mono">{formatKellyPercent(row.fairNoPct)}</strong>
+                    </div>
+                    <div>
+                      <span>Yes 优势</span>
                       <strong className="data-mono text-[var(--accent)]">{formatKellySignedPercent(row.yesEdgePct)}</strong>
                     </div>
                     <div>
-                      <span>No edge</span>
+                      <span>No 优势</span>
                       <strong className="data-mono text-[var(--warning)]">{formatKellySignedPercent(row.noEdgePct)}</strong>
+                    </div>
+                    <div>
+                      <span>Spread</span>
+                      <strong className="data-mono">{formatKellyPercent(row.spreadPct)}</strong>
                     </div>
                   </div>
 
