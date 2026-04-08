@@ -31,8 +31,11 @@ export const KellyEvidenceInspector = ({
   sections,
   methodologyNotes,
   methodologyModels,
-}: KellyEvidenceInspectorProps) => (
-  <section className="kelly-block kelly-side-block">
+}: KellyEvidenceInspectorProps) => {
+  const visibleSyncMetrics = syncMetrics.filter((metric) => metric.id === "stream" || metric.value !== "--");
+
+  return (
+    <section className="kelly-block kelly-side-block">
     <div className="kelly-block__header">
       <div>
         <div className="eyebrow">右侧核对区</div>
@@ -42,7 +45,7 @@ export const KellyEvidenceInspector = ({
     </div>
 
     <div className="kelly-evidence-stack">
-      {syncMetrics.length > 0 ? (
+      {visibleSyncMetrics.length > 0 ? (
         <article className="kelly-evidence-card">
           <div className="kelly-evidence-card__header">
             <div className="kelly-evidence-card__title">
@@ -53,7 +56,7 @@ export const KellyEvidenceInspector = ({
           </div>
 
           <div className="kelly-side-sync-grid">
-            {syncMetrics.map((metric) => (
+            {visibleSyncMetrics.map((metric) => (
               <article key={metric.id} className={cn("kelly-side-sync-card", syncToneClassMap[metric.tone ?? "neutral"])}>
                 <div className="kelly-side-sync-card__label">{metric.label}</div>
                 <div className="kelly-side-sync-card__value data-mono">{metric.value}</div>
@@ -153,4 +156,5 @@ export const KellyEvidenceInspector = ({
       ) : null}
     </div>
   </section>
-);
+  );
+};

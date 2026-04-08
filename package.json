@@ -19,8 +19,6 @@
     "check": "tsc --noEmit && npm --prefix zip run lint && node tools/check-encoding.mjs",
     "start": "node dist/index.js",
     "deploy:cloudflare": "npx wrangler deploy",
-    "patch:find-my-way": "node tools/patch-find-my-way.mjs",
-    "postinstall": "npm run patch:find-my-way",
     "test": "vitest run"
   },
   "dependencies": {

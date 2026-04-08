@@ -11,14 +11,11 @@ import type {
   KellyStreamMessage,
   KellyTemperatureUnit,
 } from "../domain/weather.js";
-import { fetchJson } from "../lib/http.js";
+import { fetchJson, fetchText } from "../lib/http.js";
 
 const POLYMARKET_EVENT_BASE_URL = "https://polymarket.com/event";
 const POLYMARKET_DISCOVERY_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 2_500);
 const POLYMARKET_MAX_SEARCH_TERMS = 6;
-const isCloudflareWorkerRuntime = () =>
-  typeof (globalThis as { WebSocketPair?: unknown }).WebSocketPair !== "undefined";
-
 type RawOrderLevel = {
   price?: string | number | null;
   size?: string | number | null;
@@ -1158,15 +1155,8 @@ export class PolymarketClient {
       const payload = await fetchJson<unknown>(`${this.gammaBaseUrl}${path}`, {
         signal: AbortSignal.timeout(POLYMARKET_DISCOVERY_TIMEOUT_MS),
       });
-      const results = unwrapMarketCollection(payload);
-      if (isCloudflareWorkerRuntime()) {
-        console.log("[polymarket][worker][search]", path, "count=", results.length);
-      }
-      return results;
-    } catch (error) {
-      if (isCloudflareWorkerRuntime()) {
-        console.log("[polymarket][worker][search][error]", path, String(error));
-      }
+      return unwrapMarketCollection(payload);
+    } catch {
       return [];
     }
   }
@@ -1208,15 +1198,10 @@ export class PolymarketClient {
         });
         const records = extractEventEndpointMarkets(payload);
         if (records.length > 0) {
-          if (isCloudflareWorkerRuntime()) {
-            console.log("[polymarket][worker][event-slug]", eventSlug, "count=", records.length);
-          }
           return records;
         }
-      } catch (error) {
-        if (isCloudflareWorkerRuntime()) {
-          console.log("[polymarket][worker][event-slug][error]", eventSlug, String(error));
-        }
+      } catch {
+        // Try the next slug candidate.
       }
     }
 
@@ -1231,10 +1216,8 @@ export class PolymarketClient {
         if (records.length > 0) {
           return records;
         }
-      } catch (error) {
-        if (isCloudflareWorkerRuntime()) {
-          console.log("[polymarket][worker][page-fallback][error]", eventSlug, String(error));
-        }
+      } catch {
+        // Try the next event page candidate.
       }
     }
 

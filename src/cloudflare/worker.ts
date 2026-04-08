@@ -10,8 +10,6 @@ import type {
 } from "../domain/weather.js";
 import { MeteoblueWeatherService } from "../providers/meteoblue/service.js";
 import { CloudflareFavoritesStore, InMemoryFavoritesStore } from "./favorites-store.js";
-import { fetchJson } from "../lib/http.js";
-import { fetchText } from "../lib/http.js";
 
 type AssetBinding = {
   fetch(request: Request): Promise<Response>;
@@ -23,6 +21,7 @@ type WorkerEnv = {
     get(key: string): Promise<string | null>;
     put(key: string, value: string): Promise<void>;
   };
+  KELLY_BRIDGE_BASE_URL?: string;
 };
 
 type WorkerContext = {
@@ -244,6 +243,52 @@ const handleError = (error: unknown) => {
   return jsonResponse(fallback.toPayload(), 500);
 };
 
+const normalizeBaseUrl = (value: string) => value.replace(/\/+$/, "");
+
+const resolveKellyBridgeBaseUrl = (env: WorkerEnv): string | null => {
+  const raw = env.KELLY_BRIDGE_BASE_URL?.trim();
+  return raw ? normalizeBaseUrl(raw) : null;
+};
+
+const buildKellyBridgeRequest = (request: Request, env: WorkerEnv): Request | null => {
+  const bridgeBaseUrl = resolveKellyBridgeBaseUrl(env);
+  if (!bridgeBaseUrl) {
+    return null;
+  }
+
+  const incomingUrl = new URL(request.url);
+  const headers = new Headers(request.headers);
+  headers.set("x-forwarded-host", incomingUrl.host);
+  headers.set("x-forwarded-proto", incomingUrl.protocol.replace(":", ""));
+
+  return new Request(`${bridgeBaseUrl}${incomingUrl.pathname}${incomingUrl.search}`, {
+    method: request.method,
+    headers,
+    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+    redirect: "manual",
+  });
+};
+
+const proxyKellyRequest = async (request: Request, env: WorkerEnv): Promise<Response | null> => {
+  const proxyRequest = buildKellyBridgeRequest(request, env);
+  if (!proxyRequest) {
+    return null;
+  }
+
+  try {
+    return await fetch(proxyRequest);
+  } catch (error) {
+    throw new AppError(
+      502,
+      "KELLY_BRIDGE_UNAVAILABLE",
+      `Kelly bridge request failed: ${error instanceof Error ? error.message : String(error)}`,
+      {
+        retryable: true,
+      },
+    );
+  }
+};
+
 const sendSocketMessage = (socket: CloudflareWebSocket, message: KellyStreamMessage) => {
   try {
     socket.send(JSON.stringify(message));
@@ -255,6 +300,11 @@ const sendSocketMessage = (socket: CloudflareWebSocket, message: KellyStreamMess
 const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerContext) => {
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
     return new Response("Expected Upgrade: websocket", { status: 426 });
+  }
+
+  const bridgedResponse = await proxyKellyRequest(request, env);
+  if (bridgedResponse) {
+    return bridgedResponse;
   }
 
   const pair = new ((globalThis as unknown as { WebSocketPair: WebSocketPairCtor }).WebSocketPair)();
@@ -289,7 +339,7 @@ const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerCo
           try {
             await stream.close();
           } catch {
-            // ignore cleanup errors
+            // Ignore cleanup failures.
           }
         };
 
@@ -319,14 +369,23 @@ const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerCo
 };
 
 const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Response> => {
-  const service = await getService(env);
   const url = new URL(request.url);
+
+  if (request.method === "GET" && url.pathname === "/healthz") {
+    return jsonResponse({ ok: true, buildId, startedAt });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/weather/kelly") {
+    const bridgedResponse = await proxyKellyRequest(request, env);
+    if (bridgedResponse) {
+      return bridgedResponse;
+    }
+  }
+
+  const service = await getService(env);
   const locationId = parseQueryLocationId(url.searchParams.get("locationId"));
 
   switch (`${request.method} ${url.pathname}`) {
-    case "GET /healthz":
-      return jsonResponse({ ok: true, buildId, startedAt });
-
     case "GET /api/weather/hourly":
       return jsonResponse(
         await service.getHourly(locationId, parseMode(url.searchParams.get("mode")), parseLimit(url.searchParams.get("limit"))),
@@ -414,38 +473,6 @@ const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Respo
         });
       }
       return jsonResponse(await service.getKellyWorkbench(locationId, parseKellyOptions(url)));
-
-    case "GET /api/debug/polymarket-search": {
-      const query = url.searchParams.get("q") ?? "highest temperature in Shanghai on April 8, 2026";
-      const payload = await fetchJson<Record<string, unknown>>(
-        `https://gamma-api.polymarket.com/public-search?q=${encodeURIComponent(query)}`,
-      );
-      const events = Array.isArray(payload.events) ? payload.events : [];
-      const firstEvent = events[0] && typeof events[0] === "object" ? (events[0] as Record<string, unknown>) : null;
-      const markets = Array.isArray(firstEvent?.markets) ? firstEvent.markets : [];
-
-      return jsonResponse({
-        query,
-        eventCount: events.length,
-        marketCount: markets.length,
-        firstEventTitle: firstEvent?.title ?? null,
-        firstMarketQuestion:
-          markets[0] && typeof markets[0] === "object" ? (markets[0] as Record<string, unknown>).question ?? null : null,
-      });
-    }
-
-    case "GET /api/debug/polymarket-page": {
-      const urlToFetch =
-        url.searchParams.get("url") ??
-        "https://polymarket.com/event/highest-temperature-in-shanghai-on-april-8-2026";
-      const html = await fetchText(urlToFetch);
-      return jsonResponse({
-        url: urlToFetch,
-        hasNextData: html.includes("__NEXT_DATA__"),
-        hasClobTokenIds: html.includes("clobTokenIds"),
-        preview: html.slice(0, 240),
-      });
-    }
 
     case "GET /api/user/favorites":
       if (!service.getUserFavorites) {

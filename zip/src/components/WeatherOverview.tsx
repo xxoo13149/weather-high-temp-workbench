@@ -148,6 +148,13 @@ const ConfidenceCard = ({
   </div>
 );
 
+const buildPredictabilityDetail = (
+  predictabilityLabel: string | undefined,
+  availableTemperatureHours: number,
+  totalHours: number,
+) =>
+  `复用分析工作区同口径（predictability: ${(predictabilityLabel ?? "--").trim()}），温度时序覆盖 ${availableTemperatureHours}/${totalHours} 小时。`;
+
 export const WeatherOverview = ({
   pageUrl,
   reportText,
@@ -232,35 +239,6 @@ export const WeatherOverview = ({
   const inspectorSummary = summarizeHour(selectedOrHoveredItem);
   const availableTemperatureHours = items.filter((item) => typeof item.temperatureC === "number").length;
   const totalHours = Math.max(items.length, 1);
-  const summaryReady = summaryText !== UI_TEXT.weatherOverview.summarySyncing;
-  const sourceConfidenceScore = useMemo(() => {
-    let score = 4;
-
-    if (availableTemperatureHours / totalHours < 0.9) {
-      score -= 1;
-    }
-
-    if (availableTemperatureHours / totalHours < 0.65) {
-      score -= 1;
-    }
-
-    if (!currentItem || !selectedOrHoveredItem) {
-      score -= 1;
-    }
-
-    if (!summaryReady) {
-      score -= 1;
-    }
-
-    return Math.max(1, Math.min(4, score));
-  }, [availableTemperatureHours, currentItem, selectedOrHoveredItem, summaryReady, totalHours]);
-  const sourceConfidenceLabel =
-    {
-      4: "数据源置信度 完整",
-      3: "数据源置信度 可用",
-      2: "数据源置信度 偏弱",
-      1: "数据源置信度 谨慎",
-    }[sourceConfidenceScore as 1 | 2 | 3 | 4] ?? "数据源置信度 暂缺";
 
   const trackGradient = useMemo(() => {
     if (!items.length) {
@@ -370,18 +348,12 @@ export const WeatherOverview = ({
 
           <p className="mt-4 max-w-4xl text-[15px] leading-7 text-white/82">{summaryText}</p>
 
-          <div className="mt-4 flex flex-wrap gap-3 [&>*:nth-child(2)]:hidden">
+          <div className="mt-4 flex flex-wrap gap-3">
             <ConfidenceCard
               title="当天最高温判断置信度"
               score={predictabilityScore ?? null}
               label={`最高温判断 ${predictabilityLabel ?? "--"}`}
-              detail="复用源站 predictability 口径，专门用于当天最高温判断，不把它当成营销指标。"
-            />
-            <ConfidenceCard
-              title="数据源置信度"
-              score={sourceConfidenceScore}
-              label={sourceConfidenceLabel}
-              detail={`温度时序覆盖 ${availableTemperatureHours}/${totalHours} 个小时点；${summaryReady ? "中文摘要已就绪" : "中文摘要仍在同步"}`}
+              detail={buildPredictabilityDetail(predictabilityLabel, availableTemperatureHours, totalHours)}
             />
           </div>
 

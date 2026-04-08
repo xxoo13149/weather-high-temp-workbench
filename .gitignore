@@ -5,6 +5,7 @@ dist/
 .pnpm-store/
 .npm-cache/
 zip/dist/
+.wrangler/
 *.log
 *.har
 *.err

@@ -20,20 +20,18 @@ import { convertAbsoluteTemperature, convertDeltaTemperature } from "@/component
 
 type SnapshotMarket = KellyWorkbenchResponse["markets"][number] | KellyWorkbenchResponse["inactiveMarkets"][number];
 
-type SourceLabelKey = KellyWorkbenchResponse["weatherEvidence"]["currentReferenceSource"];
-type SourceLabelsMap = Partial<Record<SourceLabelKey, string>> & { observation_floor?: string };
 const OBSERVATION_FLOOR_LABEL = "实况温度已超过该档位";
 
-const SOURCE_LABELS: SourceLabelsMap = {
+const SOURCE_LABELS: Partial<Record<KellyWorkbenchResponse["weatherEvidence"]["currentReferenceSource"], string>> = {
   manual: "手动输入",
+  metar: "METAR 实况",
   "hourly-current": "当前实况",
   "hourly-selected": "选中小时",
   "model-mean": "模型均值",
-  observation_floor: "实况温度已超过该档位",
 };
 
 const getSourceLabel = (source: KellyWorkbenchResponse["weatherEvidence"]["currentReferenceSource"]) =>
-  source === "metar" ? "METAR 瀹炲喌" : (SOURCE_LABELS[source] ?? "--");
+  SOURCE_LABELS[source] ?? "--";
 
 const RISK_MODE_LABELS: Record<KellyRiskMode, string> = {
   conservative: "保守",
@@ -49,6 +47,7 @@ const INACTIVE_REASON_LABELS: Partial<Record<NonNullable<SnapshotMarket["inactiv
   missing_tokens: "缺少完整 token 标识",
   no_orderbook: "当前没有可用 orderbook",
   no_executable_prices: "Yes / No 两侧都没有可执行价格",
+  observation_floor: OBSERVATION_FLOOR_LABEL,
 };
 
 const CONTRACT_TYPE_LABELS: Record<SnapshotMarket["contractType"], string> = {
@@ -174,7 +173,7 @@ const resolveInactiveReason = (market: SnapshotMarket) => {
     return OBSERVATION_FLOOR_LABEL;
   }
 
-  return market.inactiveReason ? INACTIVE_REASON_LABELS[market.inactiveReason] : "当前不可交易";
+  return market.inactiveReason ? INACTIVE_REASON_LABELS[market.inactiveReason] ?? "当前不可交易" : "当前不可交易";
 };
 
 const sortMarkets = (markets: SnapshotMarket[]) =>
