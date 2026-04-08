@@ -1,7 +1,7 @@
 name = "weather-high-temp-workbench"
 main = "src/cloudflare/worker.ts"
 compatibility_date = "2026-04-08"
-compatibility_flags = ["nodejs_compat", "allow_eval_during_startup"]
+compatibility_flags = ["nodejs_compat"]
 account_id = "c2606f405d74ecfd7506d0bcec3c9cee"
 
 [assets]

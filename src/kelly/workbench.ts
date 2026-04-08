@@ -164,6 +164,13 @@ const resolveMarketLifecycle = ({
     };
   }
 
+  if (market.observationFloorBlocked) {
+    return {
+      lifecycle: "inactive",
+      inactiveReason: "observation_floor",
+    };
+  }
+
   if (market.lifecycle === "inactive" && market.inactiveReason) {
     return {
       lifecycle: "inactive",
@@ -634,6 +641,30 @@ const applyObservationFloorToCurve = (
   });
 };
 
+const isCandidateBlockedByObservationFloor = (
+  candidate: PolymarketCandidate,
+  floorTemperatureC: number | null,
+): boolean => {
+  if (typeof floorTemperatureC !== "number" || !Number.isFinite(floorTemperatureC)) {
+    return false;
+  }
+
+  const tolerance = 1e-9;
+  if (candidate.contractType === "atMost" && candidate.bucketEndC !== null) {
+    return candidate.bucketEndC < floorTemperatureC - tolerance;
+  }
+
+  if (candidate.contractType === "exact" && candidate.bucketStartC !== null) {
+    return candidate.bucketStartC < floorTemperatureC - tolerance;
+  }
+
+  if (candidate.contractType === "range" && candidate.bucketEndC !== null) {
+    return candidate.bucketEndC < floorTemperatureC - tolerance;
+  }
+
+  return false;
+};
+
 const integrateProbability = (
   curve: KellyProbabilityCurvePoint[],
   lowerBoundC: number | null,
@@ -1092,6 +1123,9 @@ export const buildKellyMarkets = (
             rawNo: 0.5,
             fairNo: 0.5,
           };
+    const blockedByObservationFloor = isCandidateBlockedByObservationFloor(candidate, observationFloorC);
+    const mappedLifecycle = blockedByObservationFloor ? "inactive" : candidate.lifecycle;
+    const mappedInactiveReason = blockedByObservationFloor ? "observation_floor" : candidate.inactiveReason;
 
     return {
       marketId: candidate.marketId,
@@ -1110,8 +1144,9 @@ export const buildKellyMarkets = (
       exclusionReason: candidate.exclusionReason,
       yesTokenId: candidate.yesTokenId,
       noTokenId: candidate.noTokenId,
-      lifecycle: candidate.lifecycle,
-      inactiveReason: candidate.inactiveReason,
+      lifecycle: mappedLifecycle,
+      inactiveReason: mappedInactiveReason,
+      observationFloorBlocked: blockedByObservationFloor,
       entrySourceYes: "unavailable",
       entrySourceNo: "unavailable",
       yesPrice: null,

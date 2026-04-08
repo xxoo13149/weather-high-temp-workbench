@@ -16,6 +16,8 @@ import { fetchJson } from "../lib/http.js";
 const POLYMARKET_EVENT_BASE_URL = "https://polymarket.com/event";
 const POLYMARKET_DISCOVERY_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 2_500);
 const POLYMARKET_MAX_SEARCH_TERMS = 6;
+const isCloudflareWorkerRuntime = () =>
+  typeof (globalThis as { WebSocketPair?: unknown }).WebSocketPair !== "undefined";
 
 type RawOrderLevel = {
   price?: string | number | null;
@@ -514,6 +516,107 @@ const buildSearchTerms = (location: RegisteredLocation, targetDate: string): str
     ]
       .map((value) => value.trim())
       .filter(Boolean),
+  );
+};
+
+const slugifyPolymarketSegment = (value: string): string =>
+  value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
+
+const buildEventSlugCandidates = (location: RegisteredLocation, targetDate: string): string[] => {
+  const parsed = new Date(`${targetDate}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    return [];
+  }
+
+  const month = new Intl.DateTimeFormat("en-US", {
+    month: "long",
+    timeZone: "UTC",
+  })
+    .format(parsed)
+    .toLowerCase();
+  const day = String(parsed.getUTCDate());
+  const year = String(parsed.getUTCFullYear());
+  const citySlug = slugifyPolymarketSegment(location.cityName);
+  const displaySlug = slugifyPolymarketSegment(location.displayName.replace(/\b(?:airport|international)\b/gi, ""));
+
+  return unique(
+    [citySlug, displaySlug]
+      .filter(Boolean)
+      .map((placeSlug) => `highest-temperature-in-${placeSlug}-on-${month}-${day}-${year}`),
+  );
+};
+
+const extractPageMarketRecords = (html: string, eventSlug: string): Record<string, unknown>[] => {
+  const match = html.match(/<script id="__NEXT_DATA__" type="application\/json"[^>]*>([\s\S]*?)<\/script>/i);
+  if (!match?.[1]) {
+    return [];
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(match[1]);
+  } catch {
+    return [];
+  }
+
+  const eventCandidates: Record<string, unknown>[] = [];
+  const visit = (value: unknown) => {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visit(item);
+      }
+      return;
+    }
+
+    if (!isRecord(value)) {
+      return;
+    }
+
+    if (parseString(value.slug) === eventSlug && Array.isArray(value.markets) && value.markets.length > 0) {
+      eventCandidates.push(value);
+    }
+
+    for (const nested of Object.values(value)) {
+      visit(nested);
+    }
+  };
+
+  visit(payload);
+
+  const eventRecord = eventCandidates.find((candidate) => Array.isArray(candidate.markets) && candidate.markets.length > 0);
+  if (!eventRecord || !Array.isArray(eventRecord.markets)) {
+    return [];
+  }
+
+  const eventTitle = parseString(eventRecord.title);
+  const eventDescription = parseString(eventRecord.description);
+  const eventResolutionSource = parseString(eventRecord.resolutionSource);
+
+  return eventRecord.markets
+    .filter(isRecord)
+    .map((market) => ({
+      ...market,
+      event: eventRecord,
+      eventTitle,
+      eventSlug,
+      description: parseString(market.description) ?? eventDescription,
+      resolutionSource: parseString(market.resolutionSource) ?? eventResolutionSource,
+      slug: parseString(market.slug) ?? parseString(eventRecord.slug),
+    }));
+};
+
+const extractEventEndpointMarkets = (payload: unknown): Record<string, unknown>[] => {
+  const events = Array.isArray(payload) ? payload.filter(isRecord) : [];
+  return events.flatMap((eventRecord) =>
+    unwrapMarketCollection({
+      events: [eventRecord],
+    }),
   );
 };
 
@@ -1055,8 +1158,15 @@ export class PolymarketClient {
       const payload = await fetchJson<unknown>(`${this.gammaBaseUrl}${path}`, {
         signal: AbortSignal.timeout(POLYMARKET_DISCOVERY_TIMEOUT_MS),
       });
-      return unwrapMarketCollection(payload);
-    } catch {
+      const results = unwrapMarketCollection(payload);
+      if (isCloudflareWorkerRuntime()) {
+        console.log("[polymarket][worker][search]", path, "count=", results.length);
+      }
+      return results;
+    } catch (error) {
+      if (isCloudflareWorkerRuntime()) {
+        console.log("[polymarket][worker][search][error]", path, String(error));
+      }
       return [];
     }
   }
@@ -1090,20 +1200,85 @@ export class PolymarketClient {
     return results.flat();
   }
 
+  private async fetchExactEventMarkets(location: RegisteredLocation, targetDate: string): Promise<Record<string, unknown>[]> {
+    for (const eventSlug of buildEventSlugCandidates(location, targetDate)) {
+      try {
+        const payload = await fetchJson<unknown>(`${this.gammaBaseUrl}/events?limit=1&slug=${encodeURIComponent(eventSlug)}`, {
+          signal: AbortSignal.timeout(POLYMARKET_DISCOVERY_TIMEOUT_MS),
+        });
+        const records = extractEventEndpointMarkets(payload);
+        if (records.length > 0) {
+          if (isCloudflareWorkerRuntime()) {
+            console.log("[polymarket][worker][event-slug]", eventSlug, "count=", records.length);
+          }
+          return records;
+        }
+      } catch (error) {
+        if (isCloudflareWorkerRuntime()) {
+          console.log("[polymarket][worker][event-slug][error]", eventSlug, String(error));
+        }
+      }
+    }
+
+    return [];
+  }
+
+  private async fetchEventPageMarkets(location: RegisteredLocation, targetDate: string): Promise<Record<string, unknown>[]> {
+    for (const eventSlug of buildEventSlugCandidates(location, targetDate)) {
+      try {
+        const html = await fetchText(`${POLYMARKET_EVENT_BASE_URL}/${eventSlug}`);
+        const records = extractPageMarketRecords(html, eventSlug);
+        if (records.length > 0) {
+          return records;
+        }
+      } catch (error) {
+        if (isCloudflareWorkerRuntime()) {
+          console.log("[polymarket][worker][page-fallback][error]", eventSlug, String(error));
+        }
+      }
+    }
+
+    return [];
+  }
+
   async discoverMarkets(location: RegisteredLocation, targetDate: string): Promise<PolymarketDiscoveryResult> {
     const collected = new Map<string, Record<string, unknown>>();
 
-    const searchTerms = buildSearchTerms(location, targetDate).slice(0, POLYMARKET_MAX_SEARCH_TERMS);
-    const searchResults = await Promise.all(searchTerms.map(async (term) => ({ term, results: await this.searchMarkets(term) })));
+    for (const entry of await this.fetchExactEventMarkets(location, targetDate)) {
+      const title =
+        parseString(entry.question) ??
+        parseString(entry.title) ??
+        parseString(entry.groupItemTitle) ??
+        parseString(entry.slug) ??
+        `exact-event-${collected.size}`;
+      collected.set(marketKey(entry, title), entry);
+    }
 
-    for (const { term, results } of searchResults) {
-      for (const entry of results) {
+    const searchTerms = buildSearchTerms(location, targetDate).slice(0, POLYMARKET_MAX_SEARCH_TERMS);
+    if (collected.size === 0) {
+      const searchResults = await Promise.all(searchTerms.map(async (term) => ({ term, results: await this.searchMarkets(term) })));
+
+      for (const { term, results } of searchResults) {
+        for (const entry of results) {
+          const title =
+            parseString(entry.question) ??
+            parseString(entry.title) ??
+            parseString(entry.groupItemTitle) ??
+            parseString(entry.slug) ??
+            `${term}-${collected.size}`;
+          collected.set(marketKey(entry, title), entry);
+        }
+      }
+    }
+
+    if (collected.size === 0) {
+      for (const entry of await this.fetchEventPageMarkets(location, targetDate)) {
         const title =
           parseString(entry.question) ??
           parseString(entry.title) ??
           parseString(entry.groupItemTitle) ??
           parseString(entry.slug) ??
-          `${term}-${collected.size}`;
+          `page-${collected.size}`;
         collected.set(marketKey(entry, title), entry);
       }
     }
@@ -1130,7 +1305,29 @@ export class PolymarketClient {
         return (right.volume24h ?? 0) - (left.volume24h ?? 0);
       });
 
-    const { active: visibleCandidates, inactive: inactiveCandidates } = partitionDiscoveryCandidates(candidates);
+    const matchedCount = candidates.filter((candidate) => candidate.parseStatus === "matched").length;
+    if (matchedCount === 0) {
+      for (const entry of await this.fetchEventPageMarkets(location, targetDate)) {
+        const title =
+          parseString(entry.question) ??
+          parseString(entry.title) ??
+          parseString(entry.groupItemTitle) ??
+          parseString(entry.slug) ??
+          `page-retry-${collected.size}`;
+        collected.set(marketKey(entry, title), entry);
+      }
+    }
+
+    const finalCandidates = Array.from(collected.values())
+      .map((entry) => normalizeCandidate(entry, location, targetDate))
+      .filter((entry): entry is PolymarketCandidate => Boolean(entry))
+      .sort((left, right) => {
+        if (left.parseStatus !== right.parseStatus) {
+          return left.parseStatus === "matched" ? -1 : 1;
+        }
+        return (right.volume24h ?? 0) - (left.volume24h ?? 0);
+      });
+    const { active: visibleCandidates, inactive: inactiveCandidates } = partitionDiscoveryCandidates(finalCandidates);
 
     return {
       fetchedAt: new Date().toISOString(),

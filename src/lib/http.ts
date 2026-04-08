@@ -2,13 +2,17 @@ import { config } from "../config.js";
 import { AppError } from "../domain/errors.js";
 
 const defaultHeaders = {
+  accept: "application/json, text/plain, */*",
   "accept-language": "en-US,en;q=0.9",
   "user-agent": config.userAgent,
 };
 
 const isWorkerRuntime = () => {
   const maybeNavigator = (globalThis as { navigator?: { userAgent?: string } }).navigator;
-  return maybeNavigator?.userAgent === "Cloudflare-Workers";
+  return (
+    maybeNavigator?.userAgent === "Cloudflare-Workers" ||
+    typeof (globalThis as { WebSocketPair?: unknown }).WebSocketPair !== "undefined"
+  );
 };
 
 const isPolymarketUrl = (url: string) => {
@@ -138,16 +142,11 @@ const fetchWithHandling = async (
 };
 
 export const fetchText = async (url: string): Promise<string> => {
-  if (isPolymarketUrl(url)) {
-    const body = await fetchWithShellFallback(url);
-    return body.toString("utf-8");
-  }
-
   try {
     const response = await fetchWithHandling(url, "UPSTREAM_FETCH_FAILED", "Failed to fetch");
     return await response.text();
   } catch (error) {
-    if (!isPolymarketUrl(url)) {
+    if (!isPolymarketUrl(url) || isWorkerRuntime()) {
       throw error;
     }
 
@@ -157,27 +156,11 @@ export const fetchText = async (url: string): Promise<string> => {
 };
 
 export const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
-  if (isPolymarketUrl(url)) {
-    try {
-      const body = await fetchWithShellFallback(url, init);
-      return JSON.parse(body.toString("utf-8")) as T;
-    } catch (fallbackError) {
-      throw new AppError(
-        502,
-        "UPSTREAM_JSON_PARSE_FAILED",
-        `Failed to parse JSON from ${url}: ${String(fallbackError)}`,
-        {
-          retryable: true,
-        },
-      );
-    }
-  }
-
   try {
     const response = await fetchWithHandling(url, "UPSTREAM_JSON_FETCH_FAILED", "Failed to fetch JSON", init);
     return (await response.json()) as T;
   } catch (error) {
-    if (!isPolymarketUrl(url)) {
+    if (!isPolymarketUrl(url) || isWorkerRuntime()) {
       throw new AppError(502, "UPSTREAM_JSON_PARSE_FAILED", `Failed to parse JSON from ${url}: ${String(error)}`, {
         retryable: true,
       });

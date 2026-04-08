@@ -1,7 +1,17 @@
-import { createApp } from "../app.js";
-import { CloudflareFavoritesStore, InMemoryFavoritesStore } from "./favorites-store.js";
-import type { KellyRequestOptions, KellyStreamMessage, LocationInfo } from "../domain/weather.js";
+import { DEFAULT_LOCATION, LOCATION_DIRECTORY, LOCATION_REGISTRY } from "../config.js";
+import { AppError, isAppError } from "../domain/errors.js";
+import type {
+  HourlyMode,
+  KellyRequestOptions,
+  KellyRiskMode,
+  KellyStreamMessage,
+  LocationDirectoryEntry,
+  LocationInfo,
+} from "../domain/weather.js";
 import { MeteoblueWeatherService } from "../providers/meteoblue/service.js";
+import { CloudflareFavoritesStore, InMemoryFavoritesStore } from "./favorites-store.js";
+import { fetchJson } from "../lib/http.js";
+import { fetchText } from "../lib/http.js";
 
 type AssetBinding = {
   fetch(request: Request): Promise<Response>;
@@ -19,13 +29,6 @@ type WorkerContext = {
   waitUntil(promise: Promise<unknown>): void;
 };
 
-type InjectResponse = {
-  statusCode: number;
-  headers: Record<string, string | string[] | undefined>;
-  rawPayload?: Uint8Array | Buffer;
-  payload?: string;
-};
-
 type WebSocketPairCtor = new () => {
   0: CloudflareWebSocket;
   1: CloudflareWebSocket;
@@ -36,9 +39,9 @@ type CloudflareWebSocket = WebSocket & {
   close(code?: number, reason?: string): void;
 };
 
-type AppInstance = Awaited<ReturnType<typeof createApp>>;
+const buildId = process.env.BUILD_ID ?? `worker-${Date.now().toString(36)}`;
+const startedAt = new Date().toISOString();
 
-let appPromise: Promise<AppInstance> | null = null;
 let servicePromise: Promise<MeteoblueWeatherService> | null = null;
 
 const getService = async (env: WorkerEnv) => {
@@ -52,92 +55,194 @@ const getService = async (env: WorkerEnv) => {
   return await servicePromise;
 };
 
-const getApp = async (env: WorkerEnv) => {
-  if (!appPromise) {
-    appPromise = (async () => {
-      const app = createApp(await getService(env), {
-        enableWebSocketRoutes: false,
-      });
-      await app.ready();
-      return app;
-    })();
+const buildLocationDirectory = (): LocationDirectoryEntry[] =>
+  LOCATION_DIRECTORY.map((location) => ({
+    id: location.id,
+    code: location.code,
+    displayName: location.displayName,
+    displayNameZh: location.displayNameZh,
+    shortLabel: location.shortLabel,
+    cityName: location.cityName,
+    countryName: location.countryName,
+    timezone: location.timezone,
+    timezoneGroup: location.timezoneGroup,
+    enabled: location.enabled,
+    sortOrder: location.sortOrder,
+    weekPageUrl: location.weekPageUrl,
+    multimodelPageUrl: location.multimodelPageUrl,
+  }));
+
+const parseMode = (raw: string | null): HourlyMode => {
+  if (raw === null || raw === "" || raw === "1h") {
+    return "1h";
   }
 
-  return await appPromise;
-};
-
-const toHeadersObject = (request: Request): Record<string, string> => {
-  const headers: Record<string, string> = {};
-  for (const [key, value] of request.headers.entries()) {
-    headers[key] = value;
-  }
-  return headers;
-};
-
-const toResponseHeaders = (headers: InjectResponse["headers"]): Headers => {
-  const responseHeaders = new Headers();
-  for (const [key, value] of Object.entries(headers)) {
-    if (!value) {
-      continue;
-    }
-
-    if (Array.isArray(value)) {
-      for (const entry of value) {
-        responseHeaders.append(key, entry);
-      }
-      continue;
-    }
-
-    responseHeaders.set(key, value);
+  if (raw === "3h") {
+    return "3h";
   }
 
-  return responseHeaders;
+  throw new AppError(400, "BAD_REQUEST", "Query parameter 'mode' must be either '1h' or '3h'.");
 };
 
-const injectRequest = async (request: Request, env: WorkerEnv): Promise<Response> => {
-  const app = await getApp(env);
-  const url = new URL(request.url);
-  const payload =
-    request.method === "GET" || request.method === "HEAD" ? undefined : Buffer.from(await request.arrayBuffer());
-  const response = (await (app.inject({
-    method: request.method as never,
-    url: `${url.pathname}${url.search}`,
-    headers: toHeadersObject(request),
-    payload,
-  }) as unknown as Promise<InjectResponse>)) as InjectResponse;
-
-  const body =
-    response.rawPayload !== undefined
-      ? new Uint8Array(response.rawPayload)
-      : response.payload ?? "";
-  return new Response(body, {
-    status: response.statusCode,
-    headers: toResponseHeaders(response.headers),
-  });
-};
-
-const parseNumber = (value: string | null): number | undefined => {
-  if (!value?.trim()) {
+const parseLimit = (raw: string | null): number | undefined => {
+  if (raw === null || raw === "") {
     return undefined;
   }
 
-  const parsed = Number.parseFloat(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'limit' must be a positive integer.");
+  }
+
+  return value;
+};
+
+const parseAllowStale = (raw: string | null): boolean => raw === "true" || raw === "1";
+
+const parseTimestamp = (raw: string | null): string | undefined => {
+  if (raw === null || raw === "") {
+    return undefined;
+  }
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'timestamp' must be a valid ISO timestamp.");
+  }
+
+  return raw;
+};
+
+const parseBucketSize = (raw: string | null): number | undefined => {
+  if (raw === null || raw === "") {
+    return undefined;
+  }
+
+  const value = Number.parseFloat(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'bucketSize' must be a positive number.");
+  }
+
+  return value;
+};
+
+const parseFloatNumber = (raw: string | null, message: string): number | undefined => {
+  if (raw === null || raw === "") {
+    return undefined;
+  }
+
+  const value = Number.parseFloat(raw);
+  if (!Number.isFinite(value)) {
+    throw new AppError(400, "BAD_REQUEST", message);
+  }
+
+  return value;
+};
+
+const parseActualTemperatureC = (raw: string | null): number | undefined =>
+  parseFloatNumber(raw, "Query parameter 'actualTemperatureC' must be a finite number.");
+
+const parseKellyTargetDate = (raw: string | null): string | undefined => {
+  if (raw === null || raw === "") {
+    return undefined;
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'targetDate' must use YYYY-MM-DD format.");
+  }
+
+  return raw;
+};
+
+const parseBankroll = (raw: string | null): number | undefined => {
+  const value = parseFloatNumber(raw, "Query parameter 'bankroll' must be a positive number.");
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value <= 0) {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'bankroll' must be a positive number.");
+  }
+
+  return value;
+};
+
+const parseKellyRiskMode = (raw: string | null): KellyRiskMode | undefined => {
+  if (raw === null || raw === "") {
+    return undefined;
+  }
+
+  if (raw === "conservative" || raw === "balanced" || raw === "aggressive") {
+    return raw;
+  }
+
+  throw new AppError(400, "BAD_REQUEST", "Query parameter 'riskMode' must be conservative, balanced, or aggressive.");
+};
+
+const parseKellyMinEdge = (raw: string | null): number | undefined => {
+  const value = parseFloatNumber(raw, "Query parameter 'minEdge' must be between 0 and 1.");
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value < 0 || value > 1) {
+    throw new AppError(400, "BAD_REQUEST", "Query parameter 'minEdge' must be between 0 and 1.");
+  }
+
+  return value;
+};
+
+const parseQueryLocationId = (raw: string | null): LocationInfo["id"] => {
+  if (raw === null || raw === "") {
+    return DEFAULT_LOCATION;
+  }
+
+  const locationId = raw.trim() as LocationInfo["id"];
+  if (!(locationId in LOCATION_REGISTRY)) {
+    throw new AppError(400, "BAD_REQUEST", `Query parameter 'locationId' is not supported: '${raw}'.`);
+  }
+
+  return locationId;
+};
+
+const parseFavoriteBody = (raw: unknown): boolean => {
+  if (typeof raw !== "object" || raw === null || !("favorite" in raw)) {
+    throw new AppError(400, "BAD_REQUEST", "Request body must include a boolean 'favorite' field.");
+  }
+
+  const value = (raw as Record<string, unknown>).favorite;
+  if (typeof value !== "boolean") {
+    throw new AppError(400, "BAD_REQUEST", "Request body field 'favorite' must be boolean.");
+  }
+
+  return value;
 };
 
 const parseKellyOptions = (url: URL): KellyRequestOptions => ({
-  targetDate: url.searchParams.get("targetDate") ?? undefined,
-  bankroll: parseNumber(url.searchParams.get("bankroll")),
-  riskMode:
-    url.searchParams.get("riskMode") === "conservative" ||
-    url.searchParams.get("riskMode") === "balanced" ||
-    url.searchParams.get("riskMode") === "aggressive"
-      ? (url.searchParams.get("riskMode") as KellyRequestOptions["riskMode"])
-      : undefined,
-  minEdge: parseNumber(url.searchParams.get("minEdge")),
-  actualTemperatureC: parseNumber(url.searchParams.get("actualTemperatureC")),
-  selectedHourTimestamp: url.searchParams.get("selectedHour") ?? undefined,
+  targetDate: parseKellyTargetDate(url.searchParams.get("targetDate")),
+  bankroll: parseBankroll(url.searchParams.get("bankroll")),
+  riskMode: parseKellyRiskMode(url.searchParams.get("riskMode")),
+  minEdge: parseKellyMinEdge(url.searchParams.get("minEdge")),
+  actualTemperatureC: parseActualTemperatureC(url.searchParams.get("actualTemperatureC")),
+  selectedHourTimestamp: parseTimestamp(url.searchParams.get("selectedHour")),
 });
+
+const jsonResponse = (payload: unknown, status = 200) =>
+  new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store, max-age=0",
+    },
+  });
+
+const handleError = (error: unknown) => {
+  if (isAppError(error)) {
+    return jsonResponse(error.toPayload(), error.statusCode);
+  }
+
+  const fallback = new AppError(500, "INTERNAL_SERVER_ERROR", "Unexpected server error.");
+  return jsonResponse(fallback.toPayload(), 500);
+};
 
 const sendSocketMessage = (socket: CloudflareWebSocket, message: KellyStreamMessage) => {
   try {
@@ -159,14 +264,26 @@ const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerCo
 
   const service = await getService(env);
   const url = new URL(request.url);
-  const locationId = (url.searchParams.get("locationId") ?? "") as LocationInfo["id"];
+  const locationId = parseQueryLocationId(url.searchParams.get("locationId"));
 
   ctx.waitUntil(
     (async () => {
       try {
-        const stream = await service.createKellyStream(locationId, parseKellyOptions(url), (message) =>
+        const stream = await service.createKellyStream?.(locationId, parseKellyOptions(url), (message) =>
           sendSocketMessage(server, message),
         );
+
+        if (!stream) {
+          sendSocketMessage(server, {
+            type: "status",
+            generatedAt: new Date().toISOString(),
+            state: "unavailable",
+            reasonCode: "upstream_error",
+            message: "Kelly 实时流当前不可用。",
+          });
+          server.close(1011, "kelly-stream-unavailable");
+          return;
+        }
 
         const closeStream = async () => {
           try {
@@ -197,9 +314,168 @@ const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerCo
 
   return new Response(null, {
     status: 101,
-    // Cloudflare Workers extends ResponseInit with the `webSocket` property.
     ...( { webSocket: client } as ResponseInit ),
   });
+};
+
+const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Response> => {
+  const service = await getService(env);
+  const url = new URL(request.url);
+  const locationId = parseQueryLocationId(url.searchParams.get("locationId"));
+
+  switch (`${request.method} ${url.pathname}`) {
+    case "GET /healthz":
+      return jsonResponse({ ok: true, buildId, startedAt });
+
+    case "GET /api/weather/hourly":
+      return jsonResponse(
+        await service.getHourly(locationId, parseMode(url.searchParams.get("mode")), parseLimit(url.searchParams.get("limit"))),
+      );
+
+    case "GET /api/weather/report":
+      return jsonResponse(await service.getWeatherReport(locationId));
+
+    case "GET /api/weather/dashboard": {
+      const mode = parseMode(url.searchParams.get("mode"));
+      const limit = parseLimit(url.searchParams.get("limit"));
+      const [hourly, multimodel, report] = await Promise.all([
+        service.getHourly(locationId, mode, limit),
+        service.getMultiModelStatus(locationId),
+        service.getWeatherReport(locationId),
+      ]);
+      const syncState = hourly.stale || report.stale ? "stale" : "fresh";
+
+      return jsonResponse({
+        generatedAt: new Date().toISOString(),
+        sync: {
+          state: syncState,
+          label: syncState === "stale" ? "stale" : "synced",
+          updatedAt: hourly.fetchedAt,
+        },
+        locationDirectory: buildLocationDirectory(),
+        hourly,
+        report,
+        multimodel: {
+          ...multimodel,
+          imageProxyUrl: `/api/weather/multimodel/image?allowStale=true&locationId=${encodeURIComponent(locationId)}`,
+          displayUpdatedAt: multimodel.imageFetchedAt ?? multimodel.lastSuccessAt,
+          sourceType: "official-relayed-image",
+          parity: "exact-image-relay",
+          statusLabel:
+            multimodel.imageFetchedAt ?? multimodel.lastSuccessAt
+              ? multimodel.stale
+                ? "stale"
+                : "fresh"
+              : "unavailable",
+        },
+      });
+    }
+
+    case "GET /api/weather/multimodel/image": {
+      const image = await service.getMultiModelImage(locationId, parseAllowStale(url.searchParams.get("allowStale")));
+      const headers = new Headers(image.headers);
+      headers.set("content-type", image.contentType);
+      return new Response(new Uint8Array(image.body), {
+        status: 200,
+        headers,
+      });
+    }
+
+    case "GET /api/weather/multimodel/status":
+      return jsonResponse(await service.getMultiModelStatus(locationId));
+
+    case "GET /api/weather/multimodel/distribution":
+      return jsonResponse(
+        await service.getMultiModelDistribution(
+          locationId,
+          parseTimestamp(url.searchParams.get("timestamp")),
+          parseBucketSize(url.searchParams.get("bucketSize")),
+        ),
+      );
+
+    case "GET /api/weather/multimodel/insights":
+      if (!service.getMultiModelInsight) {
+        throw new AppError(503, "MULTIMODEL_INSIGHT_UNAVAILABLE", "Multimodel insights endpoint is not configured.", {
+          retryable: false,
+        });
+      }
+      return jsonResponse(
+        await service.getMultiModelInsight(
+          locationId,
+          parseTimestamp(url.searchParams.get("timestamp")),
+          parseActualTemperatureC(url.searchParams.get("actualTemperatureC")),
+        ),
+      );
+
+    case "GET /api/weather/kelly":
+      if (!service.getKellyWorkbench) {
+        throw new AppError(503, "KELLY_UNAVAILABLE", "Kelly workbench is not configured.", {
+          retryable: false,
+        });
+      }
+      return jsonResponse(await service.getKellyWorkbench(locationId, parseKellyOptions(url)));
+
+    case "GET /api/debug/polymarket-search": {
+      const query = url.searchParams.get("q") ?? "highest temperature in Shanghai on April 8, 2026";
+      const payload = await fetchJson<Record<string, unknown>>(
+        `https://gamma-api.polymarket.com/public-search?q=${encodeURIComponent(query)}`,
+      );
+      const events = Array.isArray(payload.events) ? payload.events : [];
+      const firstEvent = events[0] && typeof events[0] === "object" ? (events[0] as Record<string, unknown>) : null;
+      const markets = Array.isArray(firstEvent?.markets) ? firstEvent.markets : [];
+
+      return jsonResponse({
+        query,
+        eventCount: events.length,
+        marketCount: markets.length,
+        firstEventTitle: firstEvent?.title ?? null,
+        firstMarketQuestion:
+          markets[0] && typeof markets[0] === "object" ? (markets[0] as Record<string, unknown>).question ?? null : null,
+      });
+    }
+
+    case "GET /api/debug/polymarket-page": {
+      const urlToFetch =
+        url.searchParams.get("url") ??
+        "https://polymarket.com/event/highest-temperature-in-shanghai-on-april-8-2026";
+      const html = await fetchText(urlToFetch);
+      return jsonResponse({
+        url: urlToFetch,
+        hasNextData: html.includes("__NEXT_DATA__"),
+        hasClobTokenIds: html.includes("clobTokenIds"),
+        preview: html.slice(0, 240),
+      });
+    }
+
+    case "GET /api/user/favorites":
+      if (!service.getUserFavorites) {
+        throw new AppError(503, "FAVORITES_UNAVAILABLE", "Favorites endpoint is not configured.", {
+          retryable: false,
+        });
+      }
+      return jsonResponse(await service.getUserFavorites());
+
+    default:
+      break;
+  }
+
+  if (request.method === "PUT" && url.pathname.startsWith("/api/user/favorites/")) {
+    if (!service.setUserFavorite) {
+      throw new AppError(503, "FAVORITES_UNAVAILABLE", "Favorites endpoint is not configured.", {
+        retryable: false,
+      });
+    }
+
+    const locationPath = decodeURIComponent(url.pathname.slice("/api/user/favorites/".length));
+    if (!locationPath) {
+      throw new AppError(400, "BAD_REQUEST", "Path parameter 'locationId' must be a non-empty string.");
+    }
+
+    const favorite = parseFavoriteBody(await request.json());
+    return jsonResponse(await service.setUserFavorite(locationPath as LocationInfo["id"], favorite));
+  }
+
+  throw new AppError(404, "NOT_FOUND", "Route not found.");
 };
 
 const isApiRequest = (pathname: string) => pathname === "/healthz" || pathname.startsWith("/api/");
@@ -208,14 +484,18 @@ export default {
   async fetch(request: Request, env: WorkerEnv, ctx: WorkerContext): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/api/weather/kelly/stream") {
-      return await handleKellyStream(request, env, ctx);
-    }
+    try {
+      if (url.pathname === "/api/weather/kelly/stream") {
+        return await handleKellyStream(request, env, ctx);
+      }
 
-    if (isApiRequest(url.pathname)) {
-      return await injectRequest(request, env);
-    }
+      if (isApiRequest(url.pathname)) {
+        return await handleApiRequest(request, env);
+      }
 
-    return await env.ASSETS.fetch(request);
+      return await env.ASSETS.fetch(request);
+    } catch (error) {
+      return handleError(error);
+    }
   },
 };

@@ -282,7 +282,8 @@ export type KellyInactiveReason =
   | "expired"
   | "missing_tokens"
   | "no_orderbook"
-  | "no_executable_prices";
+  | "no_executable_prices"
+  | "observation_floor";
 export type KellyEntrySource = "best-ask" | "midpoint" | "unavailable";
 export type KellyMarketMotionState = "live" | "still" | "polling-fallback" | "unavailable";
 export type KellyStreamReasonCode =
@@ -363,6 +364,7 @@ export interface KellyMarketRow {
   bucketLabel: string;
   lifecycle: KellyMarketLifecycle;
   inactiveReason: KellyInactiveReason | null;
+  observationFloorBlocked?: boolean;
   parseStatus: "matched" | "unresolved";
   exclusionReason: string | null;
   yesTokenId: string | null;

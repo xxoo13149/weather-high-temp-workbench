@@ -655,16 +655,19 @@ describe("buildKellyWorkbench", () => {
     ]);
 
     const result = buildKellyWorkbench(args);
-    const under17 = result.markets.find((market) => market.marketId === "market-under-17");
+    const under17Active = result.markets.find((market) => market.marketId === "market-under-17");
+    const under17Inactive = result.inactiveMarkets.find((market) => market.marketId === "market-under-17");
     const atleast16 = result.markets.find((market) => market.marketId === "market-atleast-16");
 
     expect(result.weatherEvidence.observationFloorTemperatureC).toBe(18);
     expect(result.weatherEvidence.observationFloorSource).toBe("manual");
-    expect(under17).toMatchObject({
+    expect(under17Active).toBeUndefined();
+    expect(under17Inactive).toMatchObject({
       fairYes: 0,
       fairNo: 1,
-      recommendedSide: "no",
     });
+    expect(under17Inactive?.recommendedSide).not.toBe("yes");
+    expect(under17Inactive?.inactiveReason).toBe("observation_floor");
     expect(atleast16).toMatchObject({
       fairYes: 1,
       fairNo: 0,
