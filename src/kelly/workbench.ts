@@ -316,6 +316,113 @@ const resolveAvailableTargetDates = (timestamps: string[], timeZone: string): st
 const findHourlyItem = (hourly: HourlyWeatherResponse, timestamp: string | undefined) =>
   timestamp ? hourly.items.find((item) => item.timestamp === timestamp) ?? null : null;
 
+type ObservedTemperatureCandidate<Source extends string> = {
+  value: number;
+  source: Source;
+  observedAt: string | null;
+  priority: number;
+};
+
+type KellyObservationFloor = {
+  value: number | null;
+  source: KellyWeatherEvidence["observationFloorSource"];
+  observedAt: string | null;
+};
+
+type KellyObservationFloorContext = {
+  targetDate?: string;
+  timeZone?: string;
+  now?: Date;
+  rememberedFloor?: KellyObservationFloor | null;
+};
+
+const pickWarmestObservedCandidate = <Source extends string>(
+  candidates: Array<ObservedTemperatureCandidate<Source>>,
+): ObservedTemperatureCandidate<Source> | null => {
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  return [...candidates].sort((left, right) => {
+    if (right.value !== left.value) {
+      return right.value - left.value;
+    }
+
+    return right.priority - left.priority;
+  })[0] ?? null;
+};
+
+const resolveRealtimeObservedCandidate = (
+  hourly: HourlyWeatherResponse,
+  metarObservation: MetarObservation | null,
+): ObservedTemperatureCandidate<"metar" | "hourly-current"> | null => {
+  const candidates: Array<ObservedTemperatureCandidate<"metar" | "hourly-current">> = [];
+
+  if (typeof hourly.current?.temperatureC === "number" && Number.isFinite(hourly.current.temperatureC)) {
+    candidates.push({
+      value: hourly.current.temperatureC,
+      source: "hourly-current",
+      observedAt: hourly.current.timestamp,
+      priority: 2,
+    });
+  }
+
+  if (typeof metarObservation?.temperatureC === "number" && Number.isFinite(metarObservation.temperatureC)) {
+    candidates.push({
+      value: metarObservation.temperatureC,
+      source: "metar",
+      observedAt: metarObservation.observedAt,
+      priority: 1,
+    });
+  }
+
+  return pickWarmestObservedCandidate(candidates);
+};
+
+const resolveObservedHourlyHighCandidate = (
+  hourly: HourlyWeatherResponse,
+  targetDate: string,
+  timeZone: string,
+  now: Date,
+): ObservedTemperatureCandidate<"hourly-observed"> | null => {
+  const nowTime = now.getTime();
+  if (!Number.isFinite(nowTime)) {
+    return null;
+  }
+
+  const candidates = hourly.items
+    .filter((item) => typeof item.temperatureC === "number" && Number.isFinite(item.temperatureC))
+    .filter((item) => parseTargetDateFromTimestamp(item.timestamp, timeZone) === targetDate)
+    .filter((item) => {
+      const observedTime = new Date(item.timestamp).getTime();
+      return Number.isFinite(observedTime) && observedTime <= nowTime;
+    })
+    .map(
+      (item): ObservedTemperatureCandidate<"hourly-observed"> => ({
+        value: item.temperatureC as number,
+        source: "hourly-observed",
+        observedAt: item.timestamp,
+        priority: 1,
+      }),
+    );
+
+  return pickWarmestObservedCandidate(candidates);
+};
+
+const resolveObservationAnchorTargetDate = (
+  hourly: HourlyWeatherResponse,
+  metarObservation: MetarObservation | null,
+  timeZone: string,
+  now: Date,
+): string => {
+  const anchorTimestamp = metarObservation?.observedAt ?? hourly.current?.timestamp;
+  return (
+    (anchorTimestamp ? parseTargetDateFromTimestamp(anchorTimestamp, timeZone) : null) ??
+    parseTargetDateFromTimestamp(now.toISOString(), timeZone) ??
+    resolveKellyTargetDate(timeZone)
+  );
+};
+
 const resolveReferenceTemperature = (
   hourly: HourlyWeatherResponse,
   insight: MultiModelInsightResponse,
@@ -334,19 +441,12 @@ const resolveReferenceTemperature = (
     };
   }
 
-  if (typeof metarObservation?.temperatureC === "number") {
+  const realtimeObserved = resolveRealtimeObservedCandidate(hourly, metarObservation);
+  if (realtimeObserved) {
     return {
-      value: metarObservation.temperatureC,
-      source: "metar",
-      weatherTimestamp: metarObservation.observedAt,
-    };
-  }
-
-  if (typeof hourly.current?.temperatureC === "number") {
-    return {
-      value: hourly.current.temperatureC,
-      source: "hourly-current",
-      weatherTimestamp: hourly.current.timestamp,
+      value: realtimeObserved.value,
+      source: realtimeObserved.source,
+      weatherTimestamp: realtimeObserved.observedAt,
     };
   }
 
@@ -374,36 +474,72 @@ const resolveReferenceTemperature = (
   };
 };
 
-const resolveObservationFloor = (
+export const resolveObservationFloor = (
   hourly: HourlyWeatherResponse,
   metarObservation: MetarObservation | null,
   options: KellyRequestOptions,
-): {
-  value: number | null;
-  source: KellyWeatherEvidence["observationFloorSource"];
-  observedAt: string | null;
-} => {
-  if (typeof options.actualTemperatureC === "number" && Number.isFinite(options.actualTemperatureC)) {
+  context: KellyObservationFloorContext = {},
+): KellyObservationFloor => {
+  const timeZone = context.timeZone ?? hourly.location.timezone;
+  const targetDate = context.targetDate ?? resolveKellyTargetDate(timeZone);
+  const anchorNow = context.now ?? new Date();
+  const isTodayTarget =
+    targetDate === resolveObservationAnchorTargetDate(hourly, metarObservation, timeZone, anchorNow);
+
+  if (!isTodayTarget) {
     return {
+      value: null,
+      source: "none",
+      observedAt: null,
+    };
+  }
+
+  const candidates: Array<ObservedTemperatureCandidate<KellyWeatherEvidence["observationFloorSource"]>> = [];
+
+  if (typeof options.actualTemperatureC === "number" && Number.isFinite(options.actualTemperatureC)) {
+    candidates.push({
       value: options.actualTemperatureC,
       source: "manual",
       observedAt: options.selectedHourTimestamp ?? hourly.current?.timestamp ?? null,
-    };
+      priority: 3,
+    });
   }
 
-  if (typeof metarObservation?.temperatureC === "number") {
-    return {
-      value: metarObservation.temperatureC,
-      source: "metar",
-      observedAt: metarObservation.observedAt,
-    };
+  const realtimeObserved = resolveRealtimeObservedCandidate(hourly, metarObservation);
+  if (realtimeObserved) {
+    candidates.push({
+      value: realtimeObserved.value,
+      source: realtimeObserved.source,
+      observedAt: realtimeObserved.observedAt,
+      priority: realtimeObserved.priority,
+    });
   }
 
-  if (typeof hourly.current?.temperatureC === "number") {
+  const observedHourlyHigh = resolveObservedHourlyHighCandidate(
+    hourly,
+    targetDate,
+    timeZone,
+    anchorNow,
+  );
+  if (observedHourlyHigh) {
+    candidates.push(observedHourlyHigh);
+  }
+
+  if (typeof context.rememberedFloor?.value === "number" && Number.isFinite(context.rememberedFloor.value)) {
+    candidates.push({
+      value: context.rememberedFloor.value,
+      source: context.rememberedFloor.source,
+      observedAt: context.rememberedFloor.observedAt,
+      priority: 0,
+    });
+  }
+
+  const bestObserved = pickWarmestObservedCandidate(candidates);
+  if (bestObserved) {
     return {
-      value: hourly.current.temperatureC,
-      source: "hourly-current",
-      observedAt: hourly.current.timestamp,
+      value: bestObserved.value,
+      source: bestObserved.source,
+      observedAt: bestObserved.observedAt,
     };
   }
 
@@ -1551,6 +1687,7 @@ export const buildKellyWorkbench = ({
   frameSeries,
   options,
   warnings,
+  observationFloorOverride = null,
 }: {
   location: RegisteredLocation;
   targetDate: string;
@@ -1570,6 +1707,7 @@ export const buildKellyWorkbench = ({
   frameSeries: KellyFramePoint[];
   options: KellyRequestOptions;
   warnings: string[];
+  observationFloorOverride?: KellyObservationFloor | null;
 }) => {
   const bankroll = options.bankroll && Number.isFinite(options.bankroll) && options.bankroll > 0 ? options.bankroll : DEFAULT_BANKROLL;
   const minEdge =
@@ -1577,7 +1715,12 @@ export const buildKellyWorkbench = ({
   const riskMode = options.riskMode ?? DEFAULT_RISK_MODE;
   const availableTargetDates = resolveAvailableTargetDates(distribution.availableTimestamps, location.timezone);
   const reference = resolveReferenceTemperature(hourly, insight, metarObservation, options);
-  const observationFloor = resolveObservationFloor(hourly, metarObservation, options);
+  const observationFloor =
+    observationFloorOverride ??
+    resolveObservationFloor(hourly, metarObservation, options, {
+      targetDate,
+      timeZone: location.timezone,
+    });
   const signalBundle = buildUsableSignals(insight, distribution, reference.value);
   const curve = applyObservationFloorToCurve(buildProbabilityCurve(signalBundle.usableSignals), observationFloor.value);
   const shrinkResult = buildShrink(signalBundle.usableSignals, signalBundle.totalModelCount, hourly.stale || distribution.stale || insight.stale);

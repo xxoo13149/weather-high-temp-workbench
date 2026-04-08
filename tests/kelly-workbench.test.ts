@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 
 import { LOCATION_REGISTRY } from "../src/config.js";
-import { buildKellyWorkbench } from "../src/kelly/workbench.js";
+import { buildKellyWorkbench, resolveObservationFloor } from "../src/kelly/workbench.js";
 
 const location = LOCATION_REGISTRY.miami_mia;
 
@@ -659,8 +659,8 @@ describe("buildKellyWorkbench", () => {
     const under17Inactive = result.inactiveMarkets.find((market) => market.marketId === "market-under-17");
     const atleast16 = result.markets.find((market) => market.marketId === "market-atleast-16");
 
-    expect(result.weatherEvidence.observationFloorTemperatureC).toBe(18);
-    expect(result.weatherEvidence.observationFloorSource).toBe("manual");
+    expect(result.weatherEvidence.observationFloorTemperatureC).toBe(20);
+    expect(result.weatherEvidence.observationFloorSource).toBe("hourly-observed");
     expect(under17Active).toBeUndefined();
     expect(under17Inactive).toMatchObject({
       fairYes: 0,
@@ -672,6 +672,253 @@ describe("buildKellyWorkbench", () => {
       fairYes: 1,
       fairNo: 0,
     });
+  });
+
+  test("prefers the warmer realtime observation when METAR lags behind the live hourly reading", () => {
+    const args = createBuildArgs({
+      frameSeries: [],
+    });
+    args.options.actualTemperatureC = undefined;
+    args.hourly.current = {
+      timestamp: "2026-03-28T16:00:00-04:00",
+      temperatureC: 18,
+      index: 0,
+    };
+    args.metarObservation = {
+      location: { id: location.id, name: location.name, timezone: location.timezone },
+      stationId: "KMIA",
+      observedAt: "2026-03-28T15:50:00-04:00",
+      temperatureC: 15,
+      dewpointC: 12,
+      windDirectionDegrees: 130,
+      windSpeedKts: 11,
+      rawReport: "METAR KMIA 281950Z 13011KT 10SM FEW030 15/12 A3000",
+      stationName: "Miami Intl",
+      sourceUrl: "https://aviationweather.gov/api/data/metar?format=json&ids=KMIA",
+      fetchedAt: "2026-03-28T19:50:00.000Z",
+      stale: false,
+      cacheHit: true,
+    };
+    args.discoveryCandidates = [
+      {
+        ...args.discoveryCandidates[0],
+        marketId: "market-under-17",
+        slug: "market-under-17",
+        contractType: "atMost",
+        bucketStartC: null,
+        bucketEndC: 17,
+        bucketLabel: "<= 17.0C",
+        title: "Will the high temperature in Miami be at most 17C on Mar 28, 2026?",
+        yesTokenId: "yes-under-17",
+        noTokenId: "no-under-17",
+      },
+      {
+        ...args.discoveryCandidates[1],
+        marketId: "market-18-exact",
+        slug: "market-18-exact",
+        contractType: "exact",
+        bucketStartC: 18,
+        bucketEndC: 18,
+        bucketLabel: "18.0C exact",
+        title: "Will the high temperature in Miami be 18C on Mar 28, 2026?",
+        yesTokenId: "yes-18-exact",
+        noTokenId: "no-18-exact",
+      },
+    ];
+    args.orderBooks = new Map([
+      ["yes-under-17", createOrderBook("yes-under-17", 0.02)],
+      ["no-under-17", createOrderBook("no-under-17", 0.98)],
+      ["yes-18-exact", createOrderBook("yes-18-exact", 0.45)],
+      ["no-18-exact", createOrderBook("no-18-exact", 0.55)],
+    ]);
+
+    const result = buildKellyWorkbench(args);
+    const under17Active = result.markets.find((market) => market.marketId === "market-under-17");
+    const under17Inactive = result.inactiveMarkets.find((market) => market.marketId === "market-under-17");
+
+    expect(result.weatherEvidence.currentReferenceTemperatureC).toBe(18);
+    expect(result.weatherEvidence.currentReferenceSource).toBe("hourly-current");
+    expect(result.weatherEvidence.observationFloorTemperatureC).toBe(20);
+    expect(result.weatherEvidence.observationFloorSource).toBe("hourly-observed");
+    expect(under17Active).toBeUndefined();
+    expect(under17Inactive?.inactiveReason).toBe("observation_floor");
+    expect(under17Inactive).toMatchObject({
+      fairYes: 0,
+      fairNo: 1,
+    });
+  });
+
+  test("uses the highest realized hourly observation for today so cooled-off buckets stay impossible", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-03-28T20:30:00.000Z"));
+
+      const args = createBuildArgs({
+        frameSeries: [],
+      });
+      args.options.actualTemperatureC = undefined;
+      args.hourly.current = {
+        timestamp: "2026-03-28T16:00:00-04:00",
+        temperatureC: 16,
+        index: 1,
+      };
+      args.hourly.items = [
+        {
+          ...args.hourly.items[0],
+          timestamp: "2026-03-28T13:00:00-04:00",
+          temperatureC: 18,
+        },
+        {
+          ...args.hourly.items[0],
+          timestamp: "2026-03-28T16:00:00-04:00",
+          temperatureC: 16,
+        },
+        {
+          ...args.hourly.items[0],
+          timestamp: "2026-03-28T19:00:00-04:00",
+          temperatureC: 21,
+        },
+      ];
+      args.metarObservation = {
+        location: { id: location.id, name: location.name, timezone: location.timezone },
+        stationId: "KMIA",
+        observedAt: "2026-03-28T16:05:00-04:00",
+        temperatureC: 16,
+        dewpointC: 12,
+        windDirectionDegrees: 130,
+        windSpeedKts: 11,
+        rawReport: "METAR KMIA 282005Z 13011KT 10SM FEW030 16/12 A3000",
+        stationName: "Miami Intl",
+        sourceUrl: "https://aviationweather.gov/api/data/metar?format=json&ids=KMIA",
+        fetchedAt: "2026-03-28T20:05:00.000Z",
+        stale: false,
+        cacheHit: true,
+      };
+      args.discoveryCandidates = [
+        {
+          ...args.discoveryCandidates[0],
+          marketId: "market-under-17",
+          slug: "market-under-17",
+          contractType: "atMost",
+          bucketStartC: null,
+          bucketEndC: 17,
+          bucketLabel: "<= 17.0C",
+          title: "Will the high temperature in Miami be at most 17C on Mar 28, 2026?",
+          yesTokenId: "yes-under-17",
+          noTokenId: "no-under-17",
+        },
+      ];
+      args.orderBooks = new Map([
+        ["yes-under-17", createOrderBook("yes-under-17", 0.02)],
+        ["no-under-17", createOrderBook("no-under-17", 0.98)],
+      ]);
+
+      const result = buildKellyWorkbench(args);
+      const under17Inactive = result.inactiveMarkets.find((market) => market.marketId === "market-under-17");
+
+      expect(result.weatherEvidence.observationFloorTemperatureC).toBe(18);
+      expect(result.weatherEvidence.observationFloorSource).toBe("hourly-observed");
+      expect(under17Inactive?.inactiveReason).toBe("observation_floor");
+      expect(under17Inactive).toMatchObject({
+        fairYes: 0,
+        fairNo: 1,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not apply today's observation floor to future target dates", () => {
+    const args = createBuildArgs({
+      frameSeries: [],
+    });
+    args.targetDate = "2026-03-29";
+    args.options.actualTemperatureC = 18;
+    args.hourly.current = {
+      timestamp: "2026-03-28T16:00:00-04:00",
+      temperatureC: 18,
+      index: 0,
+    };
+    args.discoveryCandidates = [
+      {
+        ...args.discoveryCandidates[0],
+        marketId: "market-under-17",
+        slug: "market-under-17",
+        contractType: "atMost",
+        bucketStartC: null,
+        bucketEndC: 17,
+        bucketLabel: "<= 17.0C",
+        title: "Will the high temperature in Miami be at most 17C on Mar 29, 2026?",
+        yesTokenId: "yes-under-17",
+        noTokenId: "no-under-17",
+      },
+    ];
+    args.orderBooks = new Map([
+      ["yes-under-17", createOrderBook("yes-under-17", 0.42)],
+      ["no-under-17", createOrderBook("no-under-17", 0.58)],
+    ]);
+
+    const result = buildKellyWorkbench(args);
+
+    expect(result.weatherEvidence.observationFloorTemperatureC).toBeNull();
+    expect(result.weatherEvidence.observationFloorSource).toBe("none");
+    expect(result.markets.some((market) => market.marketId === "market-under-17")).toBe(true);
+    expect(result.inactiveMarkets.some((market) => market.marketId === "market-under-17")).toBe(false);
+  });
+
+  test("keeps a remembered observation floor when current observations cool off later in the day", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-03-28T20:30:00.000Z"));
+
+      const args = createBuildArgs();
+      args.options.actualTemperatureC = undefined;
+      args.hourly.current = {
+        timestamp: "2026-03-28T16:00:00-04:00",
+        temperatureC: 16,
+        index: 0,
+      };
+      args.hourly.items = [
+        {
+          ...args.hourly.items[0],
+          timestamp: "2026-03-28T16:00:00-04:00",
+          temperatureC: 16,
+        },
+      ];
+      args.metarObservation = {
+        location: { id: location.id, name: location.name, timezone: location.timezone },
+        stationId: "KMIA",
+        observedAt: "2026-03-28T16:05:00-04:00",
+        temperatureC: 16,
+        dewpointC: 12,
+        windDirectionDegrees: 130,
+        windSpeedKts: 11,
+        rawReport: "METAR KMIA 282005Z 13011KT 10SM FEW030 16/12 A3000",
+        stationName: "Miami Intl",
+        sourceUrl: "https://aviationweather.gov/api/data/metar?format=json&ids=KMIA",
+        fetchedAt: "2026-03-28T20:05:00.000Z",
+        stale: false,
+        cacheHit: true,
+      };
+
+      const floor = resolveObservationFloor(args.hourly, args.metarObservation, args.options, {
+        targetDate: "2026-03-28",
+        timeZone: location.timezone,
+        rememberedFloor: {
+          value: 18,
+          source: "metar",
+          observedAt: "2026-03-28T14:05:00-04:00",
+        },
+      });
+
+      expect(floor).toEqual({
+        value: 18,
+        source: "metar",
+        observedAt: "2026-03-28T14:05:00-04:00",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("defaults display unit to Celsius when no markets exist", () => {

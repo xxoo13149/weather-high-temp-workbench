@@ -321,7 +321,7 @@ export interface KellyWeatherEvidence {
   currentModelTimestamp: string | null;
   targetModelTimestamp: string | null;
   observationFloorTemperatureC: number | null;
-  observationFloorSource: "manual" | "metar" | "hourly-current" | "none";
+  observationFloorSource: "manual" | "metar" | "hourly-current" | "hourly-observed" | "none";
   observationFloorObservedAt: string | null;
   metarObservation: MetarObservation | null;
   sourceSummaryZh: string | null;

@@ -12,6 +12,7 @@ import type {
   KellyRequestOptions,
   KellyStreamHandle,
   KellyStreamMessage,
+  KellyWeatherEvidence,
   KellyWorkbenchResponse,
   LocationInfo,
   MetarObservation,
@@ -29,6 +30,7 @@ import {
   buildKellyWorkbench,
   buildReadableFramePoints,
   buildStreamMarketPatches,
+  resolveObservationFloor,
   resolveKellyTargetDate,
 } from "../../kelly/workbench.js";
 import { RefreshableCache } from "../../lib/cache.js";
@@ -293,6 +295,14 @@ export class MeteoblueWeatherService implements WeatherService {
   private readonly kellyMarketCaches = new Map<string, RefreshableCache<PolymarketDiscoveryResult>>();
   private readonly kellyOrderBookCaches = new Map<string, RefreshableCache<Map<string, NormalizedOrderBook>>>();
   private readonly kellyFrameHistories = new Map<string, KellyFramePoint[]>();
+  private readonly kellyObservationFloors = new Map<
+    string,
+    {
+      value: number;
+      source: KellyWeatherEvidence["observationFloorSource"];
+      observedAt: string | null;
+    }
+  >();
   private readonly favoritesStore: FavoritesStoreLike;
   private readonly allowedLocationIds: Set<LocationInfo["id"]>;
   private readonly polymarketClient: PolymarketClient;
@@ -488,6 +498,33 @@ export class MeteoblueWeatherService implements WeatherService {
 
     this.kellyOrderBookCaches.set(key, cache);
     return cache;
+  }
+
+  private resolveKellyObservationFloor(
+    location: ReturnType<MeteoblueWeatherService["requireLocation"]>,
+    targetDate: string,
+    hourly: HourlyWeatherResponse,
+    metarObservation: MetarObservation | null,
+    options: KellyRequestOptions,
+  ) {
+    const today = resolveKellyTargetDate(location.timezone);
+    const cacheKey = buildKellyCacheKey(location.id, targetDate);
+    const rememberedFloor = targetDate === today ? this.kellyObservationFloors.get(cacheKey) ?? null : null;
+    const floor = resolveObservationFloor(hourly, metarObservation, options, {
+      targetDate,
+      timeZone: location.timezone,
+      rememberedFloor,
+    });
+
+    if (targetDate === today && typeof floor.value === "number" && Number.isFinite(floor.value)) {
+      this.kellyObservationFloors.set(cacheKey, {
+        value: floor.value,
+        source: floor.source,
+        observedAt: floor.observedAt,
+      });
+    }
+
+    return floor;
   }
 
   private rememberKellyFrameHistory(
@@ -901,6 +938,13 @@ export class MeteoblueWeatherService implements WeatherService {
     const hasActionableBookData = [...orderBooks.values()].some(
       (book) => book.bestAsk !== null || book.bestBid !== null,
     );
+    const observationFloor = this.resolveKellyObservationFloor(
+      location,
+      targetDate,
+      hourly,
+      metarObservation,
+      options,
+    );
 
     const baseSnapshot = buildKellyWorkbench({
       location,
@@ -929,6 +973,7 @@ export class MeteoblueWeatherService implements WeatherService {
       frameSeries: existingFrameSeries,
       options,
       warnings,
+      observationFloorOverride: observationFloor,
     });
     const frameSeries = this.rememberKellyFrameHistory(
       locationId,
@@ -964,6 +1009,7 @@ export class MeteoblueWeatherService implements WeatherService {
       frameSeries,
       options,
       warnings,
+      observationFloorOverride: observationFloor,
     });
   }
 

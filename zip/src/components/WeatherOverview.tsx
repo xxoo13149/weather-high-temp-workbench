@@ -137,14 +137,14 @@ const ConfidenceCard = ({
   title: string;
   score: number | null;
   label: string;
-  detail: string;
+  detail?: string | null;
 }) => (
   <div className="min-w-[220px] rounded-[20px] border border-white/8 bg-black/20 px-4 py-3">
     <div className="eyebrow">{title}</div>
     <div className="mt-3">
       <PredictabilityDots score={score} label={label} />
     </div>
-    <div className="mt-3 text-xs leading-6 text-white/52">{detail}</div>
+    {detail ? <div className="mt-3 text-xs leading-6 text-white/52">{detail}</div> : null}
   </div>
 );
 
@@ -353,7 +353,6 @@ export const WeatherOverview = ({
               title="当天最高温判断置信度"
               score={predictabilityScore ?? null}
               label={`最高温判断 ${predictabilityLabel ?? "--"}`}
-              detail={buildPredictabilityDetail(predictabilityLabel, availableTemperatureHours, totalHours)}
             />
           </div>
 
