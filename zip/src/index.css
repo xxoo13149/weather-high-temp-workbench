@@ -134,6 +134,8 @@ img {
 
 .workspace-stage {
   position: relative;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .workspace-shell,
@@ -147,9 +149,8 @@ img {
 }
 
 .workspace-shell-muted {
-  pointer-events: none;
-  opacity: 0.84;
-  filter: saturate(0.94);
+  opacity: 0.94;
+  filter: saturate(0.98);
   transform: none;
 }
 

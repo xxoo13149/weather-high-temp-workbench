@@ -9,7 +9,7 @@ import { motion } from "motion/react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
-import { UI_TEXT } from "../display-text";
+import { translatePredictabilityLabel, UI_TEXT } from "../display-text";
 import type { HourlyWeatherItem } from "../types";
 import {
   formatDateTime,
@@ -25,6 +25,12 @@ const ITEM_WIDTH = 102;
 const ITEM_GAP = 10;
 const TRACK_PADDING = 20;
 const BAND_HEIGHT = 82;
+
+const buildPredictabilitySummaryDetail = (
+  predictabilityLabel: string,
+  availableTemperatureHours: number,
+  totalHours: number,
+) => `沿用分析工作区同口径（predictability: ${predictabilityLabel}），温度时序覆盖 ${availableTemperatureHours}/${totalHours} 小时。`;
 
 const formatWindRange = (item: HourlyWeatherItem | null) => {
   if (!item) {
@@ -313,8 +319,12 @@ export const WeatherOverview = ({
       predictabilityLabelInput.trim() !== "--"
       ? predictabilityLabelInput.trim()
       : stablePredictabilityState.label ?? stablePredictabilityLabel;
-  const resolvedPredictabilityLabel = rawPredictabilityLabel ?? "--";
-  const predictabilityDetail = `澶嶇敤鍒嗘瀽宸ヤ綔鍖哄悓涓€鍙ｅ緞锛屾俯搴︽椂搴忚鐩?${availableTemperatureHours}/${totalHours} 灏忔椂銆?`;
+  const resolvedPredictabilityLabel = translatePredictabilityLabel(rawPredictabilityLabel ?? "--");
+  const predictabilityDetail = buildPredictabilitySummaryDetail(
+    resolvedPredictabilityLabel,
+    availableTemperatureHours,
+    totalHours,
+  );
   const predictabilityLabel = resolvedPredictabilityLabel;
 
   const trackGradient = useMemo(() => {

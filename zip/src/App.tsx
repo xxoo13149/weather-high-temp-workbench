@@ -91,6 +91,8 @@ type ParsedKellyDraftControls = {
 const KELLY_DEFAULT_BANKROLL = 1000;
 const KELLY_DEFAULT_MIN_EDGE = 0.02;
 const SILENT_REFRESH_STALE_MS = 10 * 60 * 1000;
+const LOCATION_PREWARM_DELAY_MS = 300;
+const KELLY_DATE_WARM_DELAY_MS = 1_200;
 
 const parseNumber = (value: string | null) => {
   if (!value) {
@@ -282,7 +284,7 @@ const buildAnalysisBatchKey = (
 };
 
 const WARM_CACHE_TTL_MS = 60_000;
-const KELLY_WARM_CACHE_TTL_MS = 5_000;
+const KELLY_WARM_CACHE_TTL_MS = 60_000;
 const LOCATION_TEMPERATURE_TTL_MS = 15 * 60_000;
 const LOCATION_TEMPERATURE_CONCURRENCY = 3;
 
@@ -370,27 +372,27 @@ const resolveTimezoneGroupForLocation = (
 const buildWarmLocationTargets = (path: AppPath, tab: AnalysisWorkspaceState["tab"]): WarmLocationTargets => {
   if (path === "/kelly") {
     return {
-      home: true,
-      analysis: true,
+      home: false,
+      analysis: false,
       kelly: false,
-      image: true,
+      image: false,
     };
   }
 
   if (path === "/analysis") {
     return {
       home: true,
-      analysis: tab !== "models",
-      kelly: true,
-      image: true,
+      analysis: tab === "image",
+      kelly: false,
+      image: false,
     };
   }
 
   return {
     home: false,
     analysis: true,
-    kelly: true,
-    image: true,
+    kelly: false,
+    image: false,
   };
 };
 
@@ -527,6 +529,9 @@ export default function App() {
   );
   const kellyWarmCacheRef = useRef<Map<string, WarmCacheEntry<KellyWorkbenchResponse>>>(
     new Map<string, WarmCacheEntry<KellyWorkbenchResponse>>(),
+  );
+  const kellyInFlightRef = useRef<Map<string, Promise<KellyWorkbenchResponse>>>(
+    new Map<string, Promise<KellyWorkbenchResponse>>(),
   );
   const locationTemperatureWarmCacheRef = useRef<Map<string, WarmCacheEntry<number | null>>>(
     new Map<string, WarmCacheEntry<number | null>>(),
@@ -704,19 +709,37 @@ export default function App() {
       if (cachedKelly) {
         return cachedKelly;
       }
+
+      const inFlight = kellyInFlightRef.current.get(kellyKey);
+      if (inFlight) {
+        return await inFlight;
+      }
     }
 
-    const response = await weatherApi.fetchKellyWorkbench(
-      locationId,
-      targetDate,
-      bankroll,
-      riskMode,
-      minEdge,
-      actualTemperatureC ?? undefined,
-      selectedHour ?? undefined,
-      { signal },
-    );
-    return writeWarmCacheEntry(kellyWarmCacheRef.current, kellyKey, response);
+    const request = weatherApi
+      .fetchKellyWorkbench(
+        locationId,
+        targetDate,
+        bankroll,
+        riskMode,
+        minEdge,
+        actualTemperatureC ?? undefined,
+        selectedHour ?? undefined,
+        { signal },
+      )
+      .then((response) => writeWarmCacheEntry(kellyWarmCacheRef.current, kellyKey, response));
+
+    if (!bypassCache) {
+      kellyInFlightRef.current.set(kellyKey, request);
+    }
+
+    try {
+      return await request;
+    } finally {
+      if (!bypassCache && kellyInFlightRef.current.get(kellyKey) === request) {
+        kellyInFlightRef.current.delete(kellyKey);
+      }
+    }
   };
 
   const invalidateKellyWarmCache = ({
@@ -805,15 +828,6 @@ export default function App() {
     setLastConsistentAnalysisKey(null);
   };
 
-  const clearAnalysisSnapshot = () => {
-    setInsight(null);
-    setDistribution(null);
-    setLatestInsightEnvelope(null);
-    setLatestDistributionEnvelope(null);
-    setAnalysisSnapshot(null);
-    setLastConsistentAnalysisKey(null);
-  };
-
   const warmLocationSurfaces = async ({
     locationId,
     selectedTimestamp,
@@ -846,14 +860,14 @@ export default function App() {
       selectedHour: selectedTimestamp,
     });
 
-    const warmTasks: Promise<unknown>[] = [];
+    const warmTasks: Array<() => Promise<unknown>> = [];
     const shouldPreloadImage = targets.image;
     const controller = new AbortController();
     warmAbortRef.current = controller;
 
     if (targets.home || targets.analysis) {
       const cachedInsight = readWarmCacheEntry<InsightViewModel>(insightWarmCacheRef.current, insightKey);
-      warmTasks.push(
+      warmTasks.push(() =>
         cachedInsight
           ? Promise.resolve(cachedInsight)
           : weatherApi
@@ -871,7 +885,7 @@ export default function App() {
         distributionWarmCacheRef.current,
         distributionKey,
       );
-      warmTasks.push(
+      warmTasks.push(() =>
         cachedDistribution
           ? Promise.resolve(cachedDistribution)
           : weatherApi
@@ -890,7 +904,7 @@ export default function App() {
         kellyKey,
         KELLY_WARM_CACHE_TTL_MS,
       );
-      warmTasks.push(
+      warmTasks.push(() =>
         cachedKelly
           ? Promise.resolve(cachedKelly)
           : weatherApi
@@ -938,7 +952,20 @@ export default function App() {
     });
 
     try {
-      await Promise.allSettled(warmTasks);
+      await new Promise((resolve) => window.setTimeout(resolve, LOCATION_PREWARM_DELAY_MS));
+      for (const task of warmTasks) {
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        try {
+          await task();
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") {
+            return;
+          }
+        }
+      }
     } finally {
       if (warmAbortRef.current === controller) {
         warmAbortRef.current = null;
@@ -969,7 +996,7 @@ export default function App() {
     const currentPath = routeState.path;
     const currentTab = routeState.tab;
 
-    const hydrateCurrentSurface = async ({
+    const hydrateCurrentSurface = ({
       selectedTimestamp,
       actualTemperatureC,
       targetDate,
@@ -978,96 +1005,53 @@ export default function App() {
       actualTemperatureC: number | null;
       targetDate: string;
     }) => {
+      const nextInsight = readWarmCacheEntry<InsightViewModel>(
+        insightWarmCacheRef.current,
+        buildInsightWarmKey(locationId, selectedTimestamp, actualTemperatureC),
+      );
+      const nextDistribution =
+        selectedTimestamp === null
+          ? null
+          : readWarmCacheEntry<DistributionViewModel>(
+              distributionWarmCacheRef.current,
+              buildDistributionWarmKey(locationId, selectedTimestamp),
+            );
+      const nextKelly = readWarmCacheEntry<KellyWorkbenchResponse>(
+        kellyWarmCacheRef.current,
+        buildKellyWarmKey({
+          locationId,
+          targetDate,
+          bankroll: routeState.bankroll,
+          riskMode: routeState.riskMode,
+          minEdge: routeState.minEdge,
+          actualTemperatureC,
+          selectedHour: selectedTimestamp,
+        }),
+        KELLY_WARM_CACHE_TTL_MS,
+      );
+
       if (currentPath === "/analysis" && currentTab === "models") {
-        try {
-          const [nextInsight, nextDistribution] = await Promise.all([
-            fetchInsightSnapshot({
-              locationId,
-              selectedTimestamp,
-              actualTemperatureC,
-              signal: controller.signal,
-            }),
-            fetchDistributionSnapshot({
-              locationId,
-              selectedTimestamp,
-              signal: controller.signal,
-            }),
-          ]);
-
-          return {
-            nextInsight,
-            nextDistribution,
-            nextKelly: null,
-          };
-        } catch (error) {
-          if (error instanceof DOMException && error.name === "AbortError") {
-            throw error;
-          }
-
-          return {
-            nextInsight: null,
-            nextDistribution: null,
-            nextKelly: null,
-          };
-        }
+        return {
+          nextInsight,
+          nextDistribution,
+          nextKelly: null,
+        };
       }
 
       if (currentPath === "/kelly") {
-        try {
-          const nextKelly = await fetchKellySnapshot({
-            locationId,
-            targetDate,
-            bankroll: routeState.bankroll,
-            riskMode: routeState.riskMode,
-            minEdge: routeState.minEdge,
-            actualTemperatureC,
-            selectedHour: selectedTimestamp,
-            signal: controller.signal,
-          });
-
-          return {
-            nextInsight: null,
-            nextDistribution: null,
-            nextKelly,
-          };
-        } catch (error) {
-          if (error instanceof DOMException && error.name === "AbortError") {
-            throw error;
-          }
-
-          return {
-            nextInsight: null,
-            nextDistribution: null,
-            nextKelly: null,
-          };
-        }
+        return {
+          nextInsight: null,
+          nextDistribution: null,
+          nextKelly,
+        };
       }
 
       if (currentPath === "/") {
-        try {
-          const nextInsight = await fetchInsightSnapshot({
-            locationId,
-            selectedTimestamp,
-            actualTemperatureC,
-            signal: controller.signal,
-          });
-
-          return {
-            nextInsight,
-            nextDistribution: null,
-            nextKelly: null,
-          };
-        } catch (error) {
-          if (error instanceof DOMException && error.name === "AbortError") {
-            throw error;
-          }
-
-          return {
-            nextInsight: null,
-            nextDistribution: null,
-            nextKelly: null,
-          };
-        }
+        return {
+          nextInsight,
+          nextDistribution: null,
+          nextKelly: null,
+        };
       }
 
       return {
@@ -1097,31 +1081,32 @@ export default function App() {
       cacheDashboardSnapshot(locationId, nextDashboard);
 
       if (currentPath === "/analysis" && currentTab === "models") {
-        seedAnalysisSnapshot({
-          locationId,
-          generatedAt: nextDashboard.generatedAt,
-          nextInsight,
-          nextDistribution,
-        });
-        setKellySnapshot(null);
-        setLoadingInsight(false);
-        setLoadingDistribution(false);
+        if (nextInsight && nextDistribution) {
+          seedAnalysisSnapshot({
+            locationId,
+            generatedAt: nextDashboard.generatedAt,
+            nextInsight,
+            nextDistribution,
+          });
+        }
+        setLoadingInsight(!nextInsight);
+        setLoadingDistribution(!nextDistribution);
         setLoadingKelly(false);
       } else if (currentPath === "/kelly") {
-        clearAnalysisSnapshot();
         setKellySnapshot((current) => nextKelly ?? current);
-        setLoadingKelly(false);
+        setLoadingKelly(!nextKelly);
         setLoadingInsight(false);
         setLoadingDistribution(false);
       } else {
-        seedAnalysisSnapshot({
-          locationId,
-          generatedAt: nextDashboard.generatedAt,
-          nextInsight,
-          nextDistribution: null,
-        });
-        setKellySnapshot(null);
-        setLoadingInsight(false);
+        if (nextInsight) {
+          seedAnalysisSnapshot({
+            locationId,
+            generatedAt: nextDashboard.generatedAt,
+            nextInsight,
+            nextDistribution: null,
+          });
+        }
+        setLoadingInsight(!nextInsight);
         setLoadingDistribution(false);
         setLoadingKelly(false);
       }
@@ -1158,8 +1143,6 @@ export default function App() {
     setDashboardError(null);
     setInsightError(null);
     setDistributionError(null);
-    kellySocketRef.current?.close();
-    setKellyStreamState("idle");
     setLocationTransitionState({
       pendingLocationId: locationId,
       stage: "dashboard",
@@ -1181,7 +1164,7 @@ export default function App() {
       const cachedSelectedHour = pickSelectedTimestamp(cachedDashboard.hourly.items, null);
       const cachedTargetDate = resolveTodayForTimezone(cachedDashboard.hourly.locationTimezone);
       const cachedActualTemperature = resolveDefaultReferenceTemperature(cachedDashboard, cachedSelectedHour);
-      const primed = await hydrateCurrentSurface({
+      const primed = hydrateCurrentSurface({
         selectedTimestamp: cachedSelectedHour,
         actualTemperatureC: cachedActualTemperature,
         targetDate: cachedTargetDate,
@@ -1217,7 +1200,7 @@ export default function App() {
       const selectedTimestamp = pickSelectedTimestamp(nextDashboard.hourly.items, null);
       const nextTargetDate = resolveTodayForTimezone(nextDashboard.hourly.locationTimezone);
       const nextActualTemperature = resolveDefaultReferenceTemperature(nextDashboard, selectedTimestamp);
-      const primed = await hydrateCurrentSurface({
+      const primed = hydrateCurrentSurface({
         selectedTimestamp,
         actualTemperatureC: nextActualTemperature,
         targetDate: nextTargetDate,
@@ -1570,7 +1553,14 @@ export default function App() {
   useEffect(() => {
     const availableTargetDates = kellySnapshot?.availableTargetDates ?? [];
 
-    if (routeState.path !== "/kelly" || !routeState.targetDate || availableTargetDates.length === 0) {
+    if (
+      routeState.path !== "/kelly" ||
+      !routeState.targetDate ||
+      availableTargetDates.length === 0 ||
+      loadingKelly ||
+      manualRefreshingKelly ||
+      locationTransitionState.stage !== "idle"
+    ) {
       kellyDateWarmAbortRef.current?.abort();
       kellyDateWarmAbortRef.current = null;
       return;
@@ -1578,7 +1568,7 @@ export default function App() {
 
     const remainingDates = availableTargetDates
       .filter((date) => date !== routeState.targetDate)
-      .slice(0, 2);
+      .slice(0, 1);
 
     if (remainingDates.length === 0) {
       kellyDateWarmAbortRef.current?.abort();
@@ -1591,6 +1581,11 @@ export default function App() {
     kellyDateWarmAbortRef.current = controller;
 
     const warmDates = async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, KELLY_DATE_WARM_DELAY_MS));
+      if (controller.signal.aborted) {
+        return;
+      }
+
       for (const targetDate of remainingDates) {
         if (controller.signal.aborted) {
           return;
@@ -1633,6 +1628,9 @@ export default function App() {
     routeState.riskMode,
     routeState.selectedHourlyTimestamp,
     routeState.targetDate,
+    loadingKelly,
+    locationTransitionState.stage,
+    manualRefreshingKelly,
   ]);
 
   const items = dashboard?.hourly.items ?? [];
@@ -2065,9 +2063,20 @@ export default function App() {
   }, [dashboard?.multimodel.imageUrlFound, imageUrl]);
 
   useEffect(() => {
-    if (routeState.path !== "/kelly" || !routeState.targetDate || !kellySnapshot) {
+    const kellySnapshotAligned =
+      kellySnapshot?.location.id === routeState.locationId && kellySnapshot?.targetDate === routeState.targetDate;
+
+    if (routeState.path !== "/kelly" || !routeState.targetDate) {
       kellySocketRef.current?.close();
       kellySocketRef.current = null;
+      setKellyStreamState("idle");
+      return;
+    }
+
+    if (!kellySnapshot || !kellySnapshotAligned) {
+      kellySocketRef.current?.close();
+      kellySocketRef.current = null;
+      setKellyStreamState("connecting");
       return;
     }
 
@@ -2310,6 +2319,12 @@ export default function App() {
   );
   const locationGroups = useMemo(() => buildDockLocationGroups(locations), [locations]);
   const displayedLocation = locations.find((location) => location.id === displayedLocationId) ?? null;
+  const pendingLocation =
+    (locationTransitionState.pendingLocationId
+      ? locations.find((location) => location.id === locationTransitionState.pendingLocationId) ?? null
+      : null) ??
+    null;
+  const pendingLocationName = pendingLocation?.displayName ?? null;
 
   const hasCommittedSnapshot = Boolean(dashboard) && !dashboardError;
   const workspaceMuted = isLocationTransitionPending;
@@ -2332,6 +2347,8 @@ export default function App() {
             ? (kellySnapshot?.location.name ?? displayedLocation?.displayName ?? homeViewModel.locationName)
             : (displayedLocation?.displayName ?? homeViewModel.locationName)
         }
+        pendingLocationName={pendingLocationName}
+        transitioning={isLocationTransitionPending}
         locationTimezone={activeLocationTimezone}
         updatedAt={dashboard?.sync.updatedAt ?? null}
         syncState={dashboard?.sync.state ?? "fresh"}
@@ -2401,6 +2418,7 @@ export default function App() {
           <LocationRail
             expanded={railExpanded}
             activeId={displayedLocationId}
+            pendingId={locationTransitionState.pendingLocationId}
             activeGroup={activeTimezoneGroup}
             groups={locationGroups}
             favoritePendingIds={favoritePendingIds}

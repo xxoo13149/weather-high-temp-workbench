@@ -13,11 +13,29 @@ import {
 import { motion } from "motion/react";
 
 import { Button } from "@/components/ui/button";
-import { UI_TEXT } from "../display-text";
 import { formatDateTime } from "../utils";
+
+const HEADER_TEXT = {
+  productName: "天气决策台",
+  synced: "已同步",
+  stale: "缓存回退",
+  home: "首页决策台",
+  analysis: "分析工作区",
+  refresh: "刷新",
+  refreshIdle: "待命",
+  refreshPending: "刷新中",
+  refreshSuccess: "已更新",
+  refreshError: "刷新失败",
+  favorite: "收藏当前地点",
+  unfavorite: "取消收藏",
+  expandRail: "展开地点侧栏",
+  collapseRail: "收起地点侧栏",
+} as const;
 
 export const CommandHeader = ({
   locationName,
+  pendingLocationName,
+  transitioning,
   locationTimezone,
   updatedAt,
   syncState,
@@ -36,6 +54,8 @@ export const CommandHeader = ({
   onNavigateKelly,
 }: {
   locationName: string;
+  pendingLocationName?: string | null;
+  transitioning?: boolean;
   locationTimezone?: string;
   updatedAt: string | null;
   syncState: "fresh" | "stale";
@@ -55,12 +75,12 @@ export const CommandHeader = ({
 }) => {
   const refreshLabel =
     refreshState === "pending"
-      ? UI_TEXT.header.refreshPending
+      ? HEADER_TEXT.refreshPending
       : refreshState === "success"
-        ? UI_TEXT.header.refreshSuccess
+        ? HEADER_TEXT.refreshSuccess
         : refreshState === "error"
-          ? UI_TEXT.header.refreshError
-          : UI_TEXT.header.refreshIdle;
+          ? HEADER_TEXT.refreshError
+          : HEADER_TEXT.refreshIdle;
 
   return (
     <motion.header
@@ -79,7 +99,7 @@ export const CommandHeader = ({
             size="icon"
             onClick={onToggleRail}
             className="command-header-rail-toggle mt-0.5 shrink-0 md:mt-0"
-            aria-label={railExpanded ? UI_TEXT.header.collapseRail : UI_TEXT.header.expandRail}
+            aria-label={railExpanded ? HEADER_TEXT.collapseRail : HEADER_TEXT.expandRail}
           >
             {railExpanded ? <ChevronLeft className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
           </Button>
@@ -87,12 +107,21 @@ export const CommandHeader = ({
           <div className="command-header-main">
             <div className="eyebrow flex items-center gap-2 text-white/56">
               <SignalHigh className="h-3.5 w-3.5 text-[rgba(107,231,255,0.92)]" />
-              {UI_TEXT.header.productName}
+              {HEADER_TEXT.productName}
             </div>
 
             <h1 className="command-header-title truncate text-[clamp(1.18rem,1.8vw,1.68rem)] font-semibold tracking-[-0.02em] text-white">
               {locationName}
             </h1>
+
+            {transitioning && pendingLocationName ? (
+              <div
+                className="command-header-transition rounded-full border border-[rgba(107,231,255,0.16)] bg-[rgba(107,231,255,0.08)] px-2.5 py-1 text-[11px] text-[rgba(182,244,255,0.92)]"
+                aria-live="polite"
+              >
+                正在切换到 {pendingLocationName}
+              </div>
+            ) : null}
 
             <div className="command-header-meta-row">
               <Button
@@ -101,7 +130,7 @@ export const CommandHeader = ({
                 size="icon"
                 onClick={onToggleFavorite}
                 disabled={favoriteDisabled}
-                aria-label={favorite ? UI_TEXT.header.unfavorite : UI_TEXT.header.favorite}
+                aria-label={favorite ? HEADER_TEXT.unfavorite : HEADER_TEXT.favorite}
                 className="h-8.5 w-8.5 rounded-full border-white/12 bg-[rgba(12,17,26,0.78)]"
               >
                 <Star
@@ -115,7 +144,7 @@ export const CommandHeader = ({
               >
                 <span className="inline-flex h-2.5 w-2.5 rounded-full bg-current" />
                 <span className="text-xs uppercase tracking-[0.12em] text-white/72">
-                  {syncState === "stale" ? UI_TEXT.header.stale : UI_TEXT.header.synced}
+                  {syncState === "stale" ? HEADER_TEXT.stale : HEADER_TEXT.synced}
                 </span>
                 <span className="data-mono text-[11px] text-white/50">
                   {updatedAt ? formatDateTime(updatedAt, locationTimezone) : "--"}
@@ -146,7 +175,7 @@ export const CommandHeader = ({
                 data-active={currentPage === "home"}
               >
                 <Home className="mr-2 h-4 w-4" />
-                {UI_TEXT.header.home}
+                {HEADER_TEXT.home}
               </Button>
 
               <Button
@@ -158,7 +187,7 @@ export const CommandHeader = ({
                 data-active={currentPage === "analysis"}
               >
                 <Radar className="mr-2 h-4 w-4" />
-                {UI_TEXT.header.analysis}
+                {HEADER_TEXT.analysis}
               </Button>
 
               <Button
@@ -195,7 +224,7 @@ export const CommandHeader = ({
                 className={`mr-2 h-4 w-4 ${refreshState === "pending" ? "animate-spin text-[var(--accent)]" : ""}`}
               />
             )}
-            <span>{UI_TEXT.header.refresh}</span>
+            <span>{HEADER_TEXT.refresh}</span>
             <span className="ml-2 text-[11px] text-white/52" aria-live="polite">
               {refreshLabel}
             </span>

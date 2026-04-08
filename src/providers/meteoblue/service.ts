@@ -121,6 +121,20 @@ const measureAsync = async <T>(
 };
 
 const buildKellyCacheKey = (locationId: LocationInfo["id"], targetDate: string) => `${locationId}::${targetDate}`;
+const buildKellySnapshotRequestKey = (
+  locationId: LocationInfo["id"],
+  targetDate: string,
+  options: KellyRequestOptions,
+) =>
+  [
+    locationId,
+    targetDate,
+    options.bankroll ?? "default-bankroll",
+    options.riskMode ?? "default-risk",
+    options.minEdge ?? "default-edge",
+    options.actualTemperatureC ?? "default-temp",
+    options.selectedHourTimestamp ?? "default-hour",
+  ].join("::");
 
 const resolveMetarObservedHighFloor = (
   recentTemperatures: MetarTemperatureSample[],
@@ -969,7 +983,7 @@ export class MeteoblueWeatherService implements WeatherService {
   ): Promise<KellyWorkbenchResponse> {
     const location = this.requireLocation(locationId);
     const targetDate = resolveKellyTargetDate(location.timezone, options.targetDate);
-    const cacheKey = buildKellyCacheKey(locationId, targetDate);
+    const cacheKey = buildKellySnapshotRequestKey(locationId, targetDate, options);
     const existing = this.kellySnapshotInFlight.get(cacheKey);
     if (existing) {
       return await existing;
@@ -1091,6 +1105,7 @@ export class MeteoblueWeatherService implements WeatherService {
       const hasActionableBookData = [...orderBooks.values()].some(
         (book) => book.bestAsk !== null || book.bestBid !== null,
       );
+      const repricedAt = hasActionableBookData ? new Date().toISOString() : null;
       const observationFloor = this.resolveKellyObservationFloor(
         location,
         targetDate,
@@ -1123,7 +1138,7 @@ export class MeteoblueWeatherService implements WeatherService {
         orderBooks,
         priceFetchedAt,
         generatedAt,
-        repricedAt: hasActionableBookData ? generatedAt : null,
+        repricedAt,
         frameSeries: existingFrameSeries,
         options,
         warnings,
@@ -1159,7 +1174,7 @@ export class MeteoblueWeatherService implements WeatherService {
         orderBooks,
         priceFetchedAt,
         generatedAt,
-        repricedAt: hasActionableBookData ? generatedAt : null,
+        repricedAt,
         frameSeries,
         options,
         warnings,
@@ -1172,7 +1187,7 @@ export class MeteoblueWeatherService implements WeatherService {
         generatedAt,
         discoveryFetchedAt,
         orderbookFetchedAt: priceFetchedAt,
-        repricedAt: hasActionableBookData ? generatedAt : null,
+        repricedAt,
         stageTimings,
       });
 
