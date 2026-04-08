@@ -153,6 +153,28 @@ const createService = () => {
         close: vi.fn(),
       };
     }),
+    getKellyBridgeHealth: vi.fn(() => ({
+      lastSnapshotSuccessAt: "2026-04-08T12:00:00.000Z",
+      lastSnapshotErrorAt: null,
+      lastSnapshotError: null,
+      lastMarketDiscoveryAt: "2026-04-08T12:00:01.000Z",
+      lastOrderbookAt: "2026-04-08T12:00:02.000Z",
+      lastRepricedAt: "2026-04-08T12:00:02.000Z",
+      lastStreamEventAt: "2026-04-08T12:00:03.000Z",
+      openStreamCount: 1,
+      fallbackMode: false,
+      lastStageTimingsMs: {
+        hourly: 120,
+        report: 80,
+        metar: 40,
+        insight: 150,
+        distribution: 100,
+        marketDiscovery: 210,
+        orderbook: 160,
+        pricing: 70,
+        total: 930,
+      },
+    })),
   };
 
   return service as unknown as WeatherService;
@@ -179,6 +201,11 @@ describe("kelly bridge app", () => {
       ok: true,
       service: "kelly-bridge",
       sharedSecretProtected: true,
+      runtime: {
+        lastSnapshotSuccessAt: "2026-04-08T12:00:00.000Z",
+        openStreamCount: 1,
+        fallbackMode: false,
+      },
     });
 
     await app.close();

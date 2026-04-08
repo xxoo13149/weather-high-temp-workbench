@@ -158,4 +158,44 @@ describe("MeteoblueWeatherService.createKellyStream reason codes", () => {
     await handle.close();
     expect(upstreamClose).toHaveBeenCalledTimes(1);
   });
+
+  test("only subscribes tradable matched markets", async () => {
+    const service = new MeteoblueWeatherService();
+    const inactiveMatched = {
+      ...buildMatchedMarket(),
+      marketId: "market-inactive",
+      slug: "market-inactive",
+      lifecycle: "inactive",
+      inactiveReason: "expired",
+      yesTokenId: "yes-inactive",
+      noTokenId: "no-inactive",
+    } satisfies KellyMarketRow;
+
+    vi.spyOn(service, "getKellyWorkbench").mockResolvedValue({
+      ...buildSnapshot([buildMatchedMarket()]),
+      inactiveMarkets: [inactiveMatched],
+    });
+
+    const client = (service as any).polymarketClient as {
+      createMarketStream: (...args: unknown[]) => { close: () => void | Promise<void> };
+      fetchOrderBooks: (...args: unknown[]) => Promise<unknown>;
+    };
+    const upstreamClose = vi.fn();
+    const createStreamSpy = vi.spyOn(client, "createMarketStream").mockReturnValue({
+      close: upstreamClose,
+    });
+    vi.spyOn(client, "fetchOrderBooks").mockResolvedValue(
+      new Map([
+        ["yes-1", { tokenId: "yes-1", bestBid: 0.41, bestAsk: 0.42, midpoint: 0.415, spread: 0.01, updatedAt: "2026-03-28T00:00:00.000Z" }],
+        ["no-1", { tokenId: "no-1", bestBid: 0.57, bestAsk: 0.58, midpoint: 0.575, spread: 0.01, updatedAt: "2026-03-28T00:00:00.000Z" }],
+      ]),
+    );
+
+    const handle = await service.createKellyStream("miami_mia", { targetDate: "2026-03-28" }, () => {});
+
+    expect(createStreamSpy).toHaveBeenCalledWith(["yes-1", "no-1"], expect.any(Function), expect.any(Function));
+
+    await handle.close();
+    expect(upstreamClose).toHaveBeenCalledTimes(1);
+  });
 });

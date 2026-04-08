@@ -821,39 +821,50 @@ export const KellyWorkbench = ({
 }) => {
   const [selectedMarketId, setSelectedMarketId] = useState<string | null>(null);
   const [selectedOpportunityId, setSelectedOpportunityId] = useState<string | null>(null);
+  const [stableSnapshot, setStableSnapshot] = useState<KellyWorkbenchResponse | null>(snapshot);
+  const effectiveSnapshot = snapshot ?? stableSnapshot;
+  const hasSuccessfulSnapshot = stableSnapshot !== null;
+  const showingFallbackSnapshot = !snapshot && hasSuccessfulSnapshot;
+
+  useEffect(() => {
+    if (!snapshot) {
+      return;
+    }
+    setStableSnapshot(snapshot);
+  }, [snapshot]);
 
   useEffect(() => {
     setSelectedMarketId(null);
     setSelectedOpportunityId(null);
-  }, [snapshot?.location.id, snapshot?.targetDate]);
+  }, [effectiveSnapshot?.location.id, effectiveSnapshot?.targetDate]);
 
   useEffect(() => {
-    if (!snapshot) {
+    if (!effectiveSnapshot) {
       setSelectedMarketId(null);
       return;
     }
 
-    const allMarkets = [...snapshot.markets, ...snapshot.inactiveMarkets];
+    const allMarkets = [...effectiveSnapshot.markets, ...effectiveSnapshot.inactiveMarkets];
     if (selectedMarketId && allMarkets.some((market) => market.marketId === selectedMarketId)) {
       return;
     }
 
     setSelectedMarketId(
-      snapshot.recommendations[0]?.marketId ??
-        snapshot.bestObservation?.marketId ??
-        snapshot.markets[0]?.marketId ??
-        snapshot.inactiveMarkets[0]?.marketId ??
+      effectiveSnapshot.recommendations[0]?.marketId ??
+        effectiveSnapshot.bestObservation?.marketId ??
+        effectiveSnapshot.markets[0]?.marketId ??
+        effectiveSnapshot.inactiveMarkets[0]?.marketId ??
         null,
     );
-  }, [selectedMarketId, snapshot]);
+  }, [effectiveSnapshot, selectedMarketId]);
 
   const data = useMemo(
     () =>
-      snapshot
+      effectiveSnapshot
         ? buildData({
-            snapshot,
+            snapshot: effectiveSnapshot,
             locations,
-            activeLocationId,
+            activeLocationId: effectiveSnapshot.location.id,
             draftControls: {
               bankrollInput,
               minEdgeInput,
@@ -879,13 +890,30 @@ export const KellyWorkbench = ({
       refreshDisabled,
       riskMode,
       selectedMarketId,
-      snapshot,
+      effectiveSnapshot,
       streamState,
       timezone,
     ],
   );
+  const renderErrorBanner = error
+    ? showingFallbackSnapshot
+      ? `Kelly 加载失败，当前保留上一份成功快照。${error}`
+      : `Kelly 链路异常：${error}`
+    : null;
+  const renderData = useMemo(() => {
+    if (!data) {
+      return null;
+    }
+    if (!renderErrorBanner) {
+      return data;
+    }
+    return {
+      ...data,
+      statusNote: data.statusNote ? `${renderErrorBanner} | ${data.statusNote}` : renderErrorBanner,
+    };
+  }, [data, renderErrorBanner]);
 
-  if (!snapshot || !data) {
+  if (!effectiveSnapshot || !renderData) {
     return (
       <section className="terminal-panel">
         <div className="panel-section">
@@ -899,9 +927,9 @@ export const KellyWorkbench = ({
 
   return (
     <KellyWorkbenchShell
-      data={data}
-      disabled={loading || refreshing}
-      refreshing={refreshing}
+      data={renderData}
+      disabled={refreshing}
+      refreshing={refreshing || (loading && showingFallbackSnapshot)}
       selectedMarketId={selectedMarketId}
       selectedOpportunityId={selectedOpportunityId}
       onLocationChange={onLocationChange}

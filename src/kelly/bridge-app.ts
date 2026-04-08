@@ -41,6 +41,7 @@ export const createKellyBridgeApp = (options: CreateKellyBridgeAppOptions = {}) 
     buildId,
     startedAt,
     sharedSecretProtected: Boolean(preHandler),
+    runtime: service.getKellyBridgeHealth?.() ?? null,
   }));
 
   registerKellyRoutes(app, service, {

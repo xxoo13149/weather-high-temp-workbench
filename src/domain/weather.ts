@@ -565,6 +565,31 @@ export interface KellyStreamHealth {
   lastRepricedAt: string | null;
 }
 
+export interface KellyBridgeStageTimings {
+  hourly: number | null;
+  report: number | null;
+  metar: number | null;
+  insight: number | null;
+  distribution: number | null;
+  marketDiscovery: number | null;
+  orderbook: number | null;
+  pricing: number | null;
+  total: number | null;
+}
+
+export interface KellyBridgeHealth {
+  lastSnapshotSuccessAt: string | null;
+  lastSnapshotErrorAt: string | null;
+  lastSnapshotError: string | null;
+  lastMarketDiscoveryAt: string | null;
+  lastOrderbookAt: string | null;
+  lastRepricedAt: string | null;
+  lastStreamEventAt: string | null;
+  openStreamCount: number;
+  fallbackMode: boolean;
+  lastStageTimingsMs: KellyBridgeStageTimings;
+}
+
 export interface KellyWorkbenchResponse {
   location: LocationInfo;
   targetDate: string;
@@ -677,6 +702,7 @@ export interface WeatherService {
     options: KellyRequestOptions,
     onMessage: (message: KellyStreamMessage) => void,
   ): Promise<KellyStreamHandle>;
+  getKellyBridgeHealth?(): KellyBridgeHealth;
   getUserFavorites?(): Promise<UserFavoritesResponse>;
   setUserFavorite?(locationId: LocationInfo["id"], favorite: boolean): Promise<UserFavoritesResponse>;
 }

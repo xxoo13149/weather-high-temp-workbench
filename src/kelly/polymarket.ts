@@ -16,6 +16,10 @@ import { fetchJson, fetchText } from "../lib/http.js";
 const POLYMARKET_EVENT_BASE_URL = "https://polymarket.com/event";
 const POLYMARKET_DISCOVERY_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 2_500);
 const POLYMARKET_MAX_SEARCH_TERMS = 6;
+const POLYMARKET_DISCOVERY_CONCURRENCY = 2;
+const POLYMARKET_ORDERBOOK_CONCURRENCY = 4;
+const POLYMARKET_MAX_EVENT_PAYLOAD_CHARS = 1_500_000;
+const POLYMARKET_MAX_EVENT_VISIT_COUNT = 25_000;
 type RawOrderLevel = {
   price?: string | number | null;
   size?: string | number | null;
@@ -187,6 +191,35 @@ const sanitizeTemperatureText = (value: string): string =>
 const detectKellyTemperatureUnit = (text: string): KellyTemperatureUnit => {
   const sanitized = sanitizeTemperatureText(text);
   return /\b(?:fahrenheit|f)\b/i.test(sanitized) ? "F" : "C";
+};
+
+const mapWithConcurrency = async <T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> => {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const limit = Math.max(1, Math.floor(concurrency));
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= items.length) {
+        return;
+      }
+
+      results[currentIndex] = await mapper(items[currentIndex]!, currentIndex);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
 };
 
 const sanitizeKellyTemperatureText = (value: string): string =>
@@ -555,6 +588,10 @@ const extractPageMarketRecords = (html: string, eventSlug: string): Record<strin
     return [];
   }
 
+  if (match[1].length > POLYMARKET_MAX_EVENT_PAYLOAD_CHARS) {
+    return [];
+  }
+
   let payload: unknown;
   try {
     payload = JSON.parse(match[1]);
@@ -563,7 +600,13 @@ const extractPageMarketRecords = (html: string, eventSlug: string): Record<strin
   }
 
   const eventCandidates: Record<string, unknown>[] = [];
+  let visitedCount = 0;
   const visit = (value: unknown) => {
+    if (visitedCount >= POLYMARKET_MAX_EVENT_VISIT_COUNT) {
+      return;
+    }
+    visitedCount += 1;
+
     if (Array.isArray(value)) {
       for (const item of value) {
         visit(item);
@@ -1180,12 +1223,10 @@ export class PolymarketClient {
   }
 
   private async fallbackActiveMarkets(): Promise<Record<string, unknown>[]> {
-    const results = await Promise.all(
-      [0, 100].map(async (offset) => {
+    const results = await mapWithConcurrency([0, 100], POLYMARKET_DISCOVERY_CONCURRENCY, async (offset) => {
         const path = `/markets?active=true&closed=false&limit=100&offset=${offset}`;
         return await this.trySearchEndpoint(path);
-      }),
-    );
+      });
 
     return results.flat();
   }
@@ -1239,7 +1280,11 @@ export class PolymarketClient {
 
     const searchTerms = buildSearchTerms(location, targetDate).slice(0, POLYMARKET_MAX_SEARCH_TERMS);
     if (collected.size === 0) {
-      const searchResults = await Promise.all(searchTerms.map(async (term) => ({ term, results: await this.searchMarkets(term) })));
+      const searchResults = await mapWithConcurrency(
+        searchTerms,
+        POLYMARKET_DISCOVERY_CONCURRENCY,
+        async (term) => ({ term, results: await this.searchMarkets(term) }),
+      );
 
       for (const { term, results } of searchResults) {
         for (const entry of results) {
@@ -1288,19 +1333,6 @@ export class PolymarketClient {
         return (right.volume24h ?? 0) - (left.volume24h ?? 0);
       });
 
-    const matchedCount = candidates.filter((candidate) => candidate.parseStatus === "matched").length;
-    if (matchedCount === 0) {
-      for (const entry of await this.fetchEventPageMarkets(location, targetDate)) {
-        const title =
-          parseString(entry.question) ??
-          parseString(entry.title) ??
-          parseString(entry.groupItemTitle) ??
-          parseString(entry.slug) ??
-          `page-retry-${collected.size}`;
-        collected.set(marketKey(entry, title), entry);
-      }
-    }
-
     const finalCandidates = Array.from(collected.values())
       .map((entry) => normalizeCandidate(entry, location, targetDate))
       .filter((entry): entry is PolymarketCandidate => Boolean(entry))
@@ -1332,8 +1364,7 @@ export class PolymarketClient {
 
   async fetchOrderBooks(tokenIds: string[]): Promise<Map<string, NormalizedOrderBook>> {
     const uniqueTokenIds = unique(tokenIds.filter(Boolean));
-    const entries = await Promise.all(
-      uniqueTokenIds.map(async (tokenId) => {
+    const entries = await mapWithConcurrency(uniqueTokenIds, POLYMARKET_ORDERBOOK_CONCURRENCY, async (tokenId) => {
         try {
           const payload = await fetchJson<unknown>(toOrderBookUrl(this.clobBaseUrl, tokenId), {
             signal: AbortSignal.timeout(POLYMARKET_DISCOVERY_TIMEOUT_MS),
@@ -1353,8 +1384,7 @@ export class PolymarketClient {
 
           return null;
         }
-      }),
-    );
+      });
 
     return new Map(
       entries

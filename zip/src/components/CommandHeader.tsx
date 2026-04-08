@@ -90,11 +90,11 @@ export const CommandHeader = ({
               {UI_TEXT.header.productName}
             </div>
 
-            <div className="command-header-title-row">
-              <h1 className="truncate text-[clamp(1.18rem,1.8vw,1.68rem)] font-semibold tracking-[-0.02em] text-white">
-                {locationName}
-              </h1>
+            <h1 className="command-header-title truncate text-[clamp(1.18rem,1.8vw,1.68rem)] font-semibold tracking-[-0.02em] text-white">
+              {locationName}
+            </h1>
 
+            <div className="command-header-meta-row">
               <Button
                 type="button"
                 variant="outline"
@@ -134,7 +134,7 @@ export const CommandHeader = ({
           </div>
         </div>
 
-        <div className="command-header-actions">
+        <div className="command-header-center">
           <div className="command-header-nav-shell">
             <div className="command-header-nav-cluster">
               <Button
@@ -174,36 +174,34 @@ export const CommandHeader = ({
               </Button>
             </div>
           </div>
+        </div>
 
-          <div className="command-header-utility">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={onRefresh}
-              disabled={refreshDisabled}
-              className="command-header-refresh justify-start border border-white/12 bg-[rgba(12,17,26,0.76)] text-white/84 hover:border-white/20 hover:bg-[rgba(14,20,31,0.9)]"
-              data-refresh-state={refreshState}
-            >
-              {refreshState === "success" ? (
-                <CheckCheck className="mr-2 h-4 w-4 text-[var(--success)]" />
-              ) : refreshState === "error" ? (
-                <TriangleAlert className="mr-2 h-4 w-4 text-[var(--danger)]" />
-              ) : (
-                <RefreshCw
-                  className={`mr-2 h-4 w-4 ${refreshState === "pending" ? "animate-spin text-[var(--accent)]" : ""}`}
-                />
-              )}
-              <span>{UI_TEXT.header.refresh}</span>
-              <span className="ml-2 text-[11px] text-white/52" aria-live="polite">
-                {refreshLabel}
-              </span>
-            </Button>
-          </div>
+        <div className="command-header-utility">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={onRefresh}
+            disabled={refreshDisabled}
+            className="command-header-refresh justify-start border border-white/12 bg-[rgba(12,17,26,0.76)] text-white/84 hover:border-white/20 hover:bg-[rgba(14,20,31,0.9)]"
+            data-refresh-state={refreshState}
+          >
+            {refreshState === "success" ? (
+              <CheckCheck className="mr-2 h-4 w-4 text-[var(--success)]" />
+            ) : refreshState === "error" ? (
+              <TriangleAlert className="mr-2 h-4 w-4 text-[var(--danger)]" />
+            ) : (
+              <RefreshCw
+                className={`mr-2 h-4 w-4 ${refreshState === "pending" ? "animate-spin text-[var(--accent)]" : ""}`}
+              />
+            )}
+            <span>{UI_TEXT.header.refresh}</span>
+            <span className="ml-2 text-[11px] text-white/52" aria-live="polite">
+              {refreshLabel}
+            </span>
+          </Button>
         </div>
       </div>
     </motion.header>
   );
 };
-
-

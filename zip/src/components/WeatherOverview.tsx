@@ -164,8 +164,8 @@ export const WeatherOverview = ({
   onSelectTimestamp,
   currentItem,
   selectedItem,
-  predictabilityScore,
-  predictabilityLabel,
+  predictabilityScore: predictabilityScoreInput,
+  predictabilityLabel: predictabilityLabelInput,
 }: {
   pageUrl: string;
   reportText: string;
@@ -192,6 +192,70 @@ export const WeatherOverview = ({
   });
 
   const [hoveredTimestamp, setHoveredTimestamp] = useState<string | null>(null);
+  const [stablePredictabilityScore, setStablePredictabilityScore] = useState<number | null>(
+    predictabilityScoreInput ?? null,
+  );
+  const [stablePredictabilityLabel, setStablePredictabilityLabel] = useState<string | null>(
+    typeof predictabilityLabelInput === "string" &&
+      predictabilityLabelInput.trim() &&
+      predictabilityLabelInput.trim() !== "--"
+      ? predictabilityLabelInput.trim()
+      : null,
+  );
+  const [stablePredictabilityState, setStablePredictabilityState] = useState<{
+    score: number | null;
+    label: string | null;
+  }>(() => ({
+    score:
+      typeof predictabilityScoreInput === "number" && Number.isFinite(predictabilityScoreInput)
+        ? predictabilityScoreInput
+        : null,
+    label:
+      typeof predictabilityLabelInput === "string" &&
+      predictabilityLabelInput.trim() &&
+      predictabilityLabelInput.trim() !== "--"
+        ? predictabilityLabelInput.trim()
+        : null,
+  }));
+
+  useEffect(() => {
+    if (typeof predictabilityScoreInput === "number" && Number.isFinite(predictabilityScoreInput)) {
+      setStablePredictabilityScore(predictabilityScoreInput);
+    }
+  }, [predictabilityScoreInput]);
+
+  useEffect(() => {
+    if (typeof predictabilityLabelInput !== "string") {
+      return;
+    }
+    const nextLabel = predictabilityLabelInput.trim();
+    if (!nextLabel || nextLabel === "--") {
+      return;
+    }
+    setStablePredictabilityLabel(nextLabel);
+  }, [predictabilityLabelInput]);
+
+  useEffect(() => {
+    const nextScore =
+      typeof predictabilityScoreInput === "number" && Number.isFinite(predictabilityScoreInput)
+        ? predictabilityScoreInput
+        : null;
+    const nextLabel =
+      typeof predictabilityLabelInput === "string" &&
+      predictabilityLabelInput.trim() &&
+      predictabilityLabelInput.trim() !== "--"
+        ? predictabilityLabelInput.trim()
+        : null;
+
+    if (nextScore === null && nextLabel === null) {
+      return;
+    }
+
+    setStablePredictabilityState((current) => ({
+      score: nextScore ?? current.score,
+      label: nextLabel ?? current.label,
+    }));
+  }, [predictabilityLabelInput, predictabilityScoreInput]);
 
   const currentIndex = useMemo(
     () => items.findIndex((item) => item.timestamp === currentItem?.timestamp),
@@ -239,6 +303,19 @@ export const WeatherOverview = ({
   const inspectorSummary = summarizeHour(selectedOrHoveredItem);
   const availableTemperatureHours = items.filter((item) => typeof item.temperatureC === "number").length;
   const totalHours = Math.max(items.length, 1);
+  const resolvedPredictabilityScore =
+    typeof predictabilityScoreInput === "number" && Number.isFinite(predictabilityScoreInput)
+      ? predictabilityScoreInput
+      : stablePredictabilityState.score ?? stablePredictabilityScore;
+  const rawPredictabilityLabel =
+    typeof predictabilityLabelInput === "string" &&
+      predictabilityLabelInput.trim() &&
+      predictabilityLabelInput.trim() !== "--"
+      ? predictabilityLabelInput.trim()
+      : stablePredictabilityState.label ?? stablePredictabilityLabel;
+  const resolvedPredictabilityLabel = rawPredictabilityLabel ?? "--";
+  const predictabilityDetail = `澶嶇敤鍒嗘瀽宸ヤ綔鍖哄悓涓€鍙ｅ緞锛屾俯搴︽椂搴忚鐩?${availableTemperatureHours}/${totalHours} 灏忔椂銆?`;
+  const predictabilityLabel = resolvedPredictabilityLabel;
 
   const trackGradient = useMemo(() => {
     if (!items.length) {
@@ -351,7 +428,8 @@ export const WeatherOverview = ({
           <div className="mt-4 flex flex-wrap gap-3">
             <ConfidenceCard
               title="当天最高温判断置信度"
-              score={predictabilityScore ?? null}
+              score={resolvedPredictabilityScore ?? null}
+              detail={predictabilityDetail}
               label={`最高温判断 ${predictabilityLabel ?? "--"}`}
             />
           </div>

@@ -7,6 +7,8 @@ import type {
   HourlyFieldName,
   HourlyMode,
   HourlySourceType,
+  KellyBridgeHealth,
+  KellyBridgeStageTimings,
   HourlyWeatherResponse,
   KellyFramePoint,
   KellyRequestOptions,
@@ -87,6 +89,36 @@ interface MetarCacheValue {
   observation: Omit<MetarObservation, "stale" | "cacheHit"> | null;
   recentTemperatures: MetarTemperatureSample[];
 }
+
+const INITIAL_KELLY_STAGE_TIMINGS: KellyBridgeStageTimings = {
+  hourly: null,
+  report: null,
+  metar: null,
+  insight: null,
+  distribution: null,
+  marketDiscovery: null,
+  orderbook: null,
+  pricing: null,
+  total: null,
+};
+
+const cloneKellyStageTimings = (value?: Partial<KellyBridgeStageTimings> | null): KellyBridgeStageTimings => ({
+  ...INITIAL_KELLY_STAGE_TIMINGS,
+  ...(value ?? {}),
+});
+
+const measureAsync = async <T>(
+  stageTimings: Partial<KellyBridgeStageTimings>,
+  key: keyof KellyBridgeStageTimings,
+  loader: () => Promise<T>,
+): Promise<T> => {
+  const startedAt = Date.now();
+  try {
+    return await loader();
+  } finally {
+    stageTimings[key] = Date.now() - startedAt;
+  }
+};
 
 const buildKellyCacheKey = (locationId: LocationInfo["id"], targetDate: string) => `${locationId}::${targetDate}`;
 
@@ -338,11 +370,60 @@ export class MeteoblueWeatherService implements WeatherService {
   private readonly favoritesStore: FavoritesStoreLike;
   private readonly allowedLocationIds: Set<LocationInfo["id"]>;
   private readonly polymarketClient: PolymarketClient;
+  private readonly kellySnapshotInFlight = new Map<string, Promise<KellyWorkbenchResponse>>();
+  private readonly kellyBridgeHealth: KellyBridgeHealth = {
+    lastSnapshotSuccessAt: null,
+    lastSnapshotErrorAt: null,
+    lastSnapshotError: null,
+    lastMarketDiscoveryAt: null,
+    lastOrderbookAt: null,
+    lastRepricedAt: null,
+    lastStreamEventAt: null,
+    openStreamCount: 0,
+    fallbackMode: false,
+    lastStageTimingsMs: cloneKellyStageTimings(),
+  };
 
   constructor(options?: { favoritesStore?: FavoritesStoreLike }) {
     this.favoritesStore = options?.favoritesStore ?? new FavoritesStore();
     this.allowedLocationIds = new Set(Object.keys(LOCATION_REGISTRY) as LocationInfo["id"][]);
     this.polymarketClient = new PolymarketClient();
+  }
+
+  getKellyBridgeHealth(): KellyBridgeHealth {
+    return {
+      ...this.kellyBridgeHealth,
+      lastStageTimingsMs: cloneKellyStageTimings(this.kellyBridgeHealth.lastStageTimingsMs),
+    };
+  }
+
+  private recordKellySnapshotSuccess(details: {
+    generatedAt: string;
+    discoveryFetchedAt: string | null;
+    orderbookFetchedAt: string | null;
+    repricedAt: string | null;
+    stageTimings: Partial<KellyBridgeStageTimings>;
+  }) {
+    this.kellyBridgeHealth.lastSnapshotSuccessAt = details.generatedAt;
+    this.kellyBridgeHealth.lastSnapshotErrorAt = null;
+    this.kellyBridgeHealth.lastSnapshotError = null;
+    this.kellyBridgeHealth.lastMarketDiscoveryAt = details.discoveryFetchedAt ?? this.kellyBridgeHealth.lastMarketDiscoveryAt;
+    this.kellyBridgeHealth.lastOrderbookAt = details.orderbookFetchedAt ?? this.kellyBridgeHealth.lastOrderbookAt;
+    this.kellyBridgeHealth.lastRepricedAt = details.repricedAt ?? this.kellyBridgeHealth.lastRepricedAt;
+    this.kellyBridgeHealth.lastStageTimingsMs = cloneKellyStageTimings(details.stageTimings);
+  }
+
+  private recordKellySnapshotFailure(error: unknown, stageTimings: Partial<KellyBridgeStageTimings>) {
+    this.kellyBridgeHealth.lastSnapshotErrorAt = new Date().toISOString();
+    this.kellyBridgeHealth.lastSnapshotError = error instanceof Error ? error.message : String(error);
+    this.kellyBridgeHealth.lastStageTimingsMs = cloneKellyStageTimings(stageTimings);
+  }
+
+  private recordKellyStreamEvent(generatedAt: string, fallbackMode?: boolean) {
+    this.kellyBridgeHealth.lastStreamEventAt = generatedAt;
+    if (typeof fallbackMode === "boolean") {
+      this.kellyBridgeHealth.fallbackMode = fallbackMode;
+    }
   }
 
   private requireLocation(locationId: LocationInfo["id"]) {
@@ -888,165 +969,219 @@ export class MeteoblueWeatherService implements WeatherService {
   ): Promise<KellyWorkbenchResponse> {
     const location = this.requireLocation(locationId);
     const targetDate = resolveKellyTargetDate(location.timezone, options.targetDate);
-    const [hourly, report, metarResult] = await Promise.all([
-      this.getHourly(locationId, "1h", 24),
-      this.getWeatherReport(locationId),
-      this.getMetarCache(locationId).get({ allowStaleOnError: true }),
-    ]);
-    const metarObservation = metarResult.value.observation
-      ? {
-          ...metarResult.value.observation,
-          stale: metarResult.stale,
-          cacheHit: metarResult.cacheHit,
-        }
-      : null;
-    const resolvedActualTemperatureForInsight =
-      options.actualTemperatureC ??
-      metarObservation?.temperatureC ??
-      hourly.current?.temperatureC ??
-      undefined;
-    const insight = await this.getMultiModelInsight(
-      locationId,
-      options.selectedHourTimestamp,
-      resolvedActualTemperatureForInsight,
-    );
-    const targetDistributionTimestamp = resolveKellyDistributionTimestamp(insight.availableTimestamps, targetDate);
-
-    if (!targetDistributionTimestamp) {
-      throw new AppError(
-        400,
-        "BAD_REQUEST",
-        `Query parameter 'targetDate' is not available for this location: '${targetDate}'.`,
-      );
+    const cacheKey = buildKellyCacheKey(locationId, targetDate);
+    const existing = this.kellySnapshotInFlight.get(cacheKey);
+    if (existing) {
+      return await existing;
     }
 
-    const distribution = await this.getMultiModelDistribution(locationId, targetDistributionTimestamp, 1);
-
-    const warnings: string[] = [];
-    if (!options.actualTemperatureC && metarObservation === null) {
-      warnings.push("METAR 实况当前不可用，Kelly 下界约束回退到站点当前小时温度。");
-    } else if (metarObservation?.stale) {
-      warnings.push("METAR 实况当前使用最近一次成功缓存。");
-    }
-    let discoveryResult: PolymarketDiscoveryResult | null = null;
-    let discoveryFetchedAt: string | null = null;
+    const task = this.buildKellyWorkbenchSnapshot(locationId, location, targetDate, options);
+    this.kellySnapshotInFlight.set(cacheKey, task);
 
     try {
-      const marketResult = await this.getKellyMarketCache(locationId, targetDate).get({ allowStaleOnError: true });
-      discoveryResult = marketResult.value;
-      discoveryFetchedAt = discoveryResult.fetchedAt;
-      if (marketResult.stale) {
-        warnings.push("Polymarket 市场目录刷新失败，当前使用最近一次成功缓存。");
+      return await task;
+    } finally {
+      if (this.kellySnapshotInFlight.get(cacheKey) === task) {
+        this.kellySnapshotInFlight.delete(cacheKey);
       }
-      warnings.push(
-        ...buildDiscoveryWarnings([
-          ...discoveryResult.candidates,
-          ...discoveryResult.inactiveCandidates,
-        ]),
+    }
+  }
+
+  private async buildKellyWorkbenchSnapshot(
+    locationId: LocationInfo["id"],
+    location: ReturnType<MeteoblueWeatherService["requireLocation"]>,
+    targetDate: string,
+    options: KellyRequestOptions,
+  ): Promise<KellyWorkbenchResponse> {
+    const stageTimings: Partial<KellyBridgeStageTimings> = {};
+    const totalStartedAt = Date.now();
+
+    try {
+      const [hourly, report, metarResult] = await Promise.all([
+        measureAsync(stageTimings, "hourly", async () => await this.getHourly(locationId, "1h", 24)),
+        measureAsync(stageTimings, "report", async () => await this.getWeatherReport(locationId)),
+        measureAsync(stageTimings, "metar", async () => await this.getMetarCache(locationId).get({ allowStaleOnError: true })),
+      ]);
+      const metarObservation = metarResult.value.observation
+        ? {
+            ...metarResult.value.observation,
+            stale: metarResult.stale,
+            cacheHit: metarResult.cacheHit,
+          }
+        : null;
+      const resolvedActualTemperatureForInsight =
+        options.actualTemperatureC ??
+        metarObservation?.temperatureC ??
+        hourly.current?.temperatureC ??
+        undefined;
+      const insight = await measureAsync(stageTimings, "insight", async () =>
+        await this.getMultiModelInsight(
+          locationId,
+          options.selectedHourTimestamp,
+          resolvedActualTemperatureForInsight,
+        ),
       );
-    } catch {
-      warnings.push("Polymarket 市场目录暂时不可用，当前仅展示天气侧推导结果。");
-    }
+      const targetDistributionTimestamp = resolveKellyDistributionTimestamp(insight.availableTimestamps, targetDate);
 
-    let orderBooks = new Map<string, NormalizedOrderBook>();
-    let priceFetchedAt: string | null = null;
-
-    if (discoveryResult?.candidates.some((candidate) => candidate.parseStatus === "matched")) {
-      try {
-        const orderBookResult = await this.getKellyOrderBookCache(locationId, targetDate).get({
-          allowStaleOnError: true,
-        });
-        orderBooks = orderBookResult.value;
-        priceFetchedAt =
-          [...orderBooks.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]?.updatedAt ?? null;
-        if (orderBookResult.stale) {
-          warnings.push("Polymarket 盘口快照刷新失败，当前使用最近一次成功缓存。");
-        }
-      } catch {
-        warnings.push("Polymarket 盘口快照暂时不可用，当前仅展示公允概率与档位匹配。");
+      if (!targetDistributionTimestamp) {
+        throw new AppError(
+          400,
+          "BAD_REQUEST",
+          `Query parameter 'targetDate' is not available for this location: '${targetDate}'.`,
+        );
       }
+
+      const distribution = await measureAsync(stageTimings, "distribution", async () =>
+        await this.getMultiModelDistribution(locationId, targetDistributionTimestamp, 1),
+      );
+
+      const warnings: string[] = [];
+      if (!options.actualTemperatureC && metarObservation === null) {
+        warnings.push("METAR 实况当前不可用，Kelly 下界约束回退到站点当前小时温度。");
+      } else if (metarObservation?.stale) {
+        warnings.push("METAR 实况当前使用最近一次成功缓存。");
+      }
+      let discoveryResult: PolymarketDiscoveryResult | null = null;
+      let discoveryFetchedAt: string | null = null;
+
+      try {
+        const marketResult = await measureAsync(stageTimings, "marketDiscovery", async () =>
+          await this.getKellyMarketCache(locationId, targetDate).get({ allowStaleOnError: true }),
+        );
+        discoveryResult = marketResult.value;
+        discoveryFetchedAt = discoveryResult.fetchedAt;
+        if (marketResult.stale) {
+          warnings.push("Polymarket 市场目录刷新失败，当前使用最近一次成功缓存。");
+        }
+        warnings.push(
+          ...buildDiscoveryWarnings([
+            ...discoveryResult.candidates,
+            ...discoveryResult.inactiveCandidates,
+          ]),
+        );
+      } catch {
+        warnings.push("Polymarket 市场目录暂时不可用，当前仅展示天气侧推导结果。");
+      }
+
+      let orderBooks = new Map<string, NormalizedOrderBook>();
+      let priceFetchedAt: string | null = null;
+
+      if (discoveryResult?.candidates.some((candidate) => candidate.parseStatus === "matched")) {
+        try {
+          const orderBookResult = await measureAsync(stageTimings, "orderbook", async () =>
+            await this.getKellyOrderBookCache(locationId, targetDate).get({
+              allowStaleOnError: true,
+            }),
+          );
+          orderBooks = orderBookResult.value;
+          priceFetchedAt =
+            [...orderBooks.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]?.updatedAt ?? null;
+          if (orderBookResult.stale) {
+            warnings.push("Polymarket 盘口快照刷新失败，当前使用最近一次成功缓存。");
+          }
+        } catch {
+          warnings.push("Polymarket 盘口快照暂时不可用，当前仅展示公允概率与档位匹配。");
+        }
+      }
+
+      const pricingStartedAt = Date.now();
+      const generatedAt = new Date().toISOString();
+      const cacheKey = buildKellyCacheKey(locationId, targetDate);
+      const existingFrameSeries = this.kellyFrameHistories.get(cacheKey) ?? [];
+      const hasActionableBookData = [...orderBooks.values()].some(
+        (book) => book.bestAsk !== null || book.bestBid !== null,
+      );
+      const observationFloor = this.resolveKellyObservationFloor(
+        location,
+        targetDate,
+        hourly,
+        metarObservation,
+        metarResult.value.recentTemperatures,
+        options,
+      );
+
+      const baseSnapshot = buildKellyWorkbench({
+        location,
+        targetDate,
+        hourly,
+        report,
+        metarObservation,
+        insight,
+        distribution,
+        discoveryCandidates: discoveryResult?.candidates ?? [],
+        inactiveCandidates: discoveryResult?.inactiveCandidates ?? [],
+        discoveryFetchedAt,
+        sourceLinks:
+          discoveryResult?.sourceLinks ?? {
+            meteoblueWeekUrl: location.weekPageUrl,
+            meteoblueMultimodelUrl: location.multimodelPageUrl,
+            polymarketSearchUrl: `${config.polymarketGammaBaseUrl}/public-search?q=${encodeURIComponent(
+              `${location.cityName} weather ${targetDate}`,
+            )}`,
+            marketUrls: [],
+          },
+        orderBooks,
+        priceFetchedAt,
+        generatedAt,
+        repricedAt: hasActionableBookData ? generatedAt : null,
+        frameSeries: existingFrameSeries,
+        options,
+        warnings,
+        observationFloorOverride: observationFloor,
+      });
+      const frameSeries = this.rememberKellyFrameHistory(
+        locationId,
+        targetDate,
+        buildReadableFramePoints(baseSnapshot.markets, generatedAt),
+        generatedAt,
+      );
+
+      const snapshot = buildKellyWorkbench({
+        location,
+        targetDate,
+        hourly,
+        report,
+        metarObservation,
+        insight,
+        distribution,
+        discoveryCandidates: discoveryResult?.candidates ?? [],
+        inactiveCandidates: discoveryResult?.inactiveCandidates ?? [],
+        discoveryFetchedAt,
+        sourceLinks:
+          discoveryResult?.sourceLinks ?? {
+            meteoblueWeekUrl: location.weekPageUrl,
+            meteoblueMultimodelUrl: location.multimodelPageUrl,
+            polymarketSearchUrl: `${config.polymarketGammaBaseUrl}/public-search?q=${encodeURIComponent(
+              `${location.cityName} weather ${targetDate}`,
+            )}`,
+            marketUrls: [],
+          },
+        orderBooks,
+        priceFetchedAt,
+        generatedAt,
+        repricedAt: hasActionableBookData ? generatedAt : null,
+        frameSeries,
+        options,
+        warnings,
+        observationFloorOverride: observationFloor,
+      });
+
+      stageTimings.pricing = Date.now() - pricingStartedAt;
+      stageTimings.total = Date.now() - totalStartedAt;
+      this.recordKellySnapshotSuccess({
+        generatedAt,
+        discoveryFetchedAt,
+        orderbookFetchedAt: priceFetchedAt,
+        repricedAt: hasActionableBookData ? generatedAt : null,
+        stageTimings,
+      });
+
+      return snapshot;
+    } catch (error) {
+      stageTimings.total = Date.now() - totalStartedAt;
+      this.recordKellySnapshotFailure(error, stageTimings);
+      throw error;
     }
-
-    const generatedAt = new Date().toISOString();
-    const cacheKey = buildKellyCacheKey(locationId, targetDate);
-    const existingFrameSeries = this.kellyFrameHistories.get(cacheKey) ?? [];
-    const hasActionableBookData = [...orderBooks.values()].some(
-      (book) => book.bestAsk !== null || book.bestBid !== null,
-    );
-    const observationFloor = this.resolveKellyObservationFloor(
-      location,
-      targetDate,
-      hourly,
-      metarObservation,
-      metarResult.value.recentTemperatures,
-      options,
-    );
-
-    const baseSnapshot = buildKellyWorkbench({
-      location,
-      targetDate,
-      hourly,
-      report,
-      metarObservation,
-      insight,
-      distribution,
-      discoveryCandidates: discoveryResult?.candidates ?? [],
-      inactiveCandidates: discoveryResult?.inactiveCandidates ?? [],
-      discoveryFetchedAt,
-      sourceLinks:
-        discoveryResult?.sourceLinks ?? {
-          meteoblueWeekUrl: location.weekPageUrl,
-          meteoblueMultimodelUrl: location.multimodelPageUrl,
-          polymarketSearchUrl: `${config.polymarketGammaBaseUrl}/public-search?q=${encodeURIComponent(
-            `${location.cityName} weather ${targetDate}`,
-          )}`,
-          marketUrls: [],
-      },
-      orderBooks,
-      priceFetchedAt,
-      generatedAt,
-      repricedAt: hasActionableBookData ? generatedAt : null,
-      frameSeries: existingFrameSeries,
-      options,
-      warnings,
-      observationFloorOverride: observationFloor,
-    });
-    const frameSeries = this.rememberKellyFrameHistory(
-      locationId,
-      targetDate,
-      buildReadableFramePoints(baseSnapshot.markets, generatedAt),
-      generatedAt,
-    );
-
-    return buildKellyWorkbench({
-      location,
-      targetDate,
-      hourly,
-      report,
-      metarObservation,
-      insight,
-      distribution,
-      discoveryCandidates: discoveryResult?.candidates ?? [],
-      inactiveCandidates: discoveryResult?.inactiveCandidates ?? [],
-      discoveryFetchedAt,
-      sourceLinks:
-        discoveryResult?.sourceLinks ?? {
-          meteoblueWeekUrl: location.weekPageUrl,
-          meteoblueMultimodelUrl: location.multimodelPageUrl,
-          polymarketSearchUrl: `${config.polymarketGammaBaseUrl}/public-search?q=${encodeURIComponent(
-            `${location.cityName} weather ${targetDate}`,
-          )}`,
-          marketUrls: [],
-        },
-      orderBooks,
-      priceFetchedAt,
-      generatedAt,
-      repricedAt: hasActionableBookData ? generatedAt : null,
-      frameSeries,
-      options,
-      warnings,
-      observationFloorOverride: observationFloor,
-    });
   }
 
   async createKellyStream(
@@ -1061,12 +1196,15 @@ export class MeteoblueWeatherService implements WeatherService {
       ...options,
       targetDate,
     });
-    const trackedMarkets = [...snapshot.markets, ...snapshot.inactiveMarkets];
+    const trackedMarkets = snapshot.markets.filter(
+      (market) => market.lifecycle === "tradable" && market.parseStatus === "matched",
+    );
     const matchedMarkets = trackedMarkets.filter(
-      (market) => market.parseStatus === "matched" && market.yesTokenId && market.noTokenId,
+      (market) => market.yesTokenId && market.noTokenId,
     );
 
     if (!matchedMarkets.length) {
+      this.recordKellyStreamEvent(new Date().toISOString(), false);
       onMessage({
         type: "status",
         generatedAt: new Date().toISOString(),
@@ -1086,6 +1224,8 @@ export class MeteoblueWeatherService implements WeatherService {
     let lastTriggeredAt: string | null = null;
     let fallbackTimer: NodeJS.Timeout | null = null;
     let lastRepricedAt: string | null = null;
+    this.kellyBridgeHealth.openStreamCount += 1;
+    this.kellyBridgeHealth.fallbackMode = false;
 
     async function emitSnapshot(): Promise<string | null> {
       try {
@@ -1104,6 +1244,11 @@ export class MeteoblueWeatherService implements WeatherService {
           buildReadableFramePoints(repriced, generatedAt),
           generatedAt,
         );
+        service.recordKellyStreamEvent(generatedAt, false);
+        service.kellyBridgeHealth.lastOrderbookAt =
+          [...books.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]?.updatedAt ??
+          service.kellyBridgeHealth.lastOrderbookAt;
+        service.kellyBridgeHealth.lastRepricedAt = generatedAt;
 
         sendStreamMessage({
           type: "markets",
@@ -1117,6 +1262,7 @@ export class MeteoblueWeatherService implements WeatherService {
         return generatedAt;
       } catch {
         const failedAt = new Date().toISOString();
+        service.recordKellyStreamEvent(failedAt, true);
         sendStreamMessage({
           type: "status",
           generatedAt: failedAt,
@@ -1136,6 +1282,8 @@ export class MeteoblueWeatherService implements WeatherService {
         return;
       }
       const fallbackTime = new Date().toISOString();
+      service.kellyBridgeHealth.fallbackMode = true;
+      service.recordKellyStreamEvent(fallbackTime, true);
       onMessage({
         type: "status",
         generatedAt: fallbackTime,
@@ -1169,6 +1317,7 @@ export class MeteoblueWeatherService implements WeatherService {
         clearInterval(fallbackTimer);
         fallbackTimer = null;
       }
+      service.kellyBridgeHealth.fallbackMode = false;
     }
 
     function handleStreamStatus(message: KellyStreamMessage) {
@@ -1185,6 +1334,10 @@ export class MeteoblueWeatherService implements WeatherService {
 
     function sendStreamMessage(message: KellyStreamMessage) {
       handleStreamStatus(message);
+       service.recordKellyStreamEvent(
+        message.generatedAt,
+        message.type === "status" && message.reasonCode === "polling_fallback",
+      );
       onMessage(message);
     }
 
@@ -1239,6 +1392,7 @@ export class MeteoblueWeatherService implements WeatherService {
           pendingTimer = null;
         }
         stopPollingFallback();
+        service.kellyBridgeHealth.openStreamCount = Math.max(0, service.kellyBridgeHealth.openStreamCount - 1);
         await upstreamStream.close();
       },
     };

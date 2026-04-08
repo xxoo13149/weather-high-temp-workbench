@@ -93,8 +93,7 @@ const fetchWithShellFallback = async (url: string, init?: RequestInit): Promise<
 
   const [{ execFile }, { promisify }] = await Promise.all([import("node:child_process"), import("node:util")]);
   const execFileAsync = promisify(execFile);
-  const { command, args } =
-    process.platform === "win32" ? buildWindowsWebRequestCommand(url, init) : buildCurlCommand(url, init);
+  const { command, args } = buildCurlCommand(url, init);
 
   try {
     const { stdout } = await execFileAsync(command, args, {

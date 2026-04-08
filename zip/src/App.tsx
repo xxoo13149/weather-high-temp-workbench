@@ -90,6 +90,7 @@ type ParsedKellyDraftControls = {
 
 const KELLY_DEFAULT_BANKROLL = 1000;
 const KELLY_DEFAULT_MIN_EDGE = 0.02;
+const SILENT_REFRESH_STALE_MS = 10 * 60 * 1000;
 
 const parseNumber = (value: string | null) => {
   if (!value) {
@@ -282,6 +283,8 @@ const buildAnalysisBatchKey = (
 
 const WARM_CACHE_TTL_MS = 60_000;
 const KELLY_WARM_CACHE_TTL_MS = 5_000;
+const LOCATION_TEMPERATURE_TTL_MS = 15 * 60_000;
+const LOCATION_TEMPERATURE_CONCURRENCY = 3;
 
 const normalizeNumberKeyPart = (value: number | null | undefined) =>
   typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "auto";
@@ -340,6 +343,15 @@ const readWarmCacheEntry = <T,>(
   return entry.data;
 };
 
+const readWarmCacheAge = <T,>(cache: Map<string, WarmCacheEntry<T>>, key: string) => {
+  const entry = cache.get(key);
+  if (!entry) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Date.now() - entry.cachedAt;
+};
+
 const writeWarmCacheEntry = <T,>(cache: Map<string, WarmCacheEntry<T>>, key: string, data: T) => {
   cache.set(key, {
     cachedAt: Date.now(),
@@ -355,13 +367,32 @@ const resolveTimezoneGroupForLocation = (
 ): TimezoneGroup | null =>
   (locationDirectory?.find((location) => location.id === locationId)?.timezoneGroup as TimezoneGroup | undefined) ?? null;
 
-const buildWarmLocationTargets = (_path: AppPath, _tab: AnalysisWorkspaceState["tab"]): WarmLocationTargets => ({
-  // Keep location switching light: hydrate the current surface first, then lazy-load sibling pages on demand.
-  home: false,
-  analysis: false,
-  kelly: false,
-  image: false,
-});
+const buildWarmLocationTargets = (path: AppPath, tab: AnalysisWorkspaceState["tab"]): WarmLocationTargets => {
+  if (path === "/kelly") {
+    return {
+      home: true,
+      analysis: true,
+      kelly: false,
+      image: true,
+    };
+  }
+
+  if (path === "/analysis") {
+    return {
+      home: true,
+      analysis: tab !== "models",
+      kelly: true,
+      image: true,
+    };
+  }
+
+  return {
+    home: false,
+    analysis: true,
+    kelly: true,
+    image: true,
+  };
+};
 
 const resolveKellyMotionStateFromStream = (
   state: string,
@@ -452,7 +483,7 @@ export default function App() {
     pendingLocationId: null,
     stage: "idle",
   });
-  const [refreshState, setRefreshState] = useState<RefreshState>("pending");
+  const [refreshState, setRefreshState] = useState<RefreshState>("idle");
   const [lastConsistentAnalysisKey, setLastConsistentAnalysisKey] = useState<string | null>(null);
   const [analysisSnapshot, setAnalysisSnapshot] = useState<{
     key: string;
@@ -473,6 +504,7 @@ export default function App() {
   const refreshResetTimerRef = useRef<number | null>(null);
   const refreshInFlightRef = useRef(false);
   const refreshInFlightLocationRef = useRef<string | null>(null);
+  const lastDashboardRefreshAtRef = useRef(0);
   const locationTransitionInFlightRef = useRef(false);
   const locationTransitionSeqRef = useRef(0);
   const dashboardRequestSeqRef = useRef(0);
@@ -496,7 +528,10 @@ export default function App() {
   const kellyWarmCacheRef = useRef<Map<string, WarmCacheEntry<KellyWorkbenchResponse>>>(
     new Map<string, WarmCacheEntry<KellyWorkbenchResponse>>(),
   );
-  const displayedLocationId = locationTransitionState.pendingLocationId ?? routeState.locationId;
+  const locationTemperatureWarmCacheRef = useRef<Map<string, WarmCacheEntry<number | null>>>(
+    new Map<string, WarmCacheEntry<number | null>>(),
+  );
+  const displayedLocationId = routeState.locationId;
   const currentLocationTimezoneGroup =
     resolveTimezoneGroupForLocation(dashboard?.locationDirectory, displayedLocationId) ??
     resolveTimezoneGroupForLocation(
@@ -567,6 +602,7 @@ export default function App() {
   }, [routeState.actualTemperatureC, routeState.bankroll, routeState.minEdge, routeState.riskMode]);
 
   const cacheDashboardSnapshot = (locationId: string, nextDashboard: DashboardViewModel) => {
+    lastDashboardRefreshAtRef.current = Date.now();
     writeWarmCacheEntry(dashboardWarmCacheRef.current, locationId, nextDashboard);
     setDashboard(nextDashboard);
     setLocationTemperatures((current) => ({
@@ -1128,7 +1164,7 @@ export default function App() {
       pendingLocationId: locationId,
       stage: "dashboard",
     });
-    setLoadingDashboard(true);
+    setLoadingDashboard(!dashboard);
     if (currentPath === "/") {
       setLoadingInsight(true);
     }
@@ -1427,11 +1463,29 @@ export default function App() {
       return;
     }
 
-    const timer = window.setInterval(
-      () => void refreshDashboard(false, routeState.locationId),
-      CONFIG.refresh.DASHBOARD_POLL_INTERVAL_MS,
-    );
-    return () => window.clearInterval(timer);
+    const maybeRefreshOnFocus = () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+
+      if (locationTransitionInFlightRef.current || refreshInFlightRef.current) {
+        return;
+      }
+
+      if (Date.now() - lastDashboardRefreshAtRef.current < SILENT_REFRESH_STALE_MS) {
+        return;
+      }
+
+      void refreshDashboard(false, routeState.locationId);
+    };
+
+    window.addEventListener("focus", maybeRefreshOnFocus);
+    document.addEventListener("visibilitychange", maybeRefreshOnFocus);
+
+    return () => {
+      window.removeEventListener("focus", maybeRefreshOnFocus);
+      document.removeEventListener("visibilitychange", maybeRefreshOnFocus);
+    };
   }, [dashboard?.hourly.location.id, routeState.locationId, routeState.path]);
 
   useEffect(() => {
@@ -1619,24 +1673,35 @@ export default function App() {
 
     let cancelled = false;
     const controller = new AbortController();
-    const missingLocations = dashboard.locationDirectory.filter(
-      (location) => !Object.prototype.hasOwnProperty.call(locationTemperatures, location.id),
-    );
+    const visibleGroup = browsingTimezoneGroup ?? activeTimezoneGroup;
+    const staleLocations = dashboard.locationDirectory.filter((location) => {
+      if (location.timezoneGroup !== visibleGroup) {
+        return false;
+      }
 
-    if (!missingLocations.length) {
+      return readWarmCacheAge(locationTemperatureWarmCacheRef.current, location.id) > LOCATION_TEMPERATURE_TTL_MS;
+    });
+
+    if (!staleLocations.length) {
       return;
     }
 
     const loadTemperatures = async () => {
-      const results = await Promise.allSettled(
-        missingLocations.map(async (location) => {
+      const queue = [...staleLocations];
+      const workers = Array.from({ length: Math.min(LOCATION_TEMPERATURE_CONCURRENCY, queue.length) }, async () => {
+        while (queue.length > 0) {
+          const location = queue.shift();
+          if (!location || controller.signal.aborted) {
+            return;
+          }
+
           const response = await weatherApi.fetchHourly("1h", 1, location.id, { signal: controller.signal });
-          return {
-            id: location.id,
-            temp: response.current?.temperatureC ?? response.items[0]?.temperatureC ?? null,
-          };
-        }),
-      );
+          const temp = response.current?.temperatureC ?? response.items[0]?.temperatureC ?? null;
+          writeWarmCacheEntry(locationTemperatureWarmCacheRef.current, location.id, temp);
+        }
+      });
+
+      await Promise.allSettled(workers);
 
       if (cancelled) {
         return;
@@ -1644,9 +1709,14 @@ export default function App() {
 
       setLocationTemperatures((current) => {
         const next = { ...current };
-        for (const result of results) {
-          if (result.status === "fulfilled") {
-            next[result.value.id] = result.value.temp;
+        for (const location of staleLocations) {
+          const entry = locationTemperatureWarmCacheRef.current.get(location.id);
+          const cached =
+            entry && Date.now() - entry.cachedAt <= LOCATION_TEMPERATURE_TTL_MS
+              ? entry.data
+              : undefined;
+          if (cached !== undefined || location.id in next) {
+            next[location.id] = cached ?? null;
           }
         }
         return next;
@@ -1659,7 +1729,7 @@ export default function App() {
       cancelled = true;
       controller.abort();
     };
-  }, [dashboard?.locationDirectory, locationTemperatures]);
+  }, [activeTimezoneGroup, browsingTimezoneGroup, dashboard?.locationDirectory]);
 
   useEffect(() => {
     const dashboardAligned = dashboard?.hourly.location.id === routeState.locationId;
@@ -2241,8 +2311,8 @@ export default function App() {
   const locationGroups = useMemo(() => buildDockLocationGroups(locations), [locations]);
   const displayedLocation = locations.find((location) => location.id === displayedLocationId) ?? null;
 
-  const dashboardMatchesRoute = dashboard?.hourly.location.id === routeState.locationId;
-  const workspaceReady = Boolean(dashboard) && dashboardMatchesRoute && !dashboardError;
+  const hasCommittedSnapshot = Boolean(dashboard) && !dashboardError;
+  const workspaceMuted = isLocationTransitionPending;
   const kellyRefreshDisabled =
     !routeState.targetDate || loadingKelly || manualRefreshingKelly || isLocationTransitionPending;
   const peakSummary = displayedAnalysisInsight
@@ -2257,7 +2327,11 @@ export default function App() {
       <TerminalBackdrop />
 
       <CommandHeader
-        locationName={kellySnapshot?.location.name ?? displayedLocation?.displayName ?? homeViewModel.locationName}
+        locationName={
+          currentPage === "kelly"
+            ? (kellySnapshot?.location.name ?? displayedLocation?.displayName ?? homeViewModel.locationName)
+            : (displayedLocation?.displayName ?? homeViewModel.locationName)
+        }
         locationTimezone={activeLocationTimezone}
         updatedAt={dashboard?.sync.updatedAt ?? null}
         syncState={dashboard?.sync.state ?? "fresh"}
@@ -2312,7 +2386,7 @@ export default function App() {
 
       {dashboardError ? <WarningLines items={[dashboardError]} /> : null}
 
-      {!workspaceReady && !dashboardError ? (
+      {!hasCommittedSnapshot && !dashboardError ? (
         <section className="terminal-panel flex flex-1 items-center justify-center px-6 py-10">
           <div className="panel-section text-center">
             <div className="eyebrow">{UI_TEXT.app.loadingEyebrow}</div>
@@ -2322,7 +2396,7 @@ export default function App() {
         </section>
       ) : null}
 
-      {workspaceReady ? (
+      {hasCommittedSnapshot && dashboard ? (
         <div className={`${isAnalysis ? "analysis-layout-shell" : "terminal-layout"} workspace-stage`}>
           <LocationRail
             expanded={railExpanded}
@@ -2346,7 +2420,7 @@ export default function App() {
           />
 
           {isAnalysis ? (
-            <div className={`workspace-shell workspace-shell-analysis-stage ${railExpanded || isLocationTransitionPending ? "workspace-shell-muted" : ""}`}>
+            <div className={`workspace-shell workspace-shell-analysis-stage ${workspaceMuted ? "workspace-shell-muted" : ""}`}>
               <Suspense
                 fallback={
                   <RouteSurfaceFallback
@@ -2386,7 +2460,7 @@ export default function App() {
               </Suspense>
             </div>
           ) : isKelly ? (
-            <div className={`workspace-shell workspace-shell-kelly-stage ${railExpanded || isLocationTransitionPending ? "workspace-shell-muted" : ""}`}>
+            <div className={`workspace-shell workspace-shell-kelly-stage ${workspaceMuted ? "workspace-shell-muted" : ""}`}>
               <Suspense
                 fallback={
                   <RouteSurfaceFallback
@@ -2455,7 +2529,7 @@ export default function App() {
               </Suspense>
             </div>
           ) : (
-            <div className={`home-shell ${railExpanded || isLocationTransitionPending ? "workspace-shell-muted" : ""}`}>
+            <div className={`home-shell ${workspaceMuted ? "workspace-shell-muted" : ""}`}>
               <Suspense
                 fallback={
                   <RouteSurfaceFallback
@@ -2479,6 +2553,8 @@ export default function App() {
                   }
                   currentItem={homeViewModel.currentItem}
                   selectedItem={homeViewModel.selectedItem}
+                  predictabilityScore={dashboard.report.metrics.predictabilityScore ?? null}
+                  predictabilityLabel={dashboard.report.metrics.predictability}
                 />
               </Suspense>
 

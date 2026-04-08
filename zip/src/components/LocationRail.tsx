@@ -1,5 +1,5 @@
 import { Globe2, MapPinned, Pin, Star, X } from "lucide-react";
-import { useEffect, useMemo, useRef } from "react";
+import { useMemo, useRef } from "react";
 
 import { UI_TEXT } from "../display-text";
 import type { DockLocation, DockLocationGroup } from "../types";
@@ -139,22 +139,12 @@ export const LocationRail = ({
     () => groups.find((group) => group.group === activeGroup)?.items ?? [],
     [activeGroup, groups],
   );
-  const sectionRefs = useRef<Record<DockLocation["timezoneGroup"], HTMLDivElement | null>>({
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const sectionRefs = useRef<Record<DockLocation["timezoneGroup"], HTMLElement | null>>({
     asia: null,
     europe: null,
     americas: null,
   });
-
-  useEffect(() => {
-    if (!expanded) {
-      return;
-    }
-
-    sectionRefs.current[activeGroup]?.scrollIntoView({
-      block: "start",
-      behavior: "smooth",
-    });
-  }, [activeGroup, expanded]);
 
   if (expanded) {
     return (
@@ -191,8 +181,14 @@ export const LocationRail = ({
                     type="button"
                     onClick={() => {
                       onGroupChange(group.group);
-                      sectionRefs.current[group.group]?.scrollIntoView({
-                        block: "start",
+                      const container = scrollContainerRef.current;
+                      const section = sectionRefs.current[group.group];
+                      if (!container || !section) {
+                        return;
+                      }
+
+                      container.scrollTo({
+                        top: Math.max(0, section.offsetTop - container.offsetTop),
                         behavior: "smooth",
                       });
                     }}
@@ -206,7 +202,7 @@ export const LocationRail = ({
               })}
             </div>
 
-            <div className="location-rail-canvas-scroll scrollbar-terminal">
+            <div ref={scrollContainerRef} className="location-rail-canvas-scroll scrollbar-terminal">
               {groups.map((group) => (
                 <section
                   key={group.group}

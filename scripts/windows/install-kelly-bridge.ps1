@@ -8,7 +8,8 @@ param(
   [int]$PublicPort = 80,
   [string]$Host = "127.0.0.1",
   [string]$NodeVersion = "22.22.1",
-  [int]$HttpTimeoutMs = 12000
+  [int]$HttpTimeoutMs = 12000,
+  [int]$NodeMaxOldSpaceSizeMb = 256
 )
 
 $ErrorActionPreference = "Stop"
@@ -212,7 +213,9 @@ function Reset-StartupTask {
     [Parameter(Mandatory = $true)]
     [int]$BindPort,
     [Parameter(Mandatory = $true)]
-    [int]$TimeoutMs
+    [int]$TimeoutMs,
+    [Parameter(Mandatory = $true)]
+    [int]$MaxOldSpaceSizeMb
   )
 
   $existing = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
@@ -225,12 +228,13 @@ function Reset-StartupTask {
   $quotedNode = '"' + $NodeExePath + '"'
   $quotedEntry = '"' + $EntryPath + '"'
   $cmdLine = (
-    '/c set HOST={0}&& set PORT={1}&& set HTTP_TIMEOUT_MS={2}&& set KELLY_BRIDGE_SHARED_SECRET={3}&& {4} {5} 1>>"{6}" 2>>"{7}"' -f
+    '/c set HOST={0}&& set PORT={1}&& set HTTP_TIMEOUT_MS={2}&& set KELLY_BRIDGE_SHARED_SECRET={3}&& {4} --max-old-space-size={5} {6} 1>>"{7}" 2>>"{8}"' -f
       $BindHost,
       $BindPort,
       $TimeoutMs,
       $SharedSecretValue,
       $quotedNode,
+      $MaxOldSpaceSizeMb,
       $quotedEntry,
       $outLog,
       $errLog
@@ -238,7 +242,8 @@ function Reset-StartupTask {
 
   $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $cmdLine -WorkingDirectory $WorkingDirectory
   $trigger = New-ScheduledTaskTrigger -AtStartup
-  Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+  $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+  Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Settings $settings -User "SYSTEM" -RunLevel Highest -Force | Out-Null
 }
 
 function Start-StartupTask {
@@ -315,7 +320,8 @@ Reset-StartupTask `
   -SharedSecretValue $BridgeSharedSecret `
   -BindHost $Host `
   -BindPort $Port `
-  -TimeoutMs $HttpTimeoutMs
+  -TimeoutMs $HttpTimeoutMs `
+  -MaxOldSpaceSizeMb $NodeMaxOldSpaceSizeMb
 Start-StartupTask -Name $TaskName -EntryPath $entryPath
 
 $health = Wait-For-Health -Url ("http://127.0.0.1:{0}/healthz" -f $Port)

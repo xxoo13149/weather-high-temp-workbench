@@ -42,8 +42,27 @@ type CloudflareWebSocket = WebSocket & {
 
 const buildId = process.env.BUILD_ID ?? `worker-${Date.now().toString(36)}`;
 const startedAt = new Date().toISOString();
+const KELLY_BRIDGE_TIMEOUT_MS = 8_000;
+const KELLY_BRIDGE_COOLDOWN_MS = 30_000;
+
+type KellyBridgeProxyState = {
+  consecutiveFailures: number;
+  cooldownUntil: number;
+  lastFailureAt: string | null;
+  lastFailureCode: string | null;
+  lastFailureMessage: string | null;
+  lastSuccessAt: string | null;
+};
 
 let servicePromise: Promise<MeteoblueWeatherService> | null = null;
+let kellyBridgeProxyState: KellyBridgeProxyState = {
+  consecutiveFailures: 0,
+  cooldownUntil: 0,
+  lastFailureAt: null,
+  lastFailureCode: null,
+  lastFailureMessage: null,
+  lastSuccessAt: null,
+};
 
 const getService = async (env: WorkerEnv) => {
   if (!servicePromise) {
@@ -252,6 +271,62 @@ const resolveKellyBridgeBaseUrl = (env: WorkerEnv): string | null => {
   return raw ? normalizeBaseUrl(raw) : null;
 };
 
+const recordKellyBridgeSuccess = (occurredAt: string) => {
+  kellyBridgeProxyState = {
+    ...kellyBridgeProxyState,
+    consecutiveFailures: 0,
+    cooldownUntil: 0,
+    lastSuccessAt: occurredAt,
+  };
+};
+
+const recordKellyBridgeFailure = (code: string, message: string, occurredAt: string) => {
+  kellyBridgeProxyState = {
+    ...kellyBridgeProxyState,
+    consecutiveFailures: kellyBridgeProxyState.consecutiveFailures + 1,
+    cooldownUntil: Date.now() + KELLY_BRIDGE_COOLDOWN_MS,
+    lastFailureAt: occurredAt,
+    lastFailureCode: code,
+    lastFailureMessage: message,
+  };
+};
+
+const resolveKellyBridgeCooldownError = () => {
+  const remainingMs = Math.max(0, kellyBridgeProxyState.cooldownUntil - Date.now());
+  const remainingSeconds = Math.max(1, Math.ceil(remainingMs / 1000));
+  return new AppError(
+    503,
+    "KELLY_BRIDGE_COOLDOWN",
+    `Kelly bridge 正在冷却恢复，约 ${remainingSeconds}s 后再试。当前继续保留上一份快照。`,
+    {
+      retryable: true,
+      lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
+    },
+  );
+};
+
+const readBridgeResponseMessage = async (response: Response): Promise<string | null> => {
+  try {
+    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+    if (contentType.includes("application/json")) {
+      const payload = (await response.clone().json()) as { message?: unknown } | null;
+      return typeof payload?.message === "string" ? payload.message : null;
+    }
+
+    const text = (await response.clone().text()).replace(/\s+/g, " ").trim();
+    return text ? text.slice(0, 240) : null;
+  } catch {
+    return null;
+  }
+};
+
+const isAbortError = (error: unknown) =>
+  error instanceof DOMException
+    ? error.name === "AbortError"
+    : error instanceof Error
+      ? error.name === "AbortError"
+      : false;
+
 const buildKellyBridgeRequest = (request: Request, env: WorkerEnv): Request | null => {
   const bridgeBaseUrl = resolveKellyBridgeBaseUrl(env);
   if (!bridgeBaseUrl) {
@@ -275,23 +350,110 @@ const buildKellyBridgeRequest = (request: Request, env: WorkerEnv): Request | nu
   });
 };
 
-const proxyKellyRequest = async (request: Request, env: WorkerEnv): Promise<Response | null> => {
+const proxyKellyRequest = async (
+  request: Request,
+  env: WorkerEnv,
+  options?: {
+    expectWebSocket?: boolean;
+  },
+): Promise<Response | null> => {
   const proxyRequest = buildKellyBridgeRequest(request, env);
   if (!proxyRequest) {
     return null;
   }
 
+  if (kellyBridgeProxyState.cooldownUntil > Date.now()) {
+    throw resolveKellyBridgeCooldownError();
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), KELLY_BRIDGE_TIMEOUT_MS);
+
   try {
-    return await fetch(proxyRequest);
+    const timedRequest = new Request(proxyRequest, {
+      signal: controller.signal,
+    });
+    const response = await fetch(timedRequest);
+    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+    const occurredAt = new Date().toISOString();
+    const expectsWebSocket = options?.expectWebSocket === true;
+    const isWebSocketUpgrade = response.status === 101;
+    const isJson = contentType.includes("application/json");
+    const isHtml = contentType.includes("text/html");
+
+    if (expectsWebSocket) {
+      if (isWebSocketUpgrade) {
+        recordKellyBridgeSuccess(occurredAt);
+        return response;
+      }
+
+      if (response.status >= 500 || isHtml) {
+        const detail = await readBridgeResponseMessage(response);
+        const message = detail
+          ? `Kelly bridge WebSocket 上游异常：${detail}`
+          : "Kelly bridge WebSocket 上游当前不可用。";
+        recordKellyBridgeFailure("KELLY_BRIDGE_UNAVAILABLE", message, occurredAt);
+        throw new AppError(502, "KELLY_BRIDGE_UNAVAILABLE", message, {
+          retryable: true,
+          lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
+        });
+      }
+
+      recordKellyBridgeSuccess(occurredAt);
+      return response;
+    }
+
+    if (response.ok && isJson) {
+      recordKellyBridgeSuccess(occurredAt);
+      return response;
+    }
+
+    if (!response.ok && response.status < 500 && isJson) {
+      recordKellyBridgeSuccess(occurredAt);
+      return response;
+    }
+
+    const detail = await readBridgeResponseMessage(response);
+    const code = response.status >= 500 || isHtml ? "KELLY_BRIDGE_UNAVAILABLE" : "KELLY_BRIDGE_BAD_RESPONSE";
+    const message =
+      code === "KELLY_BRIDGE_BAD_RESPONSE"
+        ? `Kelly bridge 返回了不可识别的响应（status ${response.status}，content-type ${contentType || "unknown"}）。`
+        : detail
+          ? `Kelly bridge 当前不可用：${detail}`
+          : `Kelly bridge 当前不可用（status ${response.status}）。`;
+    recordKellyBridgeFailure(code, message, occurredAt);
+    throw new AppError(response.status >= 500 ? 502 : 502, code, message, {
+      retryable: true,
+      lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
+    });
   } catch (error) {
+    if (error instanceof AppError) {
+      throw error;
+    }
+
+    const occurredAt = new Date().toISOString();
+    if (isAbortError(error)) {
+      const message = `Kelly bridge 在 ${Math.round(KELLY_BRIDGE_TIMEOUT_MS / 1000)}s 内未完成响应。`;
+      recordKellyBridgeFailure("KELLY_BRIDGE_TIMEOUT", message, occurredAt);
+      throw new AppError(504, "KELLY_BRIDGE_TIMEOUT", message, {
+        retryable: true,
+        lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
+      });
+    }
+
+    const message = `Kelly bridge 请求失败：${error instanceof Error ? error.message : String(error)}`;
+    recordKellyBridgeFailure("KELLY_BRIDGE_UNAVAILABLE", message, occurredAt);
     throw new AppError(
       502,
       "KELLY_BRIDGE_UNAVAILABLE",
-      `Kelly bridge request failed: ${error instanceof Error ? error.message : String(error)}`,
+      message,
       {
         retryable: true,
+        lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
       },
     );
+  } finally {
+    clearTimeout(timeoutId);
   }
 };
 
@@ -308,7 +470,7 @@ const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerCo
     return new Response("Expected Upgrade: websocket", { status: 426 });
   }
 
-  const bridgedResponse = await proxyKellyRequest(request, env);
+  const bridgedResponse = await proxyKellyRequest(request, env, { expectWebSocket: true });
   if (bridgedResponse) {
     return bridgedResponse;
   }
@@ -378,7 +540,26 @@ const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Respo
   const url = new URL(request.url);
 
   if (request.method === "GET" && url.pathname === "/healthz") {
-    return jsonResponse({ ok: true, buildId, startedAt });
+    return jsonResponse({
+      ok: true,
+      service: "weather-worker",
+      buildId,
+      startedAt,
+      kellyBridge: {
+        configured: Boolean(resolveKellyBridgeBaseUrl(env)),
+        baseUrl: resolveKellyBridgeBaseUrl(env),
+        timeoutMs: KELLY_BRIDGE_TIMEOUT_MS,
+        cooldownMs: KELLY_BRIDGE_COOLDOWN_MS,
+        cooldownActive: kellyBridgeProxyState.cooldownUntil > Date.now(),
+        cooldownUntil:
+          kellyBridgeProxyState.cooldownUntil > 0 ? new Date(kellyBridgeProxyState.cooldownUntil).toISOString() : null,
+        consecutiveFailures: kellyBridgeProxyState.consecutiveFailures,
+        lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
+        lastFailureAt: kellyBridgeProxyState.lastFailureAt,
+        lastFailureCode: kellyBridgeProxyState.lastFailureCode,
+        lastFailureMessage: kellyBridgeProxyState.lastFailureMessage,
+      },
+    });
   }
 
   if (request.method === "GET" && url.pathname === "/api/weather/kelly") {
