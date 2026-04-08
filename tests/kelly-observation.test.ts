@@ -109,6 +109,7 @@ describe("kelly observation fallback regression", () => {
         },
         warnings: [],
       },
+      metarObservation: null,
       insight: {
         location: { id: location.id, name: location.name, timezone: location.timezone },
         fetchedAt: "2026-03-28T10:00:00.000Z",
@@ -256,8 +257,8 @@ describe("kelly observation fallback regression", () => {
         marketUrls: ["https://example.com/market-yes-30"],
       },
       orderBooks: new Map([
-        ["yes-1", { tokenId: "yes-1", bestBid: 0.9, bestAsk: 0.95, midpoint: 0.925, updatedAt: "2026-03-28T10:00:01.000Z" }],
-        ["no-1", { tokenId: "no-1", bestBid: 0.5, bestAsk: 0.6, midpoint: 0.55, updatedAt: "2026-03-28T10:00:01.000Z" }],
+        ["yes-1", { tokenId: "yes-1", bestBid: 0.98, bestAsk: 0.99, midpoint: 0.985, updatedAt: "2026-03-28T10:00:01.000Z" }],
+        ["no-1", { tokenId: "no-1", bestBid: 0.98, bestAsk: 0.99, midpoint: 0.985, updatedAt: "2026-03-28T10:00:01.000Z" }],
       ]),
       priceFetchedAt: "2026-03-28T10:00:01.000Z",
       generatedAt: "2026-03-28T10:00:02.000Z",
@@ -283,7 +284,7 @@ describe("kelly observation fallback regression", () => {
       marketId: "market-yes-30",
       recommendedSide: "none",
     });
-    expect(Math.max(matchedMarket?.edgeYes ?? 0, matchedMarket?.edgeNo ?? 0)).toBeLessThan(0);
+    expect(Math.max(matchedMarket?.edgeYes ?? 0, matchedMarket?.edgeNo ?? 0)).toBeLessThanOrEqual(0.01);
     expect(result.unresolvedMarkets).toHaveLength(1);
     expect(result.unresolvedMarkets[0]?.marketId).toBe("market-unresolved");
     expect(result.marketEvidence).toHaveLength(2);

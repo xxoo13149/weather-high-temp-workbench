@@ -14,6 +14,7 @@ import type {
   KellyStreamMessage,
   KellyWorkbenchResponse,
   LocationInfo,
+  MetarObservation,
   MultiModelDistributionResponse,
   MultiModelInsightResponse,
   MultiModelImageResponse,
@@ -33,6 +34,7 @@ import {
 import { RefreshableCache } from "../../lib/cache.js";
 import { FavoritesStore, type FavoritesStoreLike } from "../../lib/favorites-store.js";
 import { fetchBinary, fetchText } from "../../lib/http.js";
+import { fetchLatestMetarObservation } from "../metar/service.js";
 import { resolveLocation } from "./location-registry.js";
 import { extractWeekMeteogramHighchartsUrl, parseWeekMeteogramHighcharts } from "./meteogram.js";
 import {
@@ -77,6 +79,10 @@ interface ImageCacheValue {
   imageUrl: string;
   contentType: string;
   body: Buffer;
+}
+
+interface MetarCacheValue {
+  observation: Omit<MetarObservation, "stale" | "cacheHit"> | null;
 }
 
 const buildKellyCacheKey = (locationId: LocationInfo["id"], targetDate: string) => `${locationId}::${targetDate}`;
@@ -283,6 +289,7 @@ export class MeteoblueWeatherService implements WeatherService {
     LocationInfo["id"],
     RefreshableCache<MultiModelDistributionCacheValue>
   >();
+  private readonly metarCaches = new Map<LocationInfo["id"], RefreshableCache<MetarCacheValue>>();
   private readonly kellyMarketCaches = new Map<string, RefreshableCache<PolymarketDiscoveryResult>>();
   private readonly kellyOrderBookCaches = new Map<string, RefreshableCache<Map<string, NormalizedOrderBook>>>();
   private readonly kellyFrameHistories = new Map<string, KellyFramePoint[]>();
@@ -419,6 +426,25 @@ export class MeteoblueWeatherService implements WeatherService {
       async () => await loadMultiModelDistribution(location.multimodelPageUrl, location.timezone),
     );
     this.multiModelDistributionCaches.set(locationId, cache);
+    return cache;
+  }
+
+  private getMetarCache(locationId: LocationInfo["id"]) {
+    const existing = this.metarCaches.get(locationId);
+    if (existing) {
+      return existing;
+    }
+
+    const location = this.requireLocation(locationId);
+    const cache = new RefreshableCache<MetarCacheValue>(60_000, async () => ({
+      observation: await fetchLatestMetarObservation({
+        id: location.id,
+        name: location.name,
+        timezone: location.timezone,
+      }),
+    }));
+
+    this.metarCaches.set(locationId, cache);
     return cache;
   }
 
@@ -790,11 +816,28 @@ export class MeteoblueWeatherService implements WeatherService {
   ): Promise<KellyWorkbenchResponse> {
     const location = this.requireLocation(locationId);
     const targetDate = resolveKellyTargetDate(location.timezone, options.targetDate);
-    const [hourly, report, insight] = await Promise.all([
+    const [hourly, report, metarResult] = await Promise.all([
       this.getHourly(locationId, "1h", 24),
       this.getWeatherReport(locationId),
-      this.getMultiModelInsight(locationId, options.selectedHourTimestamp, options.actualTemperatureC),
+      this.getMetarCache(locationId).get({ allowStaleOnError: true }),
     ]);
+    const metarObservation = metarResult.value.observation
+      ? {
+          ...metarResult.value.observation,
+          stale: metarResult.stale,
+          cacheHit: metarResult.cacheHit,
+        }
+      : null;
+    const resolvedActualTemperatureForInsight =
+      options.actualTemperatureC ??
+      metarObservation?.temperatureC ??
+      hourly.current?.temperatureC ??
+      undefined;
+    const insight = await this.getMultiModelInsight(
+      locationId,
+      options.selectedHourTimestamp,
+      resolvedActualTemperatureForInsight,
+    );
     const targetDistributionTimestamp = resolveKellyDistributionTimestamp(insight.availableTimestamps, targetDate);
 
     if (!targetDistributionTimestamp) {
@@ -808,6 +851,11 @@ export class MeteoblueWeatherService implements WeatherService {
     const distribution = await this.getMultiModelDistribution(locationId, targetDistributionTimestamp, 1);
 
     const warnings: string[] = [];
+    if (!options.actualTemperatureC && metarObservation === null) {
+      warnings.push("METAR 实况当前不可用，Kelly 下界约束回退到站点当前小时温度。");
+    } else if (metarObservation?.stale) {
+      warnings.push("METAR 实况当前使用最近一次成功缓存。");
+    }
     let discoveryResult: PolymarketDiscoveryResult | null = null;
     let discoveryFetchedAt: string | null = null;
 
@@ -859,6 +907,7 @@ export class MeteoblueWeatherService implements WeatherService {
       targetDate,
       hourly,
       report,
+      metarObservation,
       insight,
       distribution,
       discoveryCandidates: discoveryResult?.candidates ?? [],
@@ -893,6 +942,7 @@ export class MeteoblueWeatherService implements WeatherService {
       targetDate,
       hourly,
       report,
+      metarObservation,
       insight,
       distribution,
       discoveryCandidates: discoveryResult?.candidates ?? [],

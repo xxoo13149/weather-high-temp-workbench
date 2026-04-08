@@ -20,12 +20,15 @@ import { convertAbsoluteTemperature, convertDeltaTemperature } from "@/component
 
 type SnapshotMarket = KellyWorkbenchResponse["markets"][number] | KellyWorkbenchResponse["inactiveMarkets"][number];
 
-const SOURCE_LABELS: Record<KellyWorkbenchResponse["weatherEvidence"]["currentReferenceSource"], string> = {
+const SOURCE_LABELS: Partial<Record<KellyWorkbenchResponse["weatherEvidence"]["currentReferenceSource"], string>> = {
   manual: "手动输入",
   "hourly-current": "当前实况",
   "hourly-selected": "选中小时",
   "model-mean": "模型均值",
 };
+
+const getSourceLabel = (source: KellyWorkbenchResponse["weatherEvidence"]["currentReferenceSource"]) =>
+  source === "metar" ? "METAR 瀹炲喌" : (SOURCE_LABELS[source] ?? "--");
 
 const RISK_MODE_LABELS: Record<KellyRiskMode, string> = {
   conservative: "保守",
@@ -418,7 +421,7 @@ const buildEvidenceSections = (
             id: "reference",
             label: "参考温度",
             value: formatEvidenceTemp(snapshot.weatherEvidence.currentReferenceTemperatureC),
-            detail: `来源：${SOURCE_LABELS[snapshot.weatherEvidence.currentReferenceSource]}`,
+            detail: `来源：${getSourceLabel(snapshot.weatherEvidence.currentReferenceSource)}`,
             tone: "accent",
           },
         {
@@ -507,9 +510,9 @@ const buildEvidenceSections = (
 
 const buildMethodologyNotes = (snapshot: KellyWorkbenchResponse, displayUnit: KellyTemperatureUnit) => [
   "当前版本的 shrink 为启发式收缩，不是历史回测拟合。",
-  `参考温度 ${formatTemp(snapshot.methodology.referenceTemperatureC, displayUnit)}，来源 ${SOURCE_LABELS[
-    snapshot.methodology.referenceSource
-  ] ?? "系统参考"}`,
+  `参考温度 ${formatTemp(snapshot.methodology.referenceTemperatureC, displayUnit)}，来源 ${getSourceLabel(
+    snapshot.methodology.referenceSource,
+  )}`,
   `权重拆解均值：bias ${snapshot.methodology.weightBreakdown.biasWeight.toFixed(2)} / consensus ${snapshot.methodology.weightBreakdown.consensusWeight.toFixed(2)} / rank ${snapshot.methodology.weightBreakdown.rankWeight.toFixed(2)} / normalized ${snapshot.methodology.weightBreakdown.normalizedWeight.toFixed(2)}`,
   snapshot.methodology.probabilitySteps.fairPriceRule,
   snapshot.methodology.probabilitySteps.edgeRule,
@@ -645,7 +648,7 @@ const summaryMetrics: KellySummaryMetric[] = [
       id: "reference",
       label: "参考温度",
       value: formatTempWithUnit(snapshot.weatherEvidence.currentReferenceTemperatureC),
-      detail: `来源：${SOURCE_LABELS[snapshot.weatherEvidence.currentReferenceSource]}`,
+      detail: `来源：${getSourceLabel(snapshot.weatherEvidence.currentReferenceSource)}`,
       tone: "accent",
     },
     {
@@ -669,7 +672,7 @@ const summaryMetrics: KellySummaryMetric[] = [
       id: "weather",
       label: "天气分析时间",
       value: formatDateTime(snapshot.freshness.weatherGeneratedAt, timeZone),
-      detail: `参考口径：${SOURCE_LABELS[snapshot.weatherEvidence.currentReferenceSource]}`,
+      detail: `参考口径：${getSourceLabel(snapshot.weatherEvidence.currentReferenceSource)}`,
       tone: snapshot.weatherEvidence.stale ? "warning" : "success",
     },
     {

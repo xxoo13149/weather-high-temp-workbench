@@ -110,6 +110,22 @@ export interface WeatherReportResponse {
   warnings: string[];
 }
 
+export interface MetarObservation {
+  location: LocationInfo;
+  stationId: string;
+  observedAt: string;
+  temperatureC: number;
+  dewpointC: number | null;
+  windDirectionDegrees: number | null;
+  windSpeedKts: number | null;
+  rawReport: string | null;
+  stationName: string | null;
+  sourceUrl: string;
+  fetchedAt: string;
+  stale: boolean;
+  cacheHit: boolean;
+}
+
 export interface MultiModelImageResponse {
   contentType: string;
   body: Buffer;
@@ -299,10 +315,14 @@ export interface KellyWeatherEvidence {
   targetDate: string;
   availableTargetDates: string[];
   currentReferenceTemperatureC: number | null;
-  currentReferenceSource: "manual" | "hourly-current" | "hourly-selected" | "model-mean";
+  currentReferenceSource: "manual" | "metar" | "hourly-current" | "hourly-selected" | "model-mean";
   currentWeatherTimestamp: string | null;
   currentModelTimestamp: string | null;
   targetModelTimestamp: string | null;
+  observationFloorTemperatureC: number | null;
+  observationFloorSource: "manual" | "metar" | "hourly-current" | "none";
+  observationFloorObservedAt: string | null;
+  metarObservation: MetarObservation | null;
   sourceSummaryZh: string | null;
   hourlyPageUrl: string;
   multimodelPageUrl: string;

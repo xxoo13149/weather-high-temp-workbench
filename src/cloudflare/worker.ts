@@ -55,7 +55,9 @@ const getService = async (env: WorkerEnv) => {
 const getApp = async (env: WorkerEnv) => {
   if (!appPromise) {
     appPromise = (async () => {
-      const app = createApp(await getService(env));
+      const app = createApp(await getService(env), {
+        enableWebSocketRoutes: false,
+      });
       await app.ready();
       return app;
     })();

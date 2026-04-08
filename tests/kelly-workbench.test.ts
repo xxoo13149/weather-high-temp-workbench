@@ -157,6 +157,7 @@ const createBuildArgs = ({
     },
     warnings: [],
   },
+  metarObservation: null,
   insight: {
     location: { id: location.id, name: location.name, timezone: location.timezone },
     fetchedAt: "2026-03-28T10:00:00.000Z",
@@ -611,6 +612,63 @@ describe("buildKellyWorkbench", () => {
     expect(result.markets).toHaveLength(1);
     expect(result.unresolvedMarkets).toHaveLength(1);
     expect(result.displayUnit).toBe("F");
+  });
+
+  test("applies an observed temperature floor so already-broken low buckets cannot stay Yes", () => {
+    const args = createBuildArgs({
+      frameSeries: [],
+    });
+    args.options.actualTemperatureC = 18;
+    args.hourly.current = {
+      timestamp: "2026-03-28T16:00:00-04:00",
+      temperatureC: 18,
+      index: 0,
+    };
+    args.discoveryCandidates = [
+      {
+        ...args.discoveryCandidates[0],
+        marketId: "market-under-17",
+        slug: "market-under-17",
+        contractType: "atMost",
+        bucketStartC: null,
+        bucketEndC: 17,
+        bucketLabel: "<= 17.0C",
+        title: "Will the high temperature in Miami be at most 17C on Mar 28, 2026?",
+        yesTokenId: "yes-under-17",
+        noTokenId: "no-under-17",
+      },
+      {
+        ...args.discoveryCandidates[1],
+        marketId: "market-atleast-16",
+        slug: "market-atleast-16",
+        bucketStartC: 16,
+        bucketLabel: ">= 16.0C",
+        yesTokenId: "yes-atleast-16",
+        noTokenId: "no-atleast-16",
+      },
+    ];
+    args.orderBooks = new Map([
+      ["yes-under-17", createOrderBook("yes-under-17", 0.02)],
+      ["no-under-17", createOrderBook("no-under-17", 0.98)],
+      ["yes-atleast-16", createOrderBook("yes-atleast-16", 0.65)],
+      ["no-atleast-16", createOrderBook("no-atleast-16", 0.35)],
+    ]);
+
+    const result = buildKellyWorkbench(args);
+    const under17 = result.markets.find((market) => market.marketId === "market-under-17");
+    const atleast16 = result.markets.find((market) => market.marketId === "market-atleast-16");
+
+    expect(result.weatherEvidence.observationFloorTemperatureC).toBe(18);
+    expect(result.weatherEvidence.observationFloorSource).toBe("manual");
+    expect(under17).toMatchObject({
+      fairYes: 0,
+      fairNo: 1,
+      recommendedSide: "no",
+    });
+    expect(atleast16).toMatchObject({
+      fairYes: 1,
+      fairNo: 0,
+    });
   });
 
   test("defaults display unit to Celsius when no markets exist", () => {

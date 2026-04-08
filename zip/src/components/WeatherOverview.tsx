@@ -370,7 +370,7 @@ export const WeatherOverview = ({
 
           <p className="mt-4 max-w-4xl text-[15px] leading-7 text-white/82">{summaryText}</p>
 
-          <div className="mt-4 flex flex-wrap gap-3">
+          <div className="mt-4 flex flex-wrap gap-3 [&>*:nth-child(2)]:hidden">
             <ConfidenceCard
               title="当天最高温判断置信度"
               score={predictabilityScore ?? null}

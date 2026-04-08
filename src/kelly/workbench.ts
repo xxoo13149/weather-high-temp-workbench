@@ -14,6 +14,7 @@ import type {
   KellyMethodology,
   KellyShrinkMode,
   KellyMethodologyModel,
+  MetarObservation,
   KellyProbabilityCurvePoint,
   KellyRecommendation,
   KellyRequestOptions,
@@ -311,6 +312,7 @@ const findHourlyItem = (hourly: HourlyWeatherResponse, timestamp: string | undef
 const resolveReferenceTemperature = (
   hourly: HourlyWeatherResponse,
   insight: MultiModelInsightResponse,
+  metarObservation: MetarObservation | null,
   options: KellyRequestOptions,
 ): {
   value: number | null;
@@ -322,6 +324,14 @@ const resolveReferenceTemperature = (
       value: options.actualTemperatureC,
       source: "manual",
       weatherTimestamp: options.selectedHourTimestamp ?? hourly.current?.timestamp ?? null,
+    };
+  }
+
+  if (typeof metarObservation?.temperatureC === "number") {
+    return {
+      value: metarObservation.temperatureC,
+      source: "metar",
+      weatherTimestamp: metarObservation.observedAt,
     };
   }
 
@@ -354,6 +364,46 @@ const resolveReferenceTemperature = (
     value: null,
     source: "model-mean",
     weatherTimestamp: options.selectedHourTimestamp ?? insight.selectedTimestamp,
+  };
+};
+
+const resolveObservationFloor = (
+  hourly: HourlyWeatherResponse,
+  metarObservation: MetarObservation | null,
+  options: KellyRequestOptions,
+): {
+  value: number | null;
+  source: KellyWeatherEvidence["observationFloorSource"];
+  observedAt: string | null;
+} => {
+  if (typeof options.actualTemperatureC === "number" && Number.isFinite(options.actualTemperatureC)) {
+    return {
+      value: options.actualTemperatureC,
+      source: "manual",
+      observedAt: options.selectedHourTimestamp ?? hourly.current?.timestamp ?? null,
+    };
+  }
+
+  if (typeof metarObservation?.temperatureC === "number") {
+    return {
+      value: metarObservation.temperatureC,
+      source: "metar",
+      observedAt: metarObservation.observedAt,
+    };
+  }
+
+  if (typeof hourly.current?.temperatureC === "number") {
+    return {
+      value: hourly.current.temperatureC,
+      source: "hourly-current",
+      observedAt: hourly.current.timestamp,
+    };
+  }
+
+  return {
+    value: null,
+    source: "none",
+    observedAt: null,
   };
 };
 
@@ -542,6 +592,48 @@ const buildProbabilityCurve = (signals: UsableModelSignal[]): KellyProbabilityCu
   });
 };
 
+const buildFloorFallbackCurve = (floorTemperatureC: number): KellyProbabilityCurvePoint[] => {
+  const anchor = round2(Math.floor(floorTemperatureC * 10) / 10);
+  const weights = [7, 2, 1];
+  let cumulative = 0;
+
+  return weights.map((weight, index) => {
+    const density = weight;
+    cumulative = clamp01(cumulative + density * GRID_STEP) ?? 0;
+    return {
+      temperatureC: round2(anchor + index * GRID_STEP),
+      density: round4(density),
+      cumulative: round4(cumulative),
+    };
+  });
+};
+
+const applyObservationFloorToCurve = (
+  curve: KellyProbabilityCurvePoint[],
+  floorTemperatureC: number | null,
+): KellyProbabilityCurvePoint[] => {
+  if (curve.length === 0 || typeof floorTemperatureC !== "number" || !Number.isFinite(floorTemperatureC)) {
+    return curve;
+  }
+
+  const trimmed = curve.filter((point) => point.temperatureC + 1e-9 >= floorTemperatureC);
+  const retainedMass = trimmed.reduce((sum, point) => sum + point.density * GRID_STEP, 0);
+  if (retainedMass <= 1e-6) {
+    return buildFloorFallbackCurve(floorTemperatureC);
+  }
+
+  let cumulative = 0;
+  return trimmed.map((point) => {
+    const normalizedDensity = point.density / retainedMass;
+    cumulative = clamp01(cumulative + normalizedDensity * GRID_STEP) ?? 0;
+    return {
+      temperatureC: point.temperatureC,
+      density: round4(normalizedDensity),
+      cumulative: round4(cumulative),
+    };
+  });
+};
+
 const integrateProbability = (
   curve: KellyProbabilityCurvePoint[],
   lowerBoundC: number | null,
@@ -687,7 +779,35 @@ const computeContractProbability = (
   startC: number | null,
   endC: number | null,
   shrink: number,
+  observationFloorC: number | null = null,
 ): KellyContractProbability => {
+  if (typeof observationFloorC === "number" && Number.isFinite(observationFloorC)) {
+    const floor = observationFloorC;
+
+    if (contractType === "atLeast" && startC !== null && startC <= floor) {
+      return {
+        rawYes: 1,
+        fairYes: 1,
+        rawNo: 0,
+        fairNo: 0,
+      };
+    }
+
+    const impossibleOnYes =
+      (contractType === "atMost" && endC !== null && endC < floor) ||
+      (contractType === "exact" && startC !== null && startC < floor) ||
+      (contractType === "range" && endC !== null && endC < floor);
+
+    if (impossibleOnYes) {
+      return {
+        rawYes: 0,
+        fairYes: 0,
+        rawNo: 1,
+        fairNo: 1,
+      };
+    }
+  }
+
   const raw =
     contractType === "atLeast"
       ? integrateProbability(curve, startC, null)
@@ -751,6 +871,7 @@ const KELLY_FORMULA_NOTES = [
   KELLY_METHODOLOGY_SUMMARIES.shrinkRule,
   KELLY_METHODOLOGY_SUMMARIES.pricingRule,
   KELLY_METHODOLOGY_SUMMARIES.observationRule,
+  "Observed floor rule: if realtime temperature has already reached X, any contract fully below X is forced out on the Yes side.",
 ];
 
 
@@ -952,11 +1073,19 @@ export const buildKellyMarkets = (
   candidates: PolymarketCandidate[],
   curve: KellyProbabilityCurvePoint[],
   shrink: number,
+  observationFloorC: number | null,
 ): KellyMarketRow[] =>
   candidates.map((candidate) => {
     const probability =
       candidate.parseStatus === "matched"
-        ? computeContractProbability(curve, candidate.contractType, candidate.bucketStartC, candidate.bucketEndC, shrink)
+        ? computeContractProbability(
+            curve,
+            candidate.contractType,
+            candidate.bucketStartC,
+            candidate.bucketEndC,
+            shrink,
+            observationFloorC,
+          )
         : {
             rawYes: 0.5,
             fairYes: 0.5,
@@ -1373,6 +1502,7 @@ export const buildKellyWorkbench = ({
   targetDate,
   hourly,
   report,
+  metarObservation,
   insight,
   distribution,
   discoveryCandidates,
@@ -1391,6 +1521,7 @@ export const buildKellyWorkbench = ({
   targetDate: string;
   hourly: HourlyWeatherResponse;
   report: WeatherReportResponse;
+  metarObservation: MetarObservation | null;
   insight: MultiModelInsightResponse;
   distribution: MultiModelDistributionResponse;
   discoveryCandidates: PolymarketCandidate[];
@@ -1410,9 +1541,10 @@ export const buildKellyWorkbench = ({
     options.minEdge && Number.isFinite(options.minEdge) && options.minEdge >= 0 ? clamp(options.minEdge, 0, 1) : DEFAULT_MIN_EDGE;
   const riskMode = options.riskMode ?? DEFAULT_RISK_MODE;
   const availableTargetDates = resolveAvailableTargetDates(distribution.availableTimestamps, location.timezone);
-  const reference = resolveReferenceTemperature(hourly, insight, options);
+  const reference = resolveReferenceTemperature(hourly, insight, metarObservation, options);
+  const observationFloor = resolveObservationFloor(hourly, metarObservation, options);
   const signalBundle = buildUsableSignals(insight, distribution, reference.value);
-  const curve = buildProbabilityCurve(signalBundle.usableSignals);
+  const curve = applyObservationFloorToCurve(buildProbabilityCurve(signalBundle.usableSignals), observationFloor.value);
   const shrinkResult = buildShrink(signalBundle.usableSignals, signalBundle.totalModelCount, hourly.stale || distribution.stale || insight.stale);
   const shrink = shrinkResult.value;
   const distributionSummary = buildDistributionSummary(
@@ -1424,7 +1556,7 @@ export const buildKellyWorkbench = ({
   );
   const baseBuckets = buildBaseBuckets(curve);
   const allCandidates = [...discoveryCandidates, ...inactiveCandidates];
-  const baseMarkets = buildKellyMarkets(allCandidates, curve, shrink);
+  const baseMarkets = buildKellyMarkets(allCandidates, curve, shrink, observationFloor.value);
   const pricedMarkets = applyPricingToMarkets(baseMarkets, orderBooks, {
     bankroll,
     riskMode,
@@ -1510,6 +1642,10 @@ export const buildKellyWorkbench = ({
     currentWeatherTimestamp: reference.weatherTimestamp,
     currentModelTimestamp: insight.selectedTimestamp,
     targetModelTimestamp: distribution.selectedTimestamp,
+    observationFloorTemperatureC: observationFloor.value,
+    observationFloorSource: observationFloor.source,
+    observationFloorObservedAt: observationFloor.observedAt,
+    metarObservation,
     sourceSummaryZh: report.textZh,
     hourlyPageUrl: hourly.pageUrl,
     multimodelPageUrl: distribution.pageUrl,
