@@ -44,9 +44,10 @@ The installer will:
 - Download the repository archive for branch `codex/implement-kelly-bridge-integration`
 - Install dependencies
 - Build `dist/kelly-bridge.js`
-- Open inbound TCP `8080`
-- Register a Windows service named `WeatherKellyBridge`
-- Start the service and verify `/healthz`
+- Keep the bridge listening on loopback `127.0.0.1:8080`
+- Expose a public HTTP entry on TCP `80` that forwards to `127.0.0.1:8080`
+- Register a Windows startup task named `WeatherKellyBridge`
+- Start the task immediately and verify `/healthz`
 
 ## Step 3: Cloudflare Worker Settings
 Worker variables:
@@ -54,7 +55,7 @@ Worker variables:
 - `KELLY_BRIDGE_SHARED_SECRET`
 
 Recommended value:
-- `KELLY_BRIDGE_BASE_URL=https://kelly-bridge.lukaluka.fun`
+- `KELLY_BRIDGE_BASE_URL=http://kelly-bridge.lukaluka.fun`
 
 ## Validation
 - Local server check:
@@ -63,10 +64,18 @@ Recommended value:
 Invoke-RestMethod http://127.0.0.1:8080/healthz
 ```
 
+- Public bridge check:
+
+```powershell
+Invoke-RestMethod http://kelly-bridge.lukaluka.fun/healthz
+```
+
 - Public same-origin check:
   - `https://lukaluka.fun/api/weather/kelly?...`
   - `https://lukaluka.fun/healthz`
 
 ## Notes
-- The bridge remains secret-protected even when the server port is open publicly.
+- The bridge remains secret-protected even when the HTTP entry is open publicly.
+- Keeping Node on `8080` and forwarding `80 -> 8080` avoids the unstable direct-`8080` path that some Tencent Windows setups exhibit.
+- The bridge is launched by Scheduled Tasks, not `sc.exe`, because a plain Node process is not a real Windows Service and is less reliable when registered directly with SCM.
 - The public site should continue to use same-origin `lukaluka.fun` endpoints.

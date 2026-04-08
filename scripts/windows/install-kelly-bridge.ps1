@@ -3,9 +3,10 @@ param(
   [string]$BridgeSharedSecret,
   [string]$Branch = "codex/implement-kelly-bridge-integration",
   [string]$InstallDir = "C:\weather-kelly-bridge",
-  [string]$ServiceName = "WeatherKellyBridge",
+  [string]$TaskName = "WeatherKellyBridge",
   [int]$Port = 8080,
-  [string]$Host = "0.0.0.0",
+  [int]$PublicPort = 80,
+  [string]$Host = "127.0.0.1",
   [string]$NodeVersion = "22.22.1",
   [int]$HttpTimeoutMs = 12000
 )
@@ -159,14 +160,15 @@ function Configure-MachineEnvironment {
 function Ensure-FirewallRule {
   param(
     [Parameter(Mandatory = $true)]
-    [int]$ListenPort
+    [int]$ListenPort,
+    [string]$RuleName = ("KellyBridge-{0}" -f $ListenPort),
+    [string]$DisplayName = ("Kelly Bridge TCP {0}" -f $ListenPort)
   )
 
-  $ruleName = "KellyBridge-{0}" -f $ListenPort
-  if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
+  if (-not (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule `
-      -Name $ruleName `
-      -DisplayName ("Kelly Bridge TCP {0}" -f $ListenPort) `
+      -Name $RuleName `
+      -DisplayName $DisplayName `
       -Direction Inbound `
       -Action Allow `
       -Protocol TCP `
@@ -174,32 +176,86 @@ function Ensure-FirewallRule {
   }
 }
 
-function Reset-Service {
+function Ensure-PublicPortProxy {
+  param(
+    [Parameter(Mandatory = $true)]
+    [int]$ListenPort,
+    [Parameter(Mandatory = $true)]
+    [int]$TargetPort,
+    [string]$ListenAddress = "0.0.0.0",
+    [string]$TargetAddress = "127.0.0.1"
+  )
+
+  Set-Service -Name iphlpsvc -StartupType Automatic
+  if ((Get-Service -Name iphlpsvc).Status -ne "Running") {
+    Start-Service -Name iphlpsvc
+  }
+
+  & netsh interface portproxy delete v4tov4 listenport=$ListenPort listenaddress=$ListenAddress | Out-Null
+  & netsh interface portproxy add v4tov4 listenport=$ListenPort listenaddress=$ListenAddress connectport=$TargetPort connectaddress=$TargetAddress | Out-Null
+}
+
+function Reset-StartupTask {
   param(
     [Parameter(Mandatory = $true)]
     [string]$Name,
     [Parameter(Mandatory = $true)]
     [string]$NodeExePath,
     [Parameter(Mandatory = $true)]
+    [string]$EntryPath,
+    [Parameter(Mandatory = $true)]
+    [string]$WorkingDirectory,
+    [Parameter(Mandatory = $true)]
+    [string]$SharedSecretValue,
+    [Parameter(Mandatory = $true)]
+    [string]$BindHost,
+    [Parameter(Mandatory = $true)]
+    [int]$BindPort,
+    [Parameter(Mandatory = $true)]
+    [int]$TimeoutMs
+  )
+
+  $existing = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+  if ($existing) {
+    Unregister-ScheduledTask -TaskName $Name -Confirm:$false
+  }
+
+  $outLog = Join-Path $WorkingDirectory "bridge-task.out.log"
+  $errLog = Join-Path $WorkingDirectory "bridge-task.err.log"
+  $quotedNode = '"' + $NodeExePath + '"'
+  $quotedEntry = '"' + $EntryPath + '"'
+  $cmdLine = (
+    '/c set HOST={0}&& set PORT={1}&& set HTTP_TIMEOUT_MS={2}&& set KELLY_BRIDGE_SHARED_SECRET={3}&& {4} {5} 1>>"{6}" 2>>"{7}"' -f
+      $BindHost,
+      $BindPort,
+      $TimeoutMs,
+      $SharedSecretValue,
+      $quotedNode,
+      $quotedEntry,
+      $outLog,
+      $errLog
+  )
+
+  $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $cmdLine -WorkingDirectory $WorkingDirectory
+  $trigger = New-ScheduledTaskTrigger -AtStartup
+  Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+}
+
+function Start-StartupTask {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Name,
+    [Parameter(Mandatory = $true)]
     [string]$EntryPath
   )
 
-  $existing = Get-Service -Name $Name -ErrorAction SilentlyContinue
-  if ($existing) {
-    if ($existing.Status -ne "Stopped") {
-      Stop-Service -Name $Name -Force
-    }
-
-    & sc.exe delete $Name | Out-Null
-    Start-Sleep -Seconds 2
+  $orphanedCmd = Get-CimInstance Win32_Process |
+    Where-Object { $_.CommandLine -and $_.CommandLine.Contains($EntryPath) }
+  foreach ($process in $orphanedCmd) {
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
   }
 
-  $quotedNode = '"' + $NodeExePath + '"'
-  $quotedEntry = '"' + $EntryPath + '"'
-  $binPath = "$quotedNode $quotedEntry"
-
-  & sc.exe create $Name binPath= $binPath start= auto obj= "LocalSystem" | Out-Null
-  & sc.exe description $Name "Kelly bridge service for lukaluka.fun" | Out-Null
+  Start-ScheduledTask -TaskName $Name
 }
 
 function Wait-For-Health {
@@ -241,21 +297,35 @@ Configure-MachineEnvironment `
   -BindPort $Port `
   -TimeoutMs $HttpTimeoutMs
 
-Ensure-FirewallRule -ListenPort $Port
+if ($PublicPort -gt 0 -and $PublicPort -ne $Port) {
+  Ensure-PublicPortProxy -ListenPort $PublicPort -TargetPort $Port
+  Ensure-FirewallRule -ListenPort $PublicPort -RuleName ("KellyBridge-{0}" -f $PublicPort) -DisplayName ("Kelly Bridge TCP {0}" -f $PublicPort)
+}
 
 $entryPath = Join-Path $appRoot "dist\kelly-bridge.js"
 if (-not (Test-Path $entryPath)) {
   throw "Bridge entry file was not built successfully: $entryPath"
 }
 
-Reset-Service -Name $ServiceName -NodeExePath $nodeExe -EntryPath $entryPath
-Start-Service -Name $ServiceName
+Reset-StartupTask `
+  -Name $TaskName `
+  -NodeExePath $nodeExe `
+  -EntryPath $entryPath `
+  -WorkingDirectory $appRoot `
+  -SharedSecretValue $BridgeSharedSecret `
+  -BindHost $Host `
+  -BindPort $Port `
+  -TimeoutMs $HttpTimeoutMs
+Start-StartupTask -Name $TaskName -EntryPath $entryPath
 
 $health = Wait-For-Health -Url ("http://127.0.0.1:{0}/healthz" -f $Port)
 
 Write-Host ""
 Write-Host "Kelly bridge deployed successfully."
-Write-Host ("Service    : {0}" -f $ServiceName)
+Write-Host ("Task       : {0}" -f $TaskName)
 Write-Host ("InstallDir : {0}" -f $InstallDir)
 Write-Host ("Health URL : http://127.0.0.1:{0}/healthz" -f $Port)
+if ($PublicPort -gt 0 -and $PublicPort -ne $Port) {
+  Write-Host ("Public URL : http://<server-host>/healthz (forwarded from {0} -> {1})" -f $PublicPort, $Port)
+}
 Write-Host ("Build ID   : {0}" -f $health.buildId)
