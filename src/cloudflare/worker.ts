@@ -8,6 +8,7 @@ import type {
   LocationDirectoryEntry,
   LocationInfo,
 } from "../domain/weather.js";
+import { KELLY_BRIDGE_SHARED_SECRET_HEADER } from "../kelly/bridge-contract.js";
 import { MeteoblueWeatherService } from "../providers/meteoblue/service.js";
 import { CloudflareFavoritesStore, InMemoryFavoritesStore } from "./favorites-store.js";
 
@@ -22,6 +23,7 @@ type WorkerEnv = {
     put(key: string, value: string): Promise<void>;
   };
   KELLY_BRIDGE_BASE_URL?: string;
+  KELLY_BRIDGE_SHARED_SECRET?: string;
 };
 
 type WorkerContext = {
@@ -260,6 +262,10 @@ const buildKellyBridgeRequest = (request: Request, env: WorkerEnv): Request | nu
   const headers = new Headers(request.headers);
   headers.set("x-forwarded-host", incomingUrl.host);
   headers.set("x-forwarded-proto", incomingUrl.protocol.replace(":", ""));
+  const sharedSecret = env.KELLY_BRIDGE_SHARED_SECRET?.trim();
+  if (sharedSecret) {
+    headers.set(KELLY_BRIDGE_SHARED_SECRET_HEADER, sharedSecret);
+  }
 
   return new Request(`${bridgeBaseUrl}${incomingUrl.pathname}${incomingUrl.search}`, {
     method: request.method,

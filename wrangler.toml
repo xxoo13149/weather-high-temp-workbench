@@ -12,6 +12,8 @@ not_found_handling = "single-page-application"
 [vars]
 HOST = "0.0.0.0"
 PORT = "8787"
+# Set KELLY_BRIDGE_BASE_URL per environment after the Cloud Run bridge is deployed.
+# Store KELLY_BRIDGE_SHARED_SECRET with `wrangler secret put KELLY_BRIDGE_SHARED_SECRET`.
 
 [[routes]]
 pattern = "lukaluka.fun"

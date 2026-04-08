@@ -187,6 +187,7 @@ export const config = {
   polymarketClobBaseUrl: process.env.POLYMARKET_CLOB_BASE_URL ?? "https://clob.polymarket.com",
   polymarketClobWsUrl:
     process.env.POLYMARKET_CLOB_WS_URL ?? "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+  kellyBridgeSharedSecret: process.env.KELLY_BRIDGE_SHARED_SECRET?.trim() ?? "",
   userAgent:
     process.env.USER_AGENT ??
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) weather-relay/0.2",
