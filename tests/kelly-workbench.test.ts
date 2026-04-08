@@ -828,6 +828,55 @@ describe("buildKellyWorkbench", () => {
     }
   });
 
+  test("prefers the observed intraday METAR high when it is warmer than the latest METAR and hourly readings", () => {
+    const args = createBuildArgs();
+    args.options.actualTemperatureC = undefined;
+    args.hourly.items = [
+      {
+        ...args.hourly.items[0],
+        timestamp: "2026-03-28T16:00:00-04:00",
+        temperatureC: 15,
+      },
+    ];
+    args.hourly.current = {
+      timestamp: "2026-03-28T16:00:00-04:00",
+      temperatureC: 15,
+      index: 0,
+    };
+    args.metarObservation = {
+      location: { id: location.id, name: location.name, timezone: location.timezone },
+      stationId: "KMIA",
+      observedAt: "2026-03-28T16:00:00-04:00",
+      temperatureC: 15,
+      dewpointC: 12,
+      windDirectionDegrees: 130,
+      windSpeedKts: 11,
+      rawReport: "METAR KMIA latest",
+      stationName: "Miami Intl",
+      sourceUrl: "https://aviationweather.gov/api/data/metar?format=json&ids=KMIA&hours=24",
+      fetchedAt: "2026-03-28T20:00:00.000Z",
+      stale: false,
+      cacheHit: true,
+    };
+
+    const floor = resolveObservationFloor(args.hourly, args.metarObservation, args.options, {
+      targetDate: "2026-03-28",
+      timeZone: location.timezone,
+      now: new Date("2026-03-28T16:30:00-04:00"),
+      observedMetarHigh: {
+        value: 18,
+        source: "metar",
+        observedAt: "2026-03-28T14:00:00-04:00",
+      },
+    });
+
+    expect(floor).toEqual({
+      value: 18,
+      source: "metar",
+      observedAt: "2026-03-28T14:00:00-04:00",
+    });
+  });
+
   test("does not apply today's observation floor to future target dates", () => {
     const args = createBuildArgs({
       frameSeries: [],

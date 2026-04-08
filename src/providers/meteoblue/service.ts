@@ -36,7 +36,7 @@ import {
 import { RefreshableCache } from "../../lib/cache.js";
 import { FavoritesStore, type FavoritesStoreLike } from "../../lib/favorites-store.js";
 import { fetchBinary, fetchText } from "../../lib/http.js";
-import { fetchLatestMetarObservation } from "../metar/service.js";
+import { fetchMetarSnapshot, type MetarTemperatureSample } from "../metar/service.js";
 import { resolveLocation } from "./location-registry.js";
 import { extractWeekMeteogramHighchartsUrl, parseWeekMeteogramHighcharts } from "./meteogram.js";
 import {
@@ -85,9 +85,41 @@ interface ImageCacheValue {
 
 interface MetarCacheValue {
   observation: Omit<MetarObservation, "stale" | "cacheHit"> | null;
+  recentTemperatures: MetarTemperatureSample[];
 }
 
 const buildKellyCacheKey = (locationId: LocationInfo["id"], targetDate: string) => `${locationId}::${targetDate}`;
+
+const resolveMetarObservedHighFloor = (
+  recentTemperatures: MetarTemperatureSample[],
+  targetDate: string,
+  timeZone: string,
+) => {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+
+  const sameDaySamples = recentTemperatures.filter((sample) => formatter.format(new Date(sample.observedAt)) === targetDate);
+  if (sameDaySamples.length === 0) {
+    return null;
+  }
+
+  const best = [...sameDaySamples].sort(
+    (left, right) => right.temperatureC - left.temperatureC || right.observedAt.localeCompare(left.observedAt),
+  )[0];
+  if (!best) {
+    return null;
+  }
+
+  return {
+    value: best.temperatureC,
+    source: "metar" as const,
+    observedAt: best.observedAt,
+  };
+};
 const resolveKellyDistributionTimestamp = (availableTimestamps: string[], targetDate: string): string | null => {
   const matching = availableTimestamps.filter((timestamp) => timestamp.slice(0, 10) === targetDate);
   if (matching.length === 0) {
@@ -447,11 +479,11 @@ export class MeteoblueWeatherService implements WeatherService {
 
     const location = this.requireLocation(locationId);
     const cache = new RefreshableCache<MetarCacheValue>(60_000, async () => ({
-      observation: await fetchLatestMetarObservation({
+      ...(await fetchMetarSnapshot({
         id: location.id,
         name: location.name,
         timezone: location.timezone,
-      }),
+      })),
     }));
 
     this.metarCaches.set(locationId, cache);
@@ -505,15 +537,18 @@ export class MeteoblueWeatherService implements WeatherService {
     targetDate: string,
     hourly: HourlyWeatherResponse,
     metarObservation: MetarObservation | null,
+    recentMetarTemperatures: MetarTemperatureSample[],
     options: KellyRequestOptions,
   ) {
     const today = resolveKellyTargetDate(location.timezone);
     const cacheKey = buildKellyCacheKey(location.id, targetDate);
     const rememberedFloor = targetDate === today ? this.kellyObservationFloors.get(cacheKey) ?? null : null;
+    const observedMetarHigh = resolveMetarObservedHighFloor(recentMetarTemperatures, targetDate, location.timezone);
     const floor = resolveObservationFloor(hourly, metarObservation, options, {
       targetDate,
       timeZone: location.timezone,
       rememberedFloor,
+      observedMetarHigh,
     });
 
     if (targetDate === today && typeof floor.value === "number" && Number.isFinite(floor.value)) {
@@ -943,6 +978,7 @@ export class MeteoblueWeatherService implements WeatherService {
       targetDate,
       hourly,
       metarObservation,
+      metarResult.value.recentTemperatures,
       options,
     );
 

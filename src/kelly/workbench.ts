@@ -334,6 +334,7 @@ type KellyObservationFloorContext = {
   timeZone?: string;
   now?: Date;
   rememberedFloor?: KellyObservationFloor | null;
+  observedMetarHigh?: KellyObservationFloor | null;
 };
 
 const pickWarmestObservedCandidate = <Source extends string>(
@@ -523,6 +524,15 @@ export const resolveObservationFloor = (
   );
   if (observedHourlyHigh) {
     candidates.push(observedHourlyHigh);
+  }
+
+  if (typeof context.observedMetarHigh?.value === "number" && Number.isFinite(context.observedMetarHigh.value)) {
+    candidates.push({
+      value: context.observedMetarHigh.value,
+      source: context.observedMetarHigh.source,
+      observedAt: context.observedMetarHigh.observedAt,
+      priority: 2,
+    });
   }
 
   if (typeof context.rememberedFloor?.value === "number" && Number.isFinite(context.rememberedFloor.value)) {
