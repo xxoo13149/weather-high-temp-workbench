@@ -13,7 +13,8 @@ not_found_handling = "single-page-application"
 HOST = "0.0.0.0"
 PORT = "8787"
 # Production Kelly bridge stays behind the same user-facing domain via Worker proxy.
-KELLY_BRIDGE_BASE_URL = "http://kelly-bridge.lukaluka.fun"
+KELLY_BRIDGE_BASE_URL = ""
+KELLY_BRIDGE_LOCAL_FALLBACK = "true"
 # Store KELLY_BRIDGE_SHARED_SECRET with `wrangler secret put KELLY_BRIDGE_SHARED_SECRET`.
 
 [[routes]]

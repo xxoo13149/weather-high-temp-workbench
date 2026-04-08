@@ -24,6 +24,7 @@ type WorkerEnv = {
   };
   KELLY_BRIDGE_BASE_URL?: string;
   KELLY_BRIDGE_SHARED_SECRET?: string;
+  KELLY_BRIDGE_LOCAL_FALLBACK?: string;
 };
 
 type WorkerContext = {
@@ -465,14 +466,32 @@ const sendSocketMessage = (socket: CloudflareWebSocket, message: KellyStreamMess
   }
 };
 
+const isKellyBridgeLocalFallbackEnabled = (env: WorkerEnv) => env.KELLY_BRIDGE_LOCAL_FALLBACK === "true";
+
+const shouldFallbackToLocalKelly = (error: unknown, env: WorkerEnv) =>
+  isKellyBridgeLocalFallbackEnabled(env) &&
+  isAppError(error) &&
+  (
+    error.code === "KELLY_BRIDGE_TIMEOUT" ||
+    error.code === "KELLY_BRIDGE_UNAVAILABLE" ||
+    error.code === "KELLY_BRIDGE_BAD_RESPONSE" ||
+    error.code === "KELLY_BRIDGE_COOLDOWN"
+  );
+
 const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerContext) => {
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
     return new Response("Expected Upgrade: websocket", { status: 426 });
   }
 
-  const bridgedResponse = await proxyKellyRequest(request, env, { expectWebSocket: true });
-  if (bridgedResponse) {
-    return bridgedResponse;
+  try {
+    const bridgedResponse = await proxyKellyRequest(request, env, { expectWebSocket: true });
+    if (bridgedResponse) {
+      return bridgedResponse;
+    }
+  } catch (error) {
+    if (!shouldFallbackToLocalKelly(error, env)) {
+      throw error;
+    }
   }
 
   const pair = new ((globalThis as unknown as { WebSocketPair: WebSocketPairCtor }).WebSocketPair)();
@@ -563,9 +582,15 @@ const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Respo
   }
 
   if (request.method === "GET" && url.pathname === "/api/weather/kelly") {
-    const bridgedResponse = await proxyKellyRequest(request, env);
-    if (bridgedResponse) {
-      return bridgedResponse;
+    try {
+      const bridgedResponse = await proxyKellyRequest(request, env);
+      if (bridgedResponse) {
+        return bridgedResponse;
+      }
+    } catch (error) {
+      if (!shouldFallbackToLocalKelly(error, env)) {
+        throw error;
+      }
     }
   }
 
