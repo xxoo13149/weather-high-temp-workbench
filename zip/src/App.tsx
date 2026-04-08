@@ -91,7 +91,7 @@ type ParsedKellyDraftControls = {
 const KELLY_DEFAULT_BANKROLL = 1000;
 const KELLY_DEFAULT_MIN_EDGE = 0.02;
 const SILENT_REFRESH_STALE_MS = 10 * 60 * 1000;
-const LOCATION_PREWARM_DELAY_MS = 300;
+const LOCATION_PREWARM_DELAY_MS = 1_000;
 const KELLY_DATE_WARM_DELAY_MS = 1_200;
 
 const parseNumber = (value: string | null) => {
@@ -381,7 +381,7 @@ const buildWarmLocationTargets = (path: AppPath, tab: AnalysisWorkspaceState["ta
 
   if (path === "/analysis") {
     return {
-      home: true,
+      home: false,
       analysis: tab === "image",
       kelly: false,
       image: false,
@@ -390,7 +390,7 @@ const buildWarmLocationTargets = (path: AppPath, tab: AnalysisWorkspaceState["ta
 
   return {
     home: false,
-    analysis: true,
+    analysis: false,
     kelly: false,
     image: false,
   };
@@ -984,6 +984,11 @@ export default function App() {
 
   const transitionToLocation = async (locationId: string, historyMode: "replace" | "push" = "push") => {
     if (locationId === routeState.locationId && dashboard?.hourly.location.id === locationId) {
+      setRailExpanded(false);
+      return;
+    }
+
+    if (locationTransitionState.pendingLocationId === locationId) {
       setRailExpanded(false);
       return;
     }
@@ -1669,6 +1674,10 @@ export default function App() {
       return;
     }
 
+    if (loadingDashboard || locationTransitionState.stage !== "idle") {
+      return;
+    }
+
     let cancelled = false;
     const controller = new AbortController();
     const visibleGroup = browsingTimezoneGroup ?? activeTimezoneGroup;
@@ -1727,7 +1736,13 @@ export default function App() {
       cancelled = true;
       controller.abort();
     };
-  }, [activeTimezoneGroup, browsingTimezoneGroup, dashboard?.locationDirectory]);
+  }, [
+    activeTimezoneGroup,
+    browsingTimezoneGroup,
+    dashboard?.locationDirectory,
+    loadingDashboard,
+    locationTransitionState.stage,
+  ]);
 
   useEffect(() => {
     const dashboardAligned = dashboard?.hourly.location.id === routeState.locationId;
