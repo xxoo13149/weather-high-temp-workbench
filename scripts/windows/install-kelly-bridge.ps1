@@ -290,6 +290,7 @@ $runtimeRoot = Join-Path $InstallDir "runtime"
 $runtimeDir = Ensure-NodeRuntime -Version $NodeVersion -RuntimeRoot $runtimeRoot
 $nodeExe = Join-Path $runtimeDir "node.exe"
 $corepackCmd = Join-Path $runtimeDir "corepack.cmd"
+$env:PATH = "{0};{1}" -f $runtimeDir, $env:PATH
 
 $appRoot = Expand-Repository -BranchName $Branch -DestinationRoot $InstallDir
 
