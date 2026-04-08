@@ -6,7 +6,7 @@ param(
   [string]$TaskName = "WeatherKellyBridge",
   [int]$Port = 8080,
   [int]$PublicPort = 80,
-  [string]$Host = "127.0.0.1",
+  [string]$BindHost = "127.0.0.1",
   [string]$NodeVersion = "22.22.1",
   [int]$HttpTimeoutMs = 12000,
   [int]$NodeMaxOldSpaceSizeMb = 256
@@ -298,7 +298,7 @@ Invoke-Cli -FilePath $corepackCmd -Arguments @("pnpm", "run", "build:server") -W
 
 Configure-MachineEnvironment `
   -SharedSecretValue $BridgeSharedSecret `
-  -BindHost $Host `
+  -BindHost $BindHost `
   -BindPort $Port `
   -TimeoutMs $HttpTimeoutMs
 
@@ -318,7 +318,7 @@ Reset-StartupTask `
   -EntryPath $entryPath `
   -WorkingDirectory $appRoot `
   -SharedSecretValue $BridgeSharedSecret `
-  -BindHost $Host `
+  -BindHost $BindHost `
   -BindPort $Port `
   -TimeoutMs $HttpTimeoutMs `
   -MaxOldSpaceSizeMb $NodeMaxOldSpaceSizeMb
