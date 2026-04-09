@@ -41,10 +41,11 @@ type CloudflareWebSocket = WebSocket & {
   close(code?: number, reason?: string): void;
 };
 
-const buildId = process.env.BUILD_ID ?? `worker-${Date.now().toString(36)}`;
-const startedAt = new Date().toISOString();
 const KELLY_BRIDGE_TIMEOUT_MS = 12_000;
 const KELLY_BRIDGE_COOLDOWN_MS = 30_000;
+
+let runtimeBuildId: string | null = null;
+let runtimeStartedAt: string | null = null;
 
 type KellyBridgeProxyState = {
   consecutiveFailures: number;
@@ -63,6 +64,30 @@ let kellyBridgeProxyState: KellyBridgeProxyState = {
   lastFailureCode: null,
   lastFailureMessage: null,
   lastSuccessAt: null,
+};
+
+const ensureRuntimeMetadata = () => {
+  const rawBuildId =
+    typeof process !== "undefined" && process.env && typeof process.env.BUILD_ID === "string"
+      ? process.env.BUILD_ID.trim()
+      : "";
+
+  if (!runtimeBuildId) {
+    const generatedBuildId =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? `worker-${crypto.randomUUID()}`
+        : `worker-${Math.random().toString(36).slice(2, 10)}`;
+    runtimeBuildId = rawBuildId || generatedBuildId;
+  }
+
+  if (!runtimeStartedAt) {
+    runtimeStartedAt = new Date().toISOString();
+  }
+
+  return {
+    buildId: runtimeBuildId,
+    startedAt: runtimeStartedAt,
+  };
 };
 
 const getService = async (env: WorkerEnv) => {
@@ -563,13 +588,14 @@ const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerCo
 
 const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Response> => {
   const url = new URL(request.url);
+  const runtimeMetadata = ensureRuntimeMetadata();
 
   if (request.method === "GET" && url.pathname === "/healthz") {
     return jsonResponse({
       ok: true,
       service: "weather-worker",
-      buildId,
-      startedAt,
+      buildId: runtimeMetadata.buildId,
+      startedAt: runtimeMetadata.startedAt,
       kellyBridge: {
         configured: Boolean(resolveKellyBridgeBaseUrl(env)),
         baseUrl: resolveKellyBridgeBaseUrl(env),
@@ -728,6 +754,7 @@ const isApiRequest = (pathname: string) => pathname === "/healthz" || pathname.s
 export default {
   async fetch(request: Request, env: WorkerEnv, ctx: WorkerContext): Promise<Response> {
     const url = new URL(request.url);
+    ensureRuntimeMetadata();
 
     try {
       if (url.pathname === "/api/weather/kelly/stream") {
