@@ -7,6 +7,8 @@ import type {
   KellyWorkbenchResponse,
 } from "./types";
 
+const KELLY_FRAME_WINDOW_MS = 60 * 60 * 1000;
+
 const isTradableKellyRow = (market: KellyMarketRow) =>
   market.parseStatus === "matched" &&
   market.lifecycle === "tradable" &&
@@ -128,6 +130,34 @@ export const mergeKellyStreamPatches = (
   const patched = combined.map((market) => applyKellyPatch(market, patchMap.get(market.marketId)));
   const markets = patched.filter(isTradableKellyRow);
   const inactiveMarkets = patched.filter((market) => !isTradableKellyRow(market));
+  const mergedFrames = (() => {
+    if (!frames?.length) {
+      return snapshot.frameSeries;
+    }
+
+    const merged = new Map<string, KellyFramePoint>();
+    for (const frame of snapshot.frameSeries) {
+      merged.set(frame.id, frame);
+    }
+    for (const frame of frames) {
+      merged.set(frame.id, frame);
+    }
+
+    const latestCandidates = [
+      ...snapshot.frameSeries.map((frame) => Date.parse(frame.generatedAt)),
+      ...frames.map((frame) => Date.parse(frame.generatedAt)),
+      Date.parse(snapshot.generatedAt),
+    ].filter((value) => Number.isFinite(value));
+    const latestTimestamp = latestCandidates.length ? Math.max(...latestCandidates) : Date.now();
+    const cutoffMs = latestTimestamp - KELLY_FRAME_WINDOW_MS;
+
+    return [...merged.values()]
+      .filter((frame) => {
+        const frameTime = Date.parse(frame.generatedAt);
+        return Number.isNaN(frameTime) || frameTime >= cutoffMs;
+      })
+      .sort((left, right) => left.generatedAt.localeCompare(right.generatedAt));
+  })();
 
   return {
     ...snapshot,
@@ -135,7 +165,7 @@ export const mergeKellyStreamPatches = (
     minEdge,
     markets,
     inactiveMarkets,
-    frameSeries: frames ?? snapshot.frameSeries,
+    frameSeries: mergedFrames,
     recommendations: deriveKellyRecommendations(markets, minEdge),
     bestObservation: deriveKellyBestObservation(markets),
   };

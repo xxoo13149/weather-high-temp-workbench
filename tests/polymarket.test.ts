@@ -445,6 +445,53 @@ describe("PolymarketClient", () => {
     );
   });
 
+  test("reconnects after an unexpected websocket close", async () => {
+    vi.useFakeTimers();
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+    const messages: unknown[] = [];
+
+    const handle = client.createMarketStream(
+      ["token-1"],
+      (message) => {
+        messages.push(message);
+      },
+      () => {},
+    );
+
+    const firstSocket = wsInstances.at(-1);
+    expect(firstSocket).toBeDefined();
+
+    firstSocket?.emit("open");
+    firstSocket?.emit("close");
+
+    expect(messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "status",
+          reasonCode: "polling_fallback",
+        }),
+      ]),
+    );
+
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(wsInstances).toHaveLength(2);
+
+    const secondSocket = wsInstances.at(-1);
+    secondSocket?.emit("open");
+    expect(messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "status",
+          state: "connected",
+          reasonCode: "ws_connected",
+        }),
+      ]),
+    );
+
+    handle.close();
+  });
+
   test("parses 16C titles without producing negative buckets", async () => {
     fetchJsonMock.mockResolvedValue([
       {

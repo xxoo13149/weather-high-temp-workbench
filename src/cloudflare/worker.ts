@@ -43,7 +43,7 @@ type CloudflareWebSocket = WebSocket & {
 
 const buildId = process.env.BUILD_ID ?? `worker-${Date.now().toString(36)}`;
 const startedAt = new Date().toISOString();
-const KELLY_BRIDGE_TIMEOUT_MS = 8_000;
+const KELLY_BRIDGE_TIMEOUT_MS = 12_000;
 const KELLY_BRIDGE_COOLDOWN_MS = 30_000;
 
 type KellyBridgeProxyState = {
@@ -336,6 +336,12 @@ const buildKellyBridgeRequest = (request: Request, env: WorkerEnv): Request | nu
 
   const incomingUrl = new URL(request.url);
   const headers = new Headers(request.headers);
+  headers.delete("host");
+  headers.delete("cf-connecting-ip");
+  headers.delete("cf-ipcountry");
+  headers.delete("cf-ray");
+  headers.delete("x-forwarded-host");
+  headers.delete("x-forwarded-proto");
   headers.set("x-forwarded-host", incomingUrl.host);
   headers.set("x-forwarded-proto", incomingUrl.protocol.replace(":", ""));
   const sharedSecret = env.KELLY_BRIDGE_SHARED_SECRET?.trim();

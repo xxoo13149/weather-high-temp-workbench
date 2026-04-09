@@ -57,6 +57,9 @@ import {
   WEEK_PARSER_VERSION,
 } from "./week.js";
 
+const KELLY_STREAM_CLIENT_KEEPALIVE_MS = 20_000;
+const KELLY_STREAM_POLLING_INTERVAL_MS = 30_000;
+
 interface WeekCacheValue {
   fetchedAt: string;
   sourceObservedAt: string | null;
@@ -385,6 +388,15 @@ export class MeteoblueWeatherService implements WeatherService {
   private readonly allowedLocationIds: Set<LocationInfo["id"]>;
   private readonly polymarketClient: PolymarketClient;
   private readonly kellySnapshotInFlight = new Map<string, Promise<KellyWorkbenchResponse>>();
+  private readonly kellyStreamRepriceInFlight = new Map<
+    string,
+    Promise<{
+      books: Map<string, NormalizedOrderBook>;
+      framePoints: KellyFramePoint[];
+      generatedAt: string;
+      repricedMarkets: KellyWorkbenchResponse["markets"];
+    }>
+  >();
   private readonly kellyBridgeHealth: KellyBridgeHealth = {
     lastSnapshotSuccessAt: null,
     lastSnapshotErrorAt: null,
@@ -685,6 +697,72 @@ export class MeteoblueWeatherService implements WeatherService {
 
     this.kellyFrameHistories.set(key, history);
     return history;
+  }
+
+  private async repriceKellyStreamSnapshot({
+    locationId,
+    targetDate,
+    options,
+    matchedMarkets,
+    trackedMarkets,
+    bankroll,
+    riskMode,
+    minEdge,
+  }: {
+    locationId: LocationInfo["id"];
+    targetDate: string;
+    options: KellyRequestOptions;
+    matchedMarkets: Array<
+      KellyWorkbenchResponse["markets"][number] & {
+        yesTokenId: string;
+        noTokenId: string;
+      }
+    >;
+    trackedMarkets: KellyWorkbenchResponse["markets"];
+    bankroll: number;
+    riskMode: KellyWorkbenchResponse["riskMode"];
+    minEdge: number;
+  }) {
+    const streamKey = buildKellySnapshotRequestKey(locationId, targetDate, {
+      ...options,
+      bankroll,
+      riskMode,
+      minEdge,
+    });
+    const existing = this.kellyStreamRepriceInFlight.get(streamKey);
+    if (existing) {
+      return await existing;
+    }
+
+    const task = (async () => {
+      const books = await this.polymarketClient.fetchOrderBooks(
+        matchedMarkets.flatMap((market) => [market.yesTokenId, market.noTokenId]),
+      );
+      const generatedAt = new Date().toISOString();
+      const repricedMarkets = applyPricingToMarkets(trackedMarkets, books, {
+        bankroll,
+        riskMode,
+        minEdge,
+      });
+      const framePoints = buildReadableFramePoints(repricedMarkets, generatedAt);
+      this.rememberKellyFrameHistory(locationId, targetDate, framePoints, generatedAt);
+      return {
+        books,
+        framePoints,
+        generatedAt,
+        repricedMarkets,
+      };
+    })();
+
+    this.kellyStreamRepriceInFlight.set(streamKey, task);
+
+    try {
+      return await task;
+    } finally {
+      if (this.kellyStreamRepriceInFlight.get(streamKey) === task) {
+        this.kellyStreamRepriceInFlight.delete(streamKey);
+      }
+    }
   }
 
   async getHourly(locationId: LocationInfo["id"], mode: HourlyMode, limit?: number): Promise<HourlyWeatherResponse> {
@@ -1215,7 +1293,12 @@ export class MeteoblueWeatherService implements WeatherService {
       (market) => market.lifecycle === "tradable" && market.parseStatus === "matched",
     );
     const matchedMarkets = trackedMarkets.filter(
-      (market) => market.yesTokenId && market.noTokenId,
+      (
+        market,
+      ): market is KellyWorkbenchResponse["markets"][number] & {
+        yesTokenId: string;
+        noTokenId: string;
+      } => Boolean(market.yesTokenId && market.noTokenId),
     );
 
     if (!matchedMarkets.length) {
@@ -1238,27 +1321,34 @@ export class MeteoblueWeatherService implements WeatherService {
     let pendingTimer: NodeJS.Timeout | null = null;
     let lastTriggeredAt: string | null = null;
     let fallbackTimer: NodeJS.Timeout | null = null;
+    let keepaliveTimer: NodeJS.Timeout | null = null;
     let lastRepricedAt: string | null = null;
+    let lastClientMessageAt = Date.now();
     this.kellyBridgeHealth.openStreamCount += 1;
     this.kellyBridgeHealth.fallbackMode = false;
 
     async function emitSnapshot(): Promise<string | null> {
       try {
-        const books = await service.polymarketClient.fetchOrderBooks(
-          matchedMarkets.flatMap((market) => [market.yesTokenId!, market.noTokenId!]),
-        );
-        const generatedAt = new Date().toISOString();
-        const repriced = applyPricingToMarkets(trackedMarkets, books, {
+        const {
+          books,
+          framePoints,
+          generatedAt,
+          repricedMarkets,
+        } = await service.repriceKellyStreamSnapshot({
+          locationId,
+          targetDate,
+          options: {
+            ...options,
+            bankroll: snapshot.bankroll,
+            riskMode: snapshot.riskMode,
+            minEdge: snapshot.minEdge,
+          },
+          matchedMarkets,
+          trackedMarkets,
           bankroll: snapshot.bankroll,
           riskMode: snapshot.riskMode,
           minEdge: snapshot.minEdge,
         });
-        const frames = service.rememberKellyFrameHistory(
-          locationId,
-          targetDate,
-          buildReadableFramePoints(repriced, generatedAt),
-          generatedAt,
-        );
         service.recordKellyStreamEvent(generatedAt, false);
         service.kellyBridgeHealth.lastOrderbookAt =
           [...books.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]?.updatedAt ??
@@ -1268,8 +1358,8 @@ export class MeteoblueWeatherService implements WeatherService {
         sendStreamMessage({
           type: "markets",
           generatedAt,
-          markets: buildStreamMarketPatches(repriced),
-          frames,
+          markets: buildStreamMarketPatches(repricedMarkets),
+          frames: framePoints,
           lastSignalAt: lastTriggeredAt,
           lastRepricedAt: generatedAt,
         });
@@ -1324,7 +1414,7 @@ export class MeteoblueWeatherService implements WeatherService {
             lastRepricedAt: repricedAt,
           });
         }
-      }, 30_000);
+      }, KELLY_STREAM_POLLING_INTERVAL_MS);
     }
 
     function stopPollingFallback() {
@@ -1333,6 +1423,13 @@ export class MeteoblueWeatherService implements WeatherService {
         fallbackTimer = null;
       }
       service.kellyBridgeHealth.fallbackMode = false;
+    }
+
+    function stopClientKeepalive() {
+      if (keepaliveTimer) {
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = null;
+      }
     }
 
     function handleStreamStatus(message: KellyStreamMessage) {
@@ -1347,13 +1444,59 @@ export class MeteoblueWeatherService implements WeatherService {
       }
     }
 
+    function sendClientKeepalive(message: KellyStreamMessage) {
+      lastClientMessageAt = Date.now();
+      onMessage(message);
+    }
+
     function sendStreamMessage(message: KellyStreamMessage) {
       handleStreamStatus(message);
-       service.recordKellyStreamEvent(
+      lastClientMessageAt = Date.now();
+      service.recordKellyStreamEvent(
         message.generatedAt,
         message.type === "status" && message.reasonCode === "polling_fallback",
       );
       onMessage(message);
+    }
+
+    function startClientKeepalive() {
+      if (keepaliveTimer) {
+        return;
+      }
+
+      keepaliveTimer = setInterval(() => {
+        if (closed || Date.now() - lastClientMessageAt < KELLY_STREAM_CLIENT_KEEPALIVE_MS) {
+          return;
+        }
+
+        const generatedAt = new Date().toISOString();
+        if (fallbackTimer) {
+          sendClientKeepalive({
+            type: "status",
+            generatedAt,
+            state: "degraded",
+            reasonCode: "polling_fallback",
+            message: lastRepricedAt
+              ? "实时流异常，当前回退到轮询；最近一次轮询重定价仍有效。"
+              : "实时流异常，当前回退到轮询盘口同步。",
+            lastSignalAt: lastTriggeredAt,
+            lastRepricedAt,
+          });
+          return;
+        }
+
+        sendClientKeepalive({
+          type: "status",
+          generatedAt,
+          state: "connected",
+          reasonCode: "no_recent_market_motion",
+          message: lastTriggeredAt
+            ? "实时流已连接，最近没有新的盘口变动。"
+            : "实时流已连接，正在等待新的盘口变动。",
+          lastSignalAt: lastTriggeredAt,
+          lastRepricedAt,
+        });
+      }, KELLY_STREAM_CLIENT_KEEPALIVE_MS);
     }
 
     const upstreamStream = this.polymarketClient.createMarketStream(
@@ -1386,6 +1529,8 @@ export class MeteoblueWeatherService implements WeatherService {
       },
     );
 
+    startClientKeepalive();
+
     const initialRepricedAt = await emitSnapshot();
     if (initialRepricedAt && !closed) {
       sendStreamMessage({
@@ -1406,6 +1551,7 @@ export class MeteoblueWeatherService implements WeatherService {
           clearTimeout(pendingTimer);
           pendingTimer = null;
         }
+        stopClientKeepalive();
         stopPollingFallback();
         service.kellyBridgeHealth.openStreamCount = Math.max(0, service.kellyBridgeHealth.openStreamCount - 1);
         await upstreamStream.close();

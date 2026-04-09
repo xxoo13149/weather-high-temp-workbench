@@ -30,7 +30,7 @@ const buildPredictabilitySummaryDetail = (
   predictabilityLabel: string,
   availableTemperatureHours: number,
   totalHours: number,
-) => `沿用分析工作区同口径（predictability: ${predictabilityLabel}），温度时序覆盖 ${availableTemperatureHours}/${totalHours} 小时。`;
+) => `复用分析工作区的单一置信度口径：${predictabilityLabel}，当前温度时序覆盖 ${availableTemperatureHours}/${totalHours} 小时。`;
 
 const formatWindRange = (item: HourlyWeatherItem | null) => {
   if (!item) {
@@ -440,7 +440,7 @@ export const WeatherOverview = ({
               title="当天最高温判断置信度"
               score={resolvedPredictabilityScore ?? null}
               detail={predictabilityDetail}
-              label={`最高温判断 ${predictabilityLabel ?? "--"}`}
+              label={predictabilityLabel ?? "--"}
             />
           </div>
 

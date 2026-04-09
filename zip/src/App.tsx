@@ -93,6 +93,10 @@ const KELLY_DEFAULT_MIN_EDGE = 0.02;
 const SILENT_REFRESH_STALE_MS = 10 * 60 * 1000;
 const LOCATION_PREWARM_DELAY_MS = 1_000;
 const KELLY_DATE_WARM_DELAY_MS = 1_200;
+const KELLY_STREAM_RECONNECT_BASE_MS = 1_500;
+const KELLY_STREAM_RECONNECT_MAX_MS = 12_000;
+const KELLY_STREAM_WATCHDOG_INTERVAL_MS = 10_000;
+const KELLY_STREAM_STALE_MS = 65_000;
 
 const parseNumber = (value: string | null) => {
   if (!value) {
@@ -462,6 +466,7 @@ export default function App() {
   const [kellyStreamState, setKellyStreamState] = useState<string>("idle");
   const [manualRefreshingKelly, setManualRefreshingKelly] = useState(false);
   const [kellyRefreshNonce, setKellyRefreshNonce] = useState(0);
+  const [kellySocketReconnectNonce, setKellySocketReconnectNonce] = useState(0);
   const [kellyFieldErrors, setKellyFieldErrors] = useState<KellyFieldErrors>({});
   const [kellyAppliedControls, setKellyAppliedControls] = useState(() => ({
     bankroll: routeState.bankroll,
@@ -510,6 +515,7 @@ export default function App() {
   const locationTransitionInFlightRef = useRef(false);
   const locationTransitionSeqRef = useRef(0);
   const dashboardRequestSeqRef = useRef(0);
+  const railScrollLockYRef = useRef(0);
   const dashboardAbortRef = useRef<AbortController | null>(null);
   const insightAbortRef = useRef<AbortController | null>(null);
   const distributionAbortRef = useRef<AbortController | null>(null);
@@ -518,6 +524,10 @@ export default function App() {
   const kellyDateWarmAbortRef = useRef<AbortController | null>(null);
   const kellyRequestSeqRef = useRef(0);
   const kellySocketRef = useRef<WebSocket | null>(null);
+  const kellySocketReconnectTimerRef = useRef<number | null>(null);
+  const kellySocketWatchdogTimerRef = useRef<number | null>(null);
+  const kellySocketRetryCountRef = useRef(0);
+  const kellySocketLastMessageAtRef = useRef(0);
   const dashboardWarmCacheRef = useRef<Map<string, WarmCacheEntry<DashboardViewModel>>>(
     new Map<string, WarmCacheEntry<DashboardViewModel>>(),
   );
@@ -544,6 +554,27 @@ export default function App() {
       displayedLocationId,
     );
   const activeTimezoneGroup = browsingTimezoneGroup ?? currentLocationTimezoneGroup ?? DEFAULT_ACTIVE_TIMEZONE_GROUP;
+
+  const clearKellySocketReconnectTimer = () => {
+    if (kellySocketReconnectTimerRef.current !== null) {
+      window.clearTimeout(kellySocketReconnectTimerRef.current);
+      kellySocketReconnectTimerRef.current = null;
+    }
+  };
+
+  const clearKellySocketWatchdogTimer = () => {
+    if (kellySocketWatchdogTimerRef.current !== null) {
+      window.clearInterval(kellySocketWatchdogTimerRef.current);
+      kellySocketWatchdogTimerRef.current = null;
+    }
+  };
+
+  const resetKellySocketRuntime = () => {
+    clearKellySocketReconnectTimer();
+    clearKellySocketWatchdogTimer();
+    kellySocketRetryCountRef.current = 0;
+    kellySocketLastMessageAtRef.current = 0;
+  };
 
   useEffect(() => {
     const onPopState = () => {
@@ -577,6 +608,18 @@ export default function App() {
       return;
     }
 
+    const lockedScrollY = window.scrollY;
+    railScrollLockYRef.current = lockedScrollY;
+    const { body } = document;
+    const previousOverflow = body.style.overflow;
+    const previousPosition = body.style.position;
+    const previousTop = body.style.top;
+    const previousWidth = body.style.width;
+    body.style.overflow = "hidden";
+    body.style.position = "fixed";
+    body.style.top = `-${lockedScrollY}px`;
+    body.style.width = "100%";
+
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setRailExpanded(false);
@@ -584,7 +627,14 @@ export default function App() {
     };
 
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      body.style.overflow = previousOverflow;
+      body.style.position = previousPosition;
+      body.style.top = previousTop;
+      body.style.width = previousWidth;
+      window.scrollTo({ top: railScrollLockYRef.current, behavior: "auto" });
+    };
   }, [railExpanded]);
 
   const updateRouteState = (updater: (current: RouteState) => RouteState, mode: "replace" | "push" = "replace") => {
@@ -1142,9 +1192,17 @@ export default function App() {
 
     setRailExpanded(false);
     locationTransitionInFlightRef.current = true;
+    warmAbortRef.current?.abort();
+    kellyDateWarmAbortRef.current?.abort();
+    kellyAbortRef.current?.abort();
+    kellySocketRef.current?.close();
+    kellySocketRef.current = null;
+    resetKellySocketRuntime();
     setReferenceTemperatureMode("default");
     setManualTemperatureText("");
     setKellyError(null);
+    setKellyStreamState("idle");
+    setManualRefreshingKelly(false);
     setDashboardError(null);
     setInsightError(null);
     setDistributionError(null);
@@ -1310,6 +1368,7 @@ export default function App() {
   useEffect(
     () => () => {
       clearRefreshResetTimer();
+      resetKellySocketRuntime();
       warmAbortRef.current?.abort();
       kellyDateWarmAbortRef.current?.abort();
       kellyAbortRef.current?.abort();
@@ -1950,6 +2009,7 @@ export default function App() {
   useEffect(() => {
     const dashboardAligned = dashboard?.hourly.location.id === routeState.locationId;
     if (routeState.path !== "/kelly" || !dashboard || !dashboardAligned || !routeState.targetDate) {
+      setManualRefreshingKelly(false);
       return;
     }
 
@@ -1997,6 +2057,7 @@ export default function App() {
           actualTemperatureC: routeState.actualTemperatureC,
           selectedHour: routeState.selectedHourlyTimestamp,
           signal: controller.signal,
+          bypassCache: manualRefreshingKelly,
         });
 
         if (cancelled || requestSeq !== kellyRequestSeqRef.current) {
@@ -2084,6 +2145,7 @@ export default function App() {
     if (routeState.path !== "/kelly" || !routeState.targetDate) {
       kellySocketRef.current?.close();
       kellySocketRef.current = null;
+      resetKellySocketRuntime();
       setKellyStreamState("idle");
       return;
     }
@@ -2091,6 +2153,9 @@ export default function App() {
     if (!kellySnapshot || !kellySnapshotAligned) {
       kellySocketRef.current?.close();
       kellySocketRef.current = null;
+      clearKellySocketWatchdogTimer();
+      clearKellySocketReconnectTimer();
+      kellySocketLastMessageAtRef.current = 0;
       setKellyStreamState("connecting");
       return;
     }
@@ -2106,6 +2171,8 @@ export default function App() {
         routeState.selectedHourlyTimestamp ?? undefined,
       ),
     );
+    let intentionalClose = false;
+    let reconnectRequested = false;
 
     kellySocketRef.current?.close();
     kellySocketRef.current = socket;
@@ -2159,11 +2226,89 @@ export default function App() {
       });
     };
 
+    const markSocketActivity = () => {
+      kellySocketLastMessageAtRef.current = Date.now();
+    };
+
+    const scheduleReconnect = (
+      message: Extract<KellyStreamMessage, { type: "status" }>,
+      closeSocket = false,
+    ) => {
+      if (intentionalClose || reconnectRequested) {
+        return;
+      }
+
+      reconnectRequested = true;
+      if (kellySocketRef.current === socket) {
+        kellySocketRef.current = null;
+      }
+
+      clearKellySocketWatchdogTimer();
+      applyStatusMessage(message);
+      setKellyStreamState("connecting");
+
+      const attempt = kellySocketRetryCountRef.current;
+      const delay =
+        Math.min(KELLY_STREAM_RECONNECT_MAX_MS, KELLY_STREAM_RECONNECT_BASE_MS * 2 ** attempt) +
+        Math.min(750, attempt * 125);
+      kellySocketRetryCountRef.current = Math.min(attempt + 1, 8);
+
+      clearKellySocketReconnectTimer();
+      kellySocketReconnectTimerRef.current = window.setTimeout(() => {
+        clearKellySocketReconnectTimer();
+        if (routeState.path !== "/kelly" || !routeState.targetDate) {
+          return;
+        }
+
+        setKellySocketReconnectNonce((current) => current + 1);
+      }, delay);
+
+      if (closeSocket && socket.readyState < WebSocket.CLOSING) {
+        try {
+          socket.close();
+        } catch {
+          // ignore close errors while a reconnect is already scheduled
+        }
+      }
+    };
+
+    const startSocketWatchdog = () => {
+      clearKellySocketWatchdogTimer();
+      kellySocketWatchdogTimerRef.current = window.setInterval(() => {
+        if (intentionalClose || kellySocketRef.current !== socket || !kellySocketLastMessageAtRef.current) {
+          return;
+        }
+
+        if (Date.now() - kellySocketLastMessageAtRef.current <= KELLY_STREAM_STALE_MS) {
+          return;
+        }
+
+        scheduleReconnect(
+          {
+            type: "status",
+            generatedAt: new Date().toISOString(),
+            state: "degraded",
+            reasonCode: "ws_error",
+            message: "实时流长时间没有收到新消息，正在重新建立订阅。",
+            lastSignalAt: kellySnapshot.streamHealth.lastSignalAt,
+            lastRepricedAt: kellySnapshot.streamHealth.lastRepricedAt,
+          },
+          true,
+        );
+      }, KELLY_STREAM_WATCHDOG_INTERVAL_MS);
+    };
+
     socket.onopen = () => {
+      clearKellySocketReconnectTimer();
+      kellySocketRetryCountRef.current = 0;
+      markSocketActivity();
+      startSocketWatchdog();
       setKellyStreamState("connected");
     };
 
     socket.onmessage = (event) => {
+      markSocketActivity();
+      kellySocketRetryCountRef.current = 0;
       try {
         const message = JSON.parse(event.data) as KellyStreamMessage;
         if (message.type === "status") {
@@ -2226,28 +2371,36 @@ export default function App() {
     };
 
     socket.onclose = () => {
-      if (kellySocketRef.current === socket) {
-        applyStatusMessage({
-          type: "status",
-          generatedAt: new Date().toISOString(),
-          state: "disconnected",
-          reasonCode: "ws_error",
-          message: "实时流已断开。",
-        });
-      }
-    };
-
-    socket.onerror = () => {
-      applyStatusMessage({
+      scheduleReconnect({
         type: "status",
         generatedAt: new Date().toISOString(),
         state: "degraded",
         reasonCode: "ws_error",
-        message: "实时流异常，已等待后端回退到轮询。",
+        message: "实时流连接中断，正在自动重连。",
+        lastSignalAt: kellySnapshot.streamHealth.lastSignalAt,
+        lastRepricedAt: kellySnapshot.streamHealth.lastRepricedAt,
       });
     };
 
+    socket.onerror = () => {
+      scheduleReconnect(
+        {
+          type: "status",
+          generatedAt: new Date().toISOString(),
+          state: "degraded",
+          reasonCode: "ws_error",
+          message: "实时流异常，正在自动重连；当前若需要会继续回退到轮询。",
+          lastSignalAt: kellySnapshot.streamHealth.lastSignalAt,
+          lastRepricedAt: kellySnapshot.streamHealth.lastRepricedAt,
+        },
+        true,
+      );
+    };
+
     return () => {
+      intentionalClose = true;
+      clearKellySocketReconnectTimer();
+      clearKellySocketWatchdogTimer();
       socket.close();
       if (kellySocketRef.current === socket) {
         kellySocketRef.current = null;
@@ -2257,6 +2410,7 @@ export default function App() {
     kellyRefreshNonce,
     kellySnapshot?.location.id,
     kellySnapshot?.targetDate,
+    kellySocketReconnectNonce,
     routeState.actualTemperatureC,
     routeState.bankroll,
     routeState.locationId,
@@ -2282,12 +2436,15 @@ export default function App() {
     ) && isAnalysis;
   const analysisSnapshotForLocation =
     analysisSnapshot && analysisSnapshot.locationId === routeState.locationId ? analysisSnapshot : null;
+  const fallbackAnalysisSnapshot =
+    analysisSnapshotForLocation ??
+    ((loadingInsight || loadingDistribution || Boolean(locationTransitionState.pendingLocationId)) ? analysisSnapshot : null);
   const displayedAnalysisInsight = latestAnalysisReady
     ? latestInsightEnvelope?.data ?? null
-    : analysisSnapshotForLocation?.insight ?? insight;
+    : analysisSnapshotForLocation?.insight ?? fallbackAnalysisSnapshot?.insight ?? insight;
   const displayedAnalysisDistribution = latestAnalysisReady
     ? latestDistributionEnvelope?.data ?? null
-    : analysisSnapshotForLocation?.distribution ?? distribution;
+    : analysisSnapshotForLocation?.distribution ?? fallbackAnalysisSnapshot?.distribution ?? distribution;
 
   const translatedWarnings = collectDisplayWarnings({
     dashboardWarnings: dashboard?.hourly.warnings,
@@ -2341,10 +2498,17 @@ export default function App() {
     null;
   const pendingLocationName = pendingLocation?.displayName ?? null;
 
-  const hasCommittedSnapshot = Boolean(dashboard) && !dashboardError;
-  const workspaceMuted = isLocationTransitionPending;
-  const kellyRefreshDisabled =
-    !routeState.targetDate || loadingKelly || manualRefreshingKelly || isLocationTransitionPending;
+  const hasCommittedSnapshot = Boolean(dashboard);
+  const workspaceMuted = isLocationTransitionPending && !hasCommittedSnapshot;
+  const kellyRefreshDisabled = !routeState.targetDate || manualRefreshingKelly || isLocationTransitionPending;
+  const headerRefreshState = isKelly
+    ? manualRefreshingKelly || isLocationTransitionPending
+      ? "pending"
+      : "idle"
+    : refreshState;
+  const headerRefreshDisabled = isKelly
+    ? kellyRefreshDisabled
+    : refreshState === "pending" || isLocationTransitionPending;
   const peakSummary = displayedAnalysisInsight
     ? buildPeakSummary(displayedAnalysisInsight.peakTimeDistribution, activeLocationTimezone)
     : UI_TEXT.analysis.peakSummaryLoading;
@@ -2367,8 +2531,8 @@ export default function App() {
         locationTimezone={activeLocationTimezone}
         updatedAt={dashboard?.sync.updatedAt ?? null}
         syncState={dashboard?.sync.state ?? "fresh"}
-        refreshState={refreshState}
-        refreshDisabled={loadingDashboard || (isKelly ? kellyRefreshDisabled : false) || isLocationTransitionPending}
+        refreshState={headerRefreshState}
+        refreshDisabled={headerRefreshDisabled}
         currentPage={currentPage}
         railExpanded={railExpanded}
         favorite={favoriteLocationIds.includes(routeState.locationId)}

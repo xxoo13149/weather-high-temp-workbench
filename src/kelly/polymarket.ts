@@ -20,6 +20,11 @@ const POLYMARKET_DISCOVERY_CONCURRENCY = 2;
 const POLYMARKET_ORDERBOOK_CONCURRENCY = 4;
 const POLYMARKET_MAX_EVENT_PAYLOAD_CHARS = 1_500_000;
 const POLYMARKET_MAX_EVENT_VISIT_COUNT = 25_000;
+const POLYMARKET_STREAM_HEARTBEAT_MS = 10_000;
+const POLYMARKET_STREAM_IDLE_TIMEOUT_MS = 45_000;
+const POLYMARKET_STREAM_WATCHDOG_INTERVAL_MS = 10_000;
+const POLYMARKET_STREAM_RECONNECT_BASE_MS = 1_500;
+const POLYMARKET_STREAM_RECONNECT_MAX_MS = 15_000;
 type RawOrderLevel = {
   price?: string | number | null;
   size?: string | number | null;
@@ -1412,9 +1417,13 @@ export class PolymarketClient {
       };
     }
 
-    const socket = new WebSocket(this.clobWsUrl);
     let closed = false;
+    let socket: WebSocket | null = null;
     let heartbeatTimer: NodeJS.Timeout | null = null;
+    let watchdogTimer: NodeJS.Timeout | null = null;
+    let reconnectTimer: NodeJS.Timeout | null = null;
+    let reconnectAttempt = 0;
+    let lastActivityAt = 0;
 
     const clearHeartbeat = () => {
       if (heartbeatTimer) {
@@ -1423,121 +1432,217 @@ export class PolymarketClient {
       }
     };
 
-    socket.on("open", () => {
-      onMessage({
-        type: "status",
-        generatedAt: new Date().toISOString(),
-        state: "connected",
-        reasonCode: "ws_connected",
-        message: "已连接 Polymarket 市场实时流。",
-      });
-
-      socket.send(
-        JSON.stringify({
-          assets_ids: uniqueTokenIds,
-          type: "market",
-          custom_feature_enabled: true,
-        }),
-      );
-
-      heartbeatTimer = setInterval(() => {
-        if (socket.readyState !== WebSocket.OPEN) {
-          return;
-        }
-
-        try {
-          socket.send("PING");
-        } catch {
-          // ignore heartbeat send errors; error/close handlers publish status
-        }
-      }, 10_000);
-    });
-
-    socket.on("message", (payload: RawData) => {
-      const rawText = payload.toString();
-      if (!rawText.trim() || isKeepaliveText(rawText)) {
-        return;
+    const clearWatchdog = () => {
+      if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
       }
+    };
 
-      let parsed: unknown = rawText;
-      try {
-        parsed = JSON.parse(rawText);
-      } catch {
-        if (/\berror\b/i.test(rawText)) {
-          onMessage({
-            type: "status",
-            generatedAt: new Date().toISOString(),
-            state: "degraded",
-            reasonCode: "upstream_error",
-            message: "Polymarket 上游实时流返回异常文本，当前回退到轮询盘口同步。",
-          });
-        }
-        return;
+    const clearReconnect = () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
+    };
 
-      const records = toWsRecords(parsed);
-      const occurredAt = resolveWsOccurredAt(records, new Date().toISOString());
-      if (records.some(isUpstreamWsErrorRecord)) {
-        onMessage({
-          type: "status",
-          generatedAt: occurredAt,
-          state: "degraded",
-          reasonCode: "upstream_error",
-          message: "Polymarket 上游实时流返回错误，当前回退到轮询盘口同步。",
-        });
-        return;
-      }
-
-      if (records.some(isMarketSignalRecord)) {
-        onSignal(occurredAt);
-        return;
-      }
-
-      const normalized = JSON.stringify(parsed).toLowerCase();
-      if (normalized.includes("error")) {
-        onMessage({
-          type: "status",
-          generatedAt: occurredAt,
-          state: "degraded",
-          reasonCode: "upstream_error",
-          message: "Polymarket 上游实时流返回异常，当前回退到周期性盘口同步。",
-        });
-      }
-    });
-
-    socket.on("close", () => {
+    const clearSocketRuntime = () => {
       clearHeartbeat();
-      if (!closed) {
-        onMessage({
-          type: "status",
-          generatedAt: new Date().toISOString(),
-          state: "degraded",
-          reasonCode: "polling_fallback",
-          message: "Polymarket 市场实时流已断开，当前回退到轮询盘口同步。",
-        });
-      }
-    });
+      clearWatchdog();
+    };
 
-    socket.on("error", () => {
-      clearHeartbeat();
+    const markActivity = () => {
+      lastActivityAt = Date.now();
+    };
+
+    const scheduleReconnect = (message: string) => {
+      if (closed || reconnectTimer) {
+        return;
+      }
+
+      clearSocketRuntime();
       onMessage({
         type: "status",
         generatedAt: new Date().toISOString(),
         state: "degraded",
         reasonCode: "polling_fallback",
-        message: "Polymarket 市场实时流连接失败，当前回退到轮询盘口同步。",
+        message,
       });
-    });
+
+      const delay = Math.min(
+        POLYMARKET_STREAM_RECONNECT_MAX_MS,
+        POLYMARKET_STREAM_RECONNECT_BASE_MS * 2 ** reconnectAttempt,
+      );
+      reconnectAttempt = Math.min(reconnectAttempt + 1, 8);
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!closed) {
+          connect();
+        }
+      }, delay);
+    };
+
+    const connect = () => {
+      if (closed) {
+        return;
+      }
+
+      const nextSocket = new WebSocket(this.clobWsUrl);
+      socket = nextSocket;
+
+      nextSocket.on("open", () => {
+        if (socket !== nextSocket || closed) {
+          return;
+        }
+
+        reconnectAttempt = 0;
+        markActivity();
+        onMessage({
+          type: "status",
+          generatedAt: new Date().toISOString(),
+          state: "connected",
+          reasonCode: "ws_connected",
+          message: "已连接 Polymarket 市场实时流。",
+        });
+
+        nextSocket.send(
+          JSON.stringify({
+            assets_ids: uniqueTokenIds,
+            type: "market",
+            custom_feature_enabled: true,
+          }),
+        );
+
+        heartbeatTimer = setInterval(() => {
+          if (nextSocket.readyState !== WebSocket.OPEN) {
+            return;
+          }
+
+          try {
+            nextSocket.send("PING");
+          } catch {
+            // ignore heartbeat send errors; close/error handlers publish status
+          }
+        }, POLYMARKET_STREAM_HEARTBEAT_MS);
+
+        watchdogTimer = setInterval(() => {
+          if (socket !== nextSocket || closed || !lastActivityAt) {
+            return;
+          }
+
+          if (Date.now() - lastActivityAt <= POLYMARKET_STREAM_IDLE_TIMEOUT_MS) {
+            return;
+          }
+
+          scheduleReconnect("Polymarket 市场实时流长时间无响应，正在尝试重新连接；当前继续回退到轮询盘口同步。");
+          try {
+            nextSocket.close();
+          } catch {
+            // ignore close errors while reconnect is already scheduled
+          }
+        }, POLYMARKET_STREAM_WATCHDOG_INTERVAL_MS);
+      });
+
+      nextSocket.on("message", (payload: RawData) => {
+        if (socket !== nextSocket || closed) {
+          return;
+        }
+
+        const rawText = payload.toString();
+        if (!rawText.trim() || isKeepaliveText(rawText)) {
+          markActivity();
+          return;
+        }
+
+        markActivity();
+
+        let parsed: unknown = rawText;
+        try {
+          parsed = JSON.parse(rawText);
+        } catch {
+          if (/\berror\b/i.test(rawText)) {
+            onMessage({
+              type: "status",
+              generatedAt: new Date().toISOString(),
+              state: "degraded",
+              reasonCode: "upstream_error",
+              message: "Polymarket 上游实时流返回异常文本，当前回退到轮询盘口同步。",
+            });
+          }
+          return;
+        }
+
+        const records = toWsRecords(parsed);
+        const occurredAt = resolveWsOccurredAt(records, new Date().toISOString());
+        if (records.some(isUpstreamWsErrorRecord)) {
+          onMessage({
+            type: "status",
+            generatedAt: occurredAt,
+            state: "degraded",
+            reasonCode: "upstream_error",
+            message: "Polymarket 上游实时流返回错误，当前回退到轮询盘口同步。",
+          });
+          return;
+        }
+
+        if (records.some(isMarketSignalRecord)) {
+          onSignal(occurredAt);
+          return;
+        }
+
+        const normalized = JSON.stringify(parsed).toLowerCase();
+        if (normalized.includes("error")) {
+          onMessage({
+            type: "status",
+            generatedAt: occurredAt,
+            state: "degraded",
+            reasonCode: "upstream_error",
+            message: "Polymarket 上游实时流返回异常，当前回退到周期性盘口同步。",
+          });
+        }
+      });
+
+      nextSocket.on("close", () => {
+        if (socket !== nextSocket) {
+          return;
+        }
+
+        clearSocketRuntime();
+        socket = null;
+        if (!closed) {
+          scheduleReconnect("Polymarket 市场实时流已断开，正在尝试重新连接；当前继续回退到轮询盘口同步。");
+        }
+      });
+
+      nextSocket.on("error", () => {
+        if (socket !== nextSocket) {
+          return;
+        }
+
+        clearSocketRuntime();
+        scheduleReconnect("Polymarket 市场实时流连接失败，正在尝试重新连接；当前继续回退到轮询盘口同步。");
+        try {
+          nextSocket.close();
+        } catch {
+          // ignore close errors while reconnect is already scheduled
+        }
+      });
+    };
+
+    connect();
 
     return {
       close() {
         closed = true;
-        clearHeartbeat();
+        clearReconnect();
+        clearSocketRuntime();
         try {
-          socket.close();
+          socket?.close();
         } catch {
           // ignore close errors
         }
+        socket = null;
       },
     };
   }

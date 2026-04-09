@@ -198,4 +198,112 @@ describe("MeteoblueWeatherService.createKellyStream reason codes", () => {
     await handle.close();
     expect(upstreamClose).toHaveBeenCalledTimes(1);
   });
+
+  test("emits keepalive status while realtime stays idle", async () => {
+    vi.useFakeTimers();
+    const service = new MeteoblueWeatherService();
+    vi.spyOn(service, "getKellyWorkbench").mockResolvedValue(buildSnapshot([buildMatchedMarket()]));
+
+    const client = (service as any).polymarketClient as {
+      createMarketStream: (...args: unknown[]) => { close: () => void | Promise<void> };
+      fetchOrderBooks: (...args: unknown[]) => Promise<unknown>;
+    };
+    const upstreamClose = vi.fn();
+
+    vi.spyOn(client, "createMarketStream").mockReturnValue({
+      close: upstreamClose,
+    });
+    vi.spyOn(client, "fetchOrderBooks").mockResolvedValue(
+      new Map([
+        ["yes-1", { tokenId: "yes-1", bestBid: 0.41, bestAsk: 0.42, midpoint: 0.415, spread: 0.01, updatedAt: "2026-03-28T00:00:00.000Z" }],
+        ["no-1", { tokenId: "no-1", bestBid: 0.57, bestAsk: 0.58, midpoint: 0.575, spread: 0.01, updatedAt: "2026-03-28T00:00:00.000Z" }],
+      ]),
+    );
+
+    const messages: KellyStreamMessage[] = [];
+    const handle = await service.createKellyStream("miami_mia", { targetDate: "2026-03-28" }, (message) => {
+      messages.push(message);
+    });
+
+    messages.length = 0;
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(messages).toEqual([
+      expect.objectContaining({
+        type: "status",
+        state: "connected",
+        reasonCode: "no_recent_market_motion",
+      }),
+    ]);
+
+    await handle.close();
+    expect(upstreamClose).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps repricing while polling fallback is active", async () => {
+    vi.useFakeTimers();
+    const service = new MeteoblueWeatherService();
+    vi.spyOn(service, "getKellyWorkbench").mockResolvedValue(buildSnapshot([buildMatchedMarket()]));
+
+    const client = (service as any).polymarketClient as {
+      createMarketStream: (
+        ...args: unknown[]
+      ) => { close: () => void | Promise<void> };
+      fetchOrderBooks: (...args: unknown[]) => Promise<unknown>;
+    };
+    const upstreamClose = vi.fn();
+    let upstreamOnMessage: ((message: KellyStreamMessage) => void) | null = null;
+
+    vi.spyOn(client, "createMarketStream").mockImplementation((_tokenIds, onMessage) => {
+      upstreamOnMessage = onMessage as (message: KellyStreamMessage) => void;
+      return {
+        close: upstreamClose,
+      };
+    });
+    const fetchBooksSpy = vi.spyOn(client, "fetchOrderBooks").mockResolvedValue(
+      new Map([
+        ["yes-1", { tokenId: "yes-1", bestBid: 0.41, bestAsk: 0.42, midpoint: 0.415, spread: 0.01, updatedAt: "2026-03-28T00:00:00.000Z" }],
+        ["no-1", { tokenId: "no-1", bestBid: 0.57, bestAsk: 0.58, midpoint: 0.575, spread: 0.01, updatedAt: "2026-03-28T00:00:00.000Z" }],
+      ]),
+    );
+
+    const messages: KellyStreamMessage[] = [];
+    const handle = await service.createKellyStream("miami_mia", { targetDate: "2026-03-28" }, (message) => {
+      messages.push(message);
+    });
+
+    messages.length = 0;
+    if (!upstreamOnMessage) {
+      throw new Error("Expected upstream stream callback to be captured.");
+    }
+    (upstreamOnMessage as (message: KellyStreamMessage) => void)({
+      type: "status",
+      generatedAt: "2026-03-28T00:01:00.000Z",
+      state: "degraded",
+      reasonCode: "polling_fallback",
+      message: "fallback",
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(fetchBooksSpy).toHaveBeenCalledTimes(2);
+    expect(messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "status",
+          reasonCode: "polling_fallback",
+        }),
+        expect.objectContaining({
+          type: "markets",
+        }),
+        expect.objectContaining({
+          type: "status",
+          reasonCode: "polling_fallback",
+          lastRepricedAt: expect.any(String),
+        }),
+      ]),
+    );
+
+    await handle.close();
+    expect(upstreamClose).toHaveBeenCalledTimes(1);
+  });
 });

@@ -8,8 +8,8 @@ param(
   [int]$PublicPort = 80,
   [string]$BindHost = "127.0.0.1",
   [string]$NodeVersion = "22.22.1",
-  [int]$HttpTimeoutMs = 12000,
-  [int]$NodeMaxOldSpaceSizeMb = 256
+  [int]$HttpTimeoutMs = 7000,
+  [int]$NodeMaxOldSpaceSizeMb = 768
 )
 
 $ErrorActionPreference = "Stop"
@@ -242,7 +242,12 @@ function Reset-StartupTask {
 
   $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $cmdLine -WorkingDirectory $WorkingDirectory
   $trigger = New-ScheduledTaskTrigger -AtStartup
-  $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+  $settings = New-ScheduledTaskSettingsSet `
+    -RestartCount 10 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+    -StartWhenAvailable `
+    -RunOnlyIfNetworkAvailable
   Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Settings $settings -User "SYSTEM" -RunLevel Highest -Force | Out-Null
 }
 
