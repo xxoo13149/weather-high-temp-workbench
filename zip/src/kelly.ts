@@ -1,13 +1,10 @@
 import type {
-  KellyFramePoint,
   KellyMarketRow,
   KellyRecommendation,
   KellyRiskMode,
   KellyStreamMarketPatch,
   KellyWorkbenchResponse,
 } from "./types";
-
-const KELLY_FRAME_WINDOW_MS = 60 * 60 * 1000;
 
 const isTradableKellyRow = (market: KellyMarketRow) =>
   market.parseStatus === "matched" &&
@@ -26,6 +23,7 @@ const applyKellyPatch = (
     ...market,
     lifecycle: patch.lifecycle,
     inactiveReason: patch.inactiveReason,
+    observationFloorBlocked: patch.observationFloorBlocked,
     entrySourceYes: patch.entrySourceYes,
     entrySourceNo: patch.entrySourceNo,
     yesPrice: patch.yesPrice,
@@ -34,6 +32,10 @@ const applyKellyPatch = (
     yesBestAsk: patch.yesBestAsk,
     noBestBid: patch.noBestBid,
     noBestAsk: patch.noBestAsk,
+    rawProbabilityYes: patch.rawProbabilityYes,
+    rawProbabilityNo: patch.rawProbabilityNo,
+    fairYes: patch.fairYes,
+    fairNo: patch.fairNo,
     spreadPct: patch.spreadPct,
     edgeYes: patch.edgeYes,
     edgeNo: patch.edgeNo,
@@ -123,41 +125,17 @@ export const mergeKellyStreamPatches = (
   patches: KellyStreamMarketPatch[],
   riskMode: KellyRiskMode,
   minEdge: number,
-  frames?: KellyFramePoint[],
+  _frames?: KellyWorkbenchResponse["frameSeries"],
 ): KellyWorkbenchResponse => {
+  if (patches.length === 0 && snapshot.riskMode === riskMode && snapshot.minEdge === minEdge) {
+    return snapshot;
+  }
+
   const patchMap = new Map(patches.map((patch) => [patch.marketId, patch]));
   const combined = [...snapshot.markets, ...snapshot.inactiveMarkets];
   const patched = combined.map((market) => applyKellyPatch(market, patchMap.get(market.marketId)));
   const markets = patched.filter(isTradableKellyRow);
   const inactiveMarkets = patched.filter((market) => !isTradableKellyRow(market));
-  const mergedFrames = (() => {
-    if (!frames?.length) {
-      return snapshot.frameSeries;
-    }
-
-    const merged = new Map<string, KellyFramePoint>();
-    for (const frame of snapshot.frameSeries) {
-      merged.set(frame.id, frame);
-    }
-    for (const frame of frames) {
-      merged.set(frame.id, frame);
-    }
-
-    const latestCandidates = [
-      ...snapshot.frameSeries.map((frame) => Date.parse(frame.generatedAt)),
-      ...frames.map((frame) => Date.parse(frame.generatedAt)),
-      Date.parse(snapshot.generatedAt),
-    ].filter((value) => Number.isFinite(value));
-    const latestTimestamp = latestCandidates.length ? Math.max(...latestCandidates) : Date.now();
-    const cutoffMs = latestTimestamp - KELLY_FRAME_WINDOW_MS;
-
-    return [...merged.values()]
-      .filter((frame) => {
-        const frameTime = Date.parse(frame.generatedAt);
-        return Number.isNaN(frameTime) || frameTime >= cutoffMs;
-      })
-      .sort((left, right) => left.generatedAt.localeCompare(right.generatedAt));
-  })();
 
   return {
     ...snapshot,
@@ -165,7 +143,7 @@ export const mergeKellyStreamPatches = (
     minEdge,
     markets,
     inactiveMarkets,
-    frameSeries: mergedFrames,
+    frameSeries: snapshot.frameSeries,
     recommendations: deriveKellyRecommendations(markets, minEdge),
     bestObservation: deriveKellyBestObservation(markets),
   };

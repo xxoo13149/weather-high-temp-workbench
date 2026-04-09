@@ -29,8 +29,10 @@ import type {
 import { buildDiscoveryWarnings, PolymarketClient, type NormalizedOrderBook, type PolymarketDiscoveryResult } from "../../kelly/polymarket.js";
 import {
   applyPricingToMarkets,
+  buildKellyProbabilityContext,
   buildKellyWorkbench,
   buildReadableFramePoints,
+  rebaseKellyMarketsForObservationFloor,
   buildStreamMarketPatches,
   resolveObservationFloor,
   resolveKellyTargetDate,
@@ -59,6 +61,7 @@ import {
 
 const KELLY_STREAM_CLIENT_KEEPALIVE_MS = 20_000;
 const KELLY_STREAM_POLLING_INTERVAL_MS = 30_000;
+const KELLY_STREAM_REPRICE_DEBOUNCE_MS = 750;
 
 interface WeekCacheValue {
   fetchedAt: string;
@@ -701,6 +704,7 @@ export class MeteoblueWeatherService implements WeatherService {
 
   private async repriceKellyStreamSnapshot({
     locationId,
+    location,
     targetDate,
     options,
     matchedMarkets,
@@ -708,8 +712,11 @@ export class MeteoblueWeatherService implements WeatherService {
     bankroll,
     riskMode,
     minEdge,
+    probabilityCurve,
+    shrink,
   }: {
     locationId: LocationInfo["id"];
+    location: ReturnType<MeteoblueWeatherService["requireLocation"]>;
     targetDate: string;
     options: KellyRequestOptions;
     matchedMarkets: Array<
@@ -722,6 +729,8 @@ export class MeteoblueWeatherService implements WeatherService {
     bankroll: number;
     riskMode: KellyWorkbenchResponse["riskMode"];
     minEdge: number;
+    probabilityCurve: KellyWorkbenchResponse["probabilityCurve"];
+    shrink: number;
   }) {
     const streamKey = buildKellySnapshotRequestKey(locationId, targetDate, {
       ...options,
@@ -735,11 +744,71 @@ export class MeteoblueWeatherService implements WeatherService {
     }
 
     const task = (async () => {
-      const books = await this.polymarketClient.fetchOrderBooks(
-        matchedMarkets.flatMap((market) => [market.yesTokenId, market.noTokenId]),
-      );
+      const [books, hourly, metarResult] = await Promise.all([
+        this.polymarketClient.fetchOrderBooks(
+          matchedMarkets.flatMap((market) => [market.yesTokenId, market.noTokenId]),
+        ),
+        this.getHourly(locationId, "1h"),
+        this.getMetarCache(locationId).get({ allowStaleOnError: true }),
+      ]);
       const generatedAt = new Date().toISOString();
-      const repricedMarkets = applyPricingToMarkets(trackedMarkets, books, {
+      const metarObservation = metarResult.value.observation
+        ? {
+            ...metarResult.value.observation,
+            stale: metarResult.stale,
+            cacheHit: metarResult.cacheHit,
+          }
+        : null;
+      const observationFloor = this.resolveKellyObservationFloor(
+        location,
+        targetDate,
+        hourly,
+        metarObservation,
+        metarResult.value.recentTemperatures,
+        options,
+      );
+      let nextProbabilityCurve = probabilityCurve;
+      let nextShrink = shrink;
+      try {
+        const resolvedActualTemperatureForInsight =
+          options.actualTemperatureC ??
+          metarObservation?.temperatureC ??
+          hourly.current?.temperatureC ??
+          undefined;
+        const insight = await this.getMultiModelInsight(
+          locationId,
+          options.selectedHourTimestamp,
+          resolvedActualTemperatureForInsight,
+        );
+        const targetDistributionTimestamp = resolveKellyDistributionTimestamp(insight.availableTimestamps, targetDate);
+
+        if (targetDistributionTimestamp) {
+          const distribution = await this.getMultiModelDistribution(locationId, targetDistributionTimestamp, 1);
+          const probabilityContext = buildKellyProbabilityContext({
+            hourly,
+            insight,
+            distribution,
+            metarObservation,
+            options,
+            targetDate,
+            timeZone: location.timezone,
+            observationFloorOverride: observationFloor,
+          });
+          nextProbabilityCurve = probabilityContext.curve;
+          nextShrink = probabilityContext.shrink;
+        }
+      } catch {
+        // Keep live repricing available even if the auxiliary model context
+        // cannot be refreshed for this tick. The latest observation floor still
+        // applies against the last committed probability baseline.
+      }
+      const rebasedMarkets = rebaseKellyMarketsForObservationFloor(
+        trackedMarkets,
+        nextProbabilityCurve,
+        nextShrink,
+        observationFloor.value,
+      );
+      const repricedMarkets = applyPricingToMarkets(rebasedMarkets, books, {
         bankroll,
         riskMode,
         minEdge,
@@ -1269,7 +1338,14 @@ export class MeteoblueWeatherService implements WeatherService {
         stageTimings,
       });
 
-      return snapshot;
+      return {
+        ...snapshot,
+        // Keep the frame history on the bridge for repricing and audits, but
+        // stop shipping it to the main Kelly page. That materially cuts GET
+        // payload size during rapid location switches while preserving the API
+        // field for compatibility.
+        frameSeries: [],
+      };
     } catch (error) {
       stageTimings.total = Date.now() - totalStartedAt;
       this.recordKellySnapshotFailure(error, stageTimings);
@@ -1324,6 +1400,7 @@ export class MeteoblueWeatherService implements WeatherService {
     let keepaliveTimer: NodeJS.Timeout | null = null;
     let lastRepricedAt: string | null = null;
     let lastClientMessageAt = Date.now();
+    let upstreamConnected = false;
     this.kellyBridgeHealth.openStreamCount += 1;
     this.kellyBridgeHealth.fallbackMode = false;
 
@@ -1336,6 +1413,7 @@ export class MeteoblueWeatherService implements WeatherService {
           repricedMarkets,
         } = await service.repriceKellyStreamSnapshot({
           locationId,
+          location,
           targetDate,
           options: {
             ...options,
@@ -1348,6 +1426,8 @@ export class MeteoblueWeatherService implements WeatherService {
           bankroll: snapshot.bankroll,
           riskMode: snapshot.riskMode,
           minEdge: snapshot.minEdge,
+          probabilityCurve: snapshot.probabilityCurve,
+          shrink: snapshot.distributionSummary.shrink,
         });
         service.recordKellyStreamEvent(generatedAt, false);
         service.kellyBridgeHealth.lastOrderbookAt =
@@ -1438,8 +1518,10 @@ export class MeteoblueWeatherService implements WeatherService {
       }
 
       if (message.state === "connected") {
+        upstreamConnected = true;
         stopPollingFallback();
       } else if (message.state === "degraded" || message.state === "disconnected") {
+        upstreamConnected = false;
         startPollingFallback();
       }
     }
@@ -1466,6 +1548,10 @@ export class MeteoblueWeatherService implements WeatherService {
 
       keepaliveTimer = setInterval(() => {
         if (closed || Date.now() - lastClientMessageAt < KELLY_STREAM_CLIENT_KEEPALIVE_MS) {
+          return;
+        }
+
+        if (!fallbackTimer && !upstreamConnected) {
           return;
         }
 
@@ -1513,26 +1599,15 @@ export class MeteoblueWeatherService implements WeatherService {
           if (closed) {
             return;
           }
-          const repricedAt = await emitSnapshot();
-          if (lastTriggeredAt && repricedAt) {
-            sendStreamMessage({
-              type: "status",
-              generatedAt: new Date().toISOString(),
-              state: "connected",
-              reasonCode: "ws_connected",
-              message: `已根据 ${lastTriggeredAt} 的上游事件刷新盘口。`,
-              lastSignalAt: lastTriggeredAt,
-              lastRepricedAt: repricedAt,
-            });
-          }
-        }, 300);
+          await emitSnapshot();
+        }, KELLY_STREAM_REPRICE_DEBOUNCE_MS);
       },
     );
 
     startClientKeepalive();
 
     const initialRepricedAt = await emitSnapshot();
-    if (initialRepricedAt && !closed) {
+    if (initialRepricedAt && !closed && upstreamConnected) {
       sendStreamMessage({
         type: "status",
         generatedAt: new Date().toISOString(),

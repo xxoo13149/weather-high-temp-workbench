@@ -21,8 +21,6 @@ const POLYMARKET_ORDERBOOK_CONCURRENCY = 4;
 const POLYMARKET_MAX_EVENT_PAYLOAD_CHARS = 1_500_000;
 const POLYMARKET_MAX_EVENT_VISIT_COUNT = 25_000;
 const POLYMARKET_STREAM_HEARTBEAT_MS = 10_000;
-const POLYMARKET_STREAM_IDLE_TIMEOUT_MS = 45_000;
-const POLYMARKET_STREAM_WATCHDOG_INTERVAL_MS = 10_000;
 const POLYMARKET_STREAM_RECONNECT_BASE_MS = 1_500;
 const POLYMARKET_STREAM_RECONNECT_MAX_MS = 15_000;
 type RawOrderLevel = {
@@ -357,7 +355,32 @@ const resolveWsRecordType = (record: Record<string, unknown>): string | null =>
     .find((value): value is string => Boolean(value))
     ?.toLowerCase() ?? null;
 
-const isKeepaliveText = (value: string): boolean => /^(?:ping|pong)$/i.test(value.trim());
+const isKeepaliveText = (value: string): boolean => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (/^(?:ping|pong)$/i.test(trimmed) || trimmed === "{}") {
+    return true;
+  }
+
+  if (!(trimmed.startsWith("{") && trimmed.endsWith("}"))) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    if (Object.keys(parsed).length === 0) {
+      return true;
+    }
+
+    const keepaliveType = parseString(parsed.type) ?? parseString(parsed.event);
+    return typeof keepaliveType === "string" && /^(?:ping|pong)$/i.test(keepaliveType);
+  } catch {
+    return false;
+  }
+};
 
 const isUpstreamWsErrorRecord = (record: Record<string, unknown>): boolean => {
   const type = resolveWsRecordType(record);
@@ -1420,22 +1443,13 @@ export class PolymarketClient {
     let closed = false;
     let socket: WebSocket | null = null;
     let heartbeatTimer: NodeJS.Timeout | null = null;
-    let watchdogTimer: NodeJS.Timeout | null = null;
     let reconnectTimer: NodeJS.Timeout | null = null;
     let reconnectAttempt = 0;
-    let lastActivityAt = 0;
 
     const clearHeartbeat = () => {
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
-      }
-    };
-
-    const clearWatchdog = () => {
-      if (watchdogTimer) {
-        clearInterval(watchdogTimer);
-        watchdogTimer = null;
       }
     };
 
@@ -1448,11 +1462,6 @@ export class PolymarketClient {
 
     const clearSocketRuntime = () => {
       clearHeartbeat();
-      clearWatchdog();
-    };
-
-    const markActivity = () => {
-      lastActivityAt = Date.now();
     };
 
     const scheduleReconnect = (message: string) => {
@@ -1497,7 +1506,6 @@ export class PolymarketClient {
         }
 
         reconnectAttempt = 0;
-        markActivity();
         onMessage({
           type: "status",
           generatedAt: new Date().toISOString(),
@@ -1514,6 +1522,9 @@ export class PolymarketClient {
           }),
         );
 
+        // Keep the upstream market channel alive with official PING heartbeats.
+        // Quiet books are valid, so close/error should drive reconnects instead
+        // of a synthetic idle watchdog.
         heartbeatTimer = setInterval(() => {
           if (nextSocket.readyState !== WebSocket.OPEN) {
             return;
@@ -1525,23 +1536,7 @@ export class PolymarketClient {
             // ignore heartbeat send errors; close/error handlers publish status
           }
         }, POLYMARKET_STREAM_HEARTBEAT_MS);
-
-        watchdogTimer = setInterval(() => {
-          if (socket !== nextSocket || closed || !lastActivityAt) {
-            return;
-          }
-
-          if (Date.now() - lastActivityAt <= POLYMARKET_STREAM_IDLE_TIMEOUT_MS) {
-            return;
-          }
-
-          scheduleReconnect("Polymarket 市场实时流长时间无响应，正在尝试重新连接；当前继续回退到轮询盘口同步。");
-          try {
-            nextSocket.close();
-          } catch {
-            // ignore close errors while reconnect is already scheduled
-          }
-        }, POLYMARKET_STREAM_WATCHDOG_INTERVAL_MS);
+        return;
       });
 
       nextSocket.on("message", (payload: RawData) => {
@@ -1551,11 +1546,8 @@ export class PolymarketClient {
 
         const rawText = payload.toString();
         if (!rawText.trim() || isKeepaliveText(rawText)) {
-          markActivity();
           return;
         }
-
-        markActivity();
 
         let parsed: unknown = rawText;
         try {
@@ -1611,7 +1603,7 @@ export class PolymarketClient {
         clearSocketRuntime();
         socket = null;
         if (!closed) {
-          scheduleReconnect("Polymarket 市场实时流已断开，正在尝试重新连接；当前继续回退到轮询盘口同步。");
+          scheduleReconnect("Polymarket 实时流已断开，正在重连并回退到轮询。");
         }
       });
 
@@ -1621,7 +1613,8 @@ export class PolymarketClient {
         }
 
         clearSocketRuntime();
-        scheduleReconnect("Polymarket 市场实时流连接失败，正在尝试重新连接；当前继续回退到轮询盘口同步。");
+        socket = null;
+        scheduleReconnect("Polymarket 实时流异常，正在重连并回退到轮询。");
         try {
           nextSocket.close();
         } catch {

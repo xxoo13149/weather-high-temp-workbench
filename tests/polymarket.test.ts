@@ -415,12 +415,13 @@ describe("PolymarketClient", () => {
     handle.close();
   });
 
-  test("reports polling fallback when the websocket transport closes unexpectedly", async () => {
+  test("does not treat an idle market stream as broken while heartbeat pings are active", async () => {
+    vi.useFakeTimers();
     const { PolymarketClient } = await import("../src/kelly/polymarket.js");
     const client = new PolymarketClient();
     const messages: unknown[] = [];
 
-    client.createMarketStream(
+    const handle = client.createMarketStream(
       ["token-1"],
       (message) => {
         messages.push(message);
@@ -432,17 +433,47 @@ describe("PolymarketClient", () => {
     expect(socket).toBeDefined();
 
     socket?.emit("open");
-    socket?.emit("close");
+    messages.length = 0;
 
-    expect(messages).toEqual(
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(messages).toEqual([]);
+    expect(socket?.sent.filter((entry) => entry === "PING").length).toBeGreaterThan(0);
+
+    handle.close();
+  });
+
+  test("does not force a reconnect just because the market channel stays quiet", async () => {
+    vi.useFakeTimers();
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+    const messages: unknown[] = [];
+
+    const handle = client.createMarketStream(
+      ["token-1"],
+      (message) => {
+        messages.push(message);
+      },
+      () => {},
+    );
+
+    const socket = wsInstances.at(-1);
+    expect(socket).toBeDefined();
+
+    socket?.emit("open");
+    await vi.advanceTimersByTimeAsync(90_000);
+
+    expect(wsInstances).toHaveLength(1);
+    expect(messages).not.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           type: "status",
-          state: "degraded",
           reasonCode: "polling_fallback",
         }),
       ]),
     );
+
+    handle.close();
   });
 
   test("reconnects after an unexpected websocket close", async () => {
@@ -459,16 +490,19 @@ describe("PolymarketClient", () => {
       () => {},
     );
 
-    const firstSocket = wsInstances.at(-1);
-    expect(firstSocket).toBeDefined();
+    const socket = wsInstances.at(-1);
+    expect(socket).toBeDefined();
 
-    firstSocket?.emit("open");
-    firstSocket?.emit("close");
+    socket?.emit("open");
+    messages.length = 0;
+
+    socket?.emit("close");
 
     expect(messages).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           type: "status",
+          state: "degraded",
           reasonCode: "polling_fallback",
         }),
       ]),
@@ -477,8 +511,9 @@ describe("PolymarketClient", () => {
     await vi.advanceTimersByTimeAsync(1_500);
     expect(wsInstances).toHaveLength(2);
 
-    const secondSocket = wsInstances.at(-1);
-    secondSocket?.emit("open");
+    const reconnectedSocket = wsInstances.at(-1);
+    reconnectedSocket?.emit("open");
+
     expect(messages).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -488,6 +523,45 @@ describe("PolymarketClient", () => {
         }),
       ]),
     );
+
+    handle.close();
+  });
+
+  test("reconnects after websocket error closes the transport", async () => {
+    vi.useFakeTimers();
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+    const messages: unknown[] = [];
+
+    const handle = client.createMarketStream(
+      ["token-1"],
+      (message) => {
+        messages.push(message);
+      },
+      () => {},
+    );
+
+    const socket = wsInstances.at(-1);
+    expect(socket).toBeDefined();
+
+    socket?.emit("open");
+    messages.length = 0;
+
+    socket?.emit("error", new Error("boom"));
+
+    expect(socket?.readyState).toBe(MockWebSocket.CLOSED);
+    expect(messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "status",
+          state: "degraded",
+          reasonCode: "polling_fallback",
+        }),
+      ]),
+    );
+
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(wsInstances).toHaveLength(2);
 
     handle.close();
   });

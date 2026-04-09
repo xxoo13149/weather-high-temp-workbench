@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, startTransition, Suspense, useEffect, useMemo, useRef, useState } from "react";
 
 import { getErrorMessage, weatherApi } from "./api";
 import { CommandHeader } from "./components/CommandHeader";
@@ -91,12 +91,10 @@ type ParsedKellyDraftControls = {
 const KELLY_DEFAULT_BANKROLL = 1000;
 const KELLY_DEFAULT_MIN_EDGE = 0.02;
 const SILENT_REFRESH_STALE_MS = 10 * 60 * 1000;
-const LOCATION_PREWARM_DELAY_MS = 1_000;
-const KELLY_DATE_WARM_DELAY_MS = 1_200;
+const LOCATION_PREWARM_DELAY_MS = 180;
+const KELLY_DATE_WARM_DELAY_MS = 220;
 const KELLY_STREAM_RECONNECT_BASE_MS = 1_500;
 const KELLY_STREAM_RECONNECT_MAX_MS = 12_000;
-const KELLY_STREAM_WATCHDOG_INTERVAL_MS = 10_000;
-const KELLY_STREAM_STALE_MS = 65_000;
 
 const parseNumber = (value: string | null) => {
   if (!value) {
@@ -376,27 +374,27 @@ const resolveTimezoneGroupForLocation = (
 const buildWarmLocationTargets = (path: AppPath, tab: AnalysisWorkspaceState["tab"]): WarmLocationTargets => {
   if (path === "/kelly") {
     return {
-      home: false,
-      analysis: false,
+      home: true,
+      analysis: true,
       kelly: false,
-      image: false,
+      image: true,
     };
   }
 
   if (path === "/analysis") {
     return {
-      home: false,
+      home: true,
       analysis: tab === "image",
-      kelly: false,
-      image: false,
+      kelly: true,
+      image: tab === "models",
     };
   }
 
   return {
     home: false,
-    analysis: false,
-    kelly: false,
-    image: false,
+    analysis: true,
+    kelly: true,
+    image: true,
   };
 };
 
@@ -453,6 +451,12 @@ const RouteSurfaceFallback = ({
     </div>
   </section>
 );
+
+const compactKellySnapshotForClient = (snapshot: KellyWorkbenchResponse): KellyWorkbenchResponse => ({
+  ...snapshot,
+  frameSeries: [],
+  unresolvedMarkets: [],
+});
 
 export default function App() {
   const [routeState, setRouteState] = useState<RouteState>(() => parseRouteState());
@@ -525,9 +529,7 @@ export default function App() {
   const kellyRequestSeqRef = useRef(0);
   const kellySocketRef = useRef<WebSocket | null>(null);
   const kellySocketReconnectTimerRef = useRef<number | null>(null);
-  const kellySocketWatchdogTimerRef = useRef<number | null>(null);
   const kellySocketRetryCountRef = useRef(0);
-  const kellySocketLastMessageAtRef = useRef(0);
   const dashboardWarmCacheRef = useRef<Map<string, WarmCacheEntry<DashboardViewModel>>>(
     new Map<string, WarmCacheEntry<DashboardViewModel>>(),
   );
@@ -536,6 +538,10 @@ export default function App() {
   );
   const distributionWarmCacheRef = useRef<Map<string, WarmCacheEntry<DistributionViewModel>>>(
     new Map<string, WarmCacheEntry<DistributionViewModel>>(),
+  );
+  const insightInFlightRef = useRef<Map<string, Promise<InsightViewModel>>>(new Map<string, Promise<InsightViewModel>>());
+  const distributionInFlightRef = useRef<Map<string, Promise<DistributionViewModel | null>>>(
+    new Map<string, Promise<DistributionViewModel | null>>(),
   );
   const kellyWarmCacheRef = useRef<Map<string, WarmCacheEntry<KellyWorkbenchResponse>>>(
     new Map<string, WarmCacheEntry<KellyWorkbenchResponse>>(),
@@ -562,18 +568,9 @@ export default function App() {
     }
   };
 
-  const clearKellySocketWatchdogTimer = () => {
-    if (kellySocketWatchdogTimerRef.current !== null) {
-      window.clearInterval(kellySocketWatchdogTimerRef.current);
-      kellySocketWatchdogTimerRef.current = null;
-    }
-  };
-
   const resetKellySocketRuntime = () => {
     clearKellySocketReconnectTimer();
-    clearKellySocketWatchdogTimer();
     kellySocketRetryCountRef.current = 0;
-    kellySocketLastMessageAtRef.current = 0;
   };
 
   useEffect(() => {
@@ -691,10 +688,26 @@ export default function App() {
       return cachedInsight;
     }
 
-    const response = await weatherApi.fetchInsights(locationId, selectedTimestamp ?? undefined, actualTemperatureC ?? undefined, {
-      signal,
-    });
-    return writeWarmCacheEntry(insightWarmCacheRef.current, insightKey, mapInsightResponse(response));
+    const inFlight = insightInFlightRef.current.get(insightKey);
+    if (inFlight) {
+      return await inFlight;
+    }
+
+    const request = weatherApi
+      .fetchInsights(locationId, selectedTimestamp ?? undefined, actualTemperatureC ?? undefined, {
+        signal,
+      })
+      .then((response) => writeWarmCacheEntry(insightWarmCacheRef.current, insightKey, mapInsightResponse(response)));
+
+    insightInFlightRef.current.set(insightKey, request);
+
+    try {
+      return await request;
+    } finally {
+      if (insightInFlightRef.current.get(insightKey) === request) {
+        insightInFlightRef.current.delete(insightKey);
+      }
+    }
   };
 
   const fetchDistributionSnapshot = async ({
@@ -716,8 +729,26 @@ export default function App() {
       return cachedDistribution;
     }
 
-    const response = await weatherApi.fetchDistribution(locationId, selectedTimestamp, 1, { signal });
-    return writeWarmCacheEntry(distributionWarmCacheRef.current, distributionKey, mapDistributionResponse(response));
+    const inFlight = distributionInFlightRef.current.get(distributionKey);
+    if (inFlight) {
+      return await inFlight;
+    }
+
+    const request = weatherApi
+      .fetchDistribution(locationId, selectedTimestamp, 1, { signal })
+      .then((response) =>
+        writeWarmCacheEntry(distributionWarmCacheRef.current, distributionKey, mapDistributionResponse(response)),
+      );
+
+    distributionInFlightRef.current.set(distributionKey, request);
+
+    try {
+      return await request;
+    } finally {
+      if (distributionInFlightRef.current.get(distributionKey) === request) {
+        distributionInFlightRef.current.delete(distributionKey);
+      }
+    }
   };
 
   const fetchKellySnapshot = async ({
@@ -777,7 +808,9 @@ export default function App() {
         selectedHour ?? undefined,
         { signal },
       )
-      .then((response) => writeWarmCacheEntry(kellyWarmCacheRef.current, kellyKey, response));
+      .then((response) =>
+        writeWarmCacheEntry(kellyWarmCacheRef.current, kellyKey, compactKellySnapshotForClient(response)),
+      );
 
     if (!bypassCache) {
       kellyInFlightRef.current.set(kellyKey, request);
@@ -898,79 +931,44 @@ export default function App() {
     targets: WarmLocationTargets;
   }) => {
     warmAbortRef.current?.abort();
-    const insightKey = buildInsightWarmKey(locationId, selectedTimestamp, actualTemperatureC);
-    const distributionKey = buildDistributionWarmKey(locationId, selectedTimestamp);
-    const kellyKey = buildKellyWarmKey({
-      locationId,
-      targetDate,
-      bankroll,
-      riskMode,
-      minEdge,
-      actualTemperatureC,
-      selectedHour: selectedTimestamp,
-    });
-
     const warmTasks: Array<() => Promise<unknown>> = [];
     const shouldPreloadImage = targets.image;
     const controller = new AbortController();
     warmAbortRef.current = controller;
 
     if (targets.home || targets.analysis) {
-      const cachedInsight = readWarmCacheEntry<InsightViewModel>(insightWarmCacheRef.current, insightKey);
       warmTasks.push(() =>
-        cachedInsight
-          ? Promise.resolve(cachedInsight)
-          : weatherApi
-              .fetchInsights(locationId, selectedTimestamp ?? undefined, actualTemperatureC ?? undefined, {
-                signal: controller.signal,
-              })
-              .then((response) =>
-                writeWarmCacheEntry(insightWarmCacheRef.current, insightKey, mapInsightResponse(response)),
-              ),
+        fetchInsightSnapshot({
+          locationId,
+          selectedTimestamp,
+          actualTemperatureC,
+          signal: controller.signal,
+        }),
       );
     }
 
     if (targets.analysis && selectedTimestamp !== null) {
-      const cachedDistribution = readWarmCacheEntry<DistributionViewModel>(
-        distributionWarmCacheRef.current,
-        distributionKey,
-      );
       warmTasks.push(() =>
-        cachedDistribution
-          ? Promise.resolve(cachedDistribution)
-          : weatherApi
-              .fetchDistribution(locationId, selectedTimestamp, 1, {
-                signal: controller.signal,
-              })
-              .then((response) =>
-                writeWarmCacheEntry(distributionWarmCacheRef.current, distributionKey, mapDistributionResponse(response)),
-              ),
+        fetchDistributionSnapshot({
+          locationId,
+          selectedTimestamp,
+          signal: controller.signal,
+        }),
       );
     }
 
     if (targets.kelly) {
-      const cachedKelly = readWarmCacheEntry<KellyWorkbenchResponse>(
-        kellyWarmCacheRef.current,
-        kellyKey,
-        KELLY_WARM_CACHE_TTL_MS,
-      );
       warmTasks.push(() =>
-        cachedKelly
-          ? Promise.resolve(cachedKelly)
-          : weatherApi
-              .fetchKellyWorkbench(
-                locationId,
-                targetDate,
-                bankroll,
-                riskMode,
-                minEdge,
-                actualTemperatureC ?? undefined,
-                selectedTimestamp ?? undefined,
-                {
-                  signal: controller.signal,
-                },
-              )
-              .then((response) => writeWarmCacheEntry(kellyWarmCacheRef.current, kellyKey, response)),
+        fetchKellySnapshot({
+          locationId,
+          targetDate,
+          bankroll,
+          riskMode,
+          minEdge,
+          actualTemperatureC,
+          selectedHour: selectedTimestamp,
+          signal: controller.signal,
+        }),
       );
     }
 
@@ -1003,14 +1001,23 @@ export default function App() {
 
     try {
       await new Promise((resolve) => window.setTimeout(resolve, LOCATION_PREWARM_DELAY_MS));
-      for (const task of warmTasks) {
+      const results = await Promise.allSettled(
+        warmTasks.map(async (task) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+
+          await task();
+        }),
+      );
+
+      for (const result of results) {
         if (controller.signal.aborted) {
           return;
         }
 
-        try {
-          await task();
-        } catch (error) {
+        if (result.status === "rejected") {
+          const error = result.reason;
           if (error instanceof DOMException && error.name === "AbortError") {
             return;
           }
@@ -1632,7 +1639,7 @@ export default function App() {
 
     const remainingDates = availableTargetDates
       .filter((date) => date !== routeState.targetDate)
-      .slice(0, 1);
+      .slice(0, 2);
 
     if (remainingDates.length === 0) {
       kellyDateWarmAbortRef.current?.abort();
@@ -1842,19 +1849,17 @@ export default function App() {
 
     const load = async () => {
       try {
-        const response = await weatherApi.fetchInsights(
-          routeState.locationId,
-          routeState.selectedInsightTimestamp ?? undefined,
-          routeState.actualTemperatureC ?? undefined,
-          { signal: controller.signal },
-        );
+        const mappedInsight = await fetchInsightSnapshot({
+          locationId: routeState.locationId,
+          selectedTimestamp: routeState.selectedInsightTimestamp ?? null,
+          actualTemperatureC: routeState.actualTemperatureC ?? null,
+          signal: controller.signal,
+        });
 
         if (cancelled) {
           return;
         }
 
-        const mappedInsight = mapInsightResponse(response);
-        writeWarmCacheEntry(insightWarmCacheRef.current, insightKey, mappedInsight);
         const generatedAt = dashboard.generatedAt;
         const key = buildAnalysisBatchKey(routeState.locationId, mappedInsight.selectedTimestamp, generatedAt);
 
@@ -1948,19 +1953,23 @@ export default function App() {
 
     const load = async () => {
       try {
-        const response = await weatherApi.fetchDistribution(
-          routeState.locationId,
-          distributionTimestamp,
-          1,
-          { signal: controller.signal },
-        );
+        const mappedDistribution = await fetchDistributionSnapshot({
+          locationId: routeState.locationId,
+          selectedTimestamp: distributionTimestamp,
+          signal: controller.signal,
+        });
 
         if (cancelled) {
           return;
         }
 
-        const mappedDistribution = mapDistributionResponse(response);
-        writeWarmCacheEntry(distributionWarmCacheRef.current, distributionKey, mappedDistribution);
+        if (!mappedDistribution) {
+          setDistribution(null);
+          setLatestDistributionEnvelope(null);
+          setDistributionError(null);
+          return;
+        }
+
         const generatedAt = dashboard.generatedAt;
         const key = buildAnalysisBatchKey(routeState.locationId, mappedDistribution.selectedTimestamp, generatedAt);
 
@@ -2030,6 +2039,7 @@ export default function App() {
     if (cachedKelly) {
       setKellySnapshot(cachedKelly);
       setKellyError(null);
+      setKellyStreamState(cachedKelly.streamHealth.state);
       setLoadingKelly(false);
       setManualRefreshingKelly(false);
       return;
@@ -2044,7 +2054,6 @@ export default function App() {
     if (!manualRefreshingKelly) {
       setLoadingKelly(true);
     }
-    setKellyStreamState("connecting");
 
     const load = async () => {
       try {
@@ -2066,6 +2075,7 @@ export default function App() {
 
         setKellySnapshot(response);
         setKellyError(null);
+        setKellyStreamState(response.streamHealth.state);
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") {
           return;
@@ -2153,10 +2163,8 @@ export default function App() {
     if (!kellySnapshot || !kellySnapshotAligned) {
       kellySocketRef.current?.close();
       kellySocketRef.current = null;
-      clearKellySocketWatchdogTimer();
       clearKellySocketReconnectTimer();
-      kellySocketLastMessageAtRef.current = 0;
-      setKellyStreamState("connecting");
+      setKellyStreamState(kellySnapshot?.streamHealth.state ?? "idle");
       return;
     }
 
@@ -2226,10 +2234,6 @@ export default function App() {
       });
     };
 
-    const markSocketActivity = () => {
-      kellySocketLastMessageAtRef.current = Date.now();
-    };
-
     const scheduleReconnect = (
       message: Extract<KellyStreamMessage, { type: "status" }>,
       closeSocket = false,
@@ -2243,9 +2247,7 @@ export default function App() {
         kellySocketRef.current = null;
       }
 
-      clearKellySocketWatchdogTimer();
       applyStatusMessage(message);
-      setKellyStreamState("connecting");
 
       const attempt = kellySocketRetryCountRef.current;
       const delay =
@@ -2272,63 +2274,37 @@ export default function App() {
       }
     };
 
-    const startSocketWatchdog = () => {
-      clearKellySocketWatchdogTimer();
-      kellySocketWatchdogTimerRef.current = window.setInterval(() => {
-        if (intentionalClose || kellySocketRef.current !== socket || !kellySocketLastMessageAtRef.current) {
-          return;
-        }
-
-        if (Date.now() - kellySocketLastMessageAtRef.current <= KELLY_STREAM_STALE_MS) {
-          return;
-        }
-
-        scheduleReconnect(
-          {
-            type: "status",
-            generatedAt: new Date().toISOString(),
-            state: "degraded",
-            reasonCode: "ws_error",
-            message: "实时流长时间没有收到新消息，正在重新建立订阅。",
-            lastSignalAt: kellySnapshot.streamHealth.lastSignalAt,
-            lastRepricedAt: kellySnapshot.streamHealth.lastRepricedAt,
-          },
-          true,
-        );
-      }, KELLY_STREAM_WATCHDOG_INTERVAL_MS);
-    };
-
     socket.onopen = () => {
       clearKellySocketReconnectTimer();
       kellySocketRetryCountRef.current = 0;
-      markSocketActivity();
-      startSocketWatchdog();
-      setKellyStreamState("connected");
+      setKellyStreamState("connecting");
     };
 
     socket.onmessage = (event) => {
-      markSocketActivity();
       kellySocketRetryCountRef.current = 0;
       try {
         const message = JSON.parse(event.data) as KellyStreamMessage;
         if (message.type === "status") {
-          applyStatusMessage(message);
+          startTransition(() => {
+            applyStatusMessage(message);
+          });
           return;
         }
 
-        setKellyStreamState("connected");
-        setKellySnapshot((current) => {
-          if (!current) {
-            return current;
-          }
+        startTransition(() => {
+          setKellyStreamState("connected");
+          setKellySnapshot((current) => {
+            if (!current) {
+              return current;
+            }
 
-          const merged = mergeKellyStreamPatches(
-            current,
-            message.markets,
-            routeState.riskMode,
-            routeState.minEdge,
-            message.frames,
-          );
+            const merged = mergeKellyStreamPatches(
+              current,
+              message.markets,
+              routeState.riskMode,
+              routeState.minEdge,
+              message.frames,
+            );
 
           return {
             ...merged,
@@ -2342,8 +2318,8 @@ export default function App() {
             },
             freshness: {
               ...merged.freshness,
-              orderbookFetchedAt: message.lastRepricedAt ?? message.generatedAt,
-              repricedAt: message.lastRepricedAt ?? merged.freshness.repricedAt ?? message.generatedAt,
+              orderbookFetchedAt: message.lastRepricedAt ?? merged.freshness.orderbookFetchedAt,
+              repricedAt: message.lastRepricedAt ?? merged.freshness.repricedAt,
               lastStreamEventAt: message.lastSignalAt ?? message.generatedAt,
               marketMotionState: "live",
             },
@@ -2357,15 +2333,18 @@ export default function App() {
                   }
                 : status,
             ),
-          } satisfies KellyWorkbenchResponse;
+            } satisfies KellyWorkbenchResponse;
+          });
         });
       } catch {
-        applyStatusMessage({
+        startTransition(() => {
+          applyStatusMessage({
           type: "status",
           generatedAt: new Date().toISOString(),
           state: "degraded",
           reasonCode: "upstream_error",
           message: "实时流返回了无法解析的消息，当前等待后端恢复。",
+          });
         });
       }
     };
@@ -2400,7 +2379,6 @@ export default function App() {
     return () => {
       intentionalClose = true;
       clearKellySocketReconnectTimer();
-      clearKellySocketWatchdogTimer();
       socket.close();
       if (kellySocketRef.current === socket) {
         kellySocketRef.current = null;

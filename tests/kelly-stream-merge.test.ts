@@ -114,6 +114,7 @@ describe("mergeKellyStreamPatches", () => {
       marketId: "market-1",
       lifecycle: "tradable",
       inactiveReason: null,
+      observationFloorBlocked: false,
       entrySourceYes: "best-ask",
       entrySourceNo: "best-ask",
       yesPrice: 0.61,
@@ -122,6 +123,10 @@ describe("mergeKellyStreamPatches", () => {
       yesBestAsk: 0.61,
       noBestBid: 0.41,
       noBestAsk: 0.42,
+      rawProbabilityYes: 0.55,
+      rawProbabilityNo: 0.45,
+      fairYes: 0.55,
+      fairNo: 0.45,
       spreadPct: 0.01,
       edgeYes: -0.06,
       edgeNo: -0.02,
@@ -169,6 +174,6 @@ describe("mergeKellyStreamPatches", () => {
       suggestedStake: 0,
       side: "no",
     });
-    expect(next.frameSeries).toEqual(frames);
+    expect(next.frameSeries).toEqual([]);
   });
 });

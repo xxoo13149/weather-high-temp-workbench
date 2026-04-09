@@ -230,9 +230,7 @@ const buildFreshness = ({
         : "unavailable"
       : frameAgeMs <= 60_000
         ? "live"
-        : frameAgeMs <= 180_000
-          ? "still"
-          : "polling-fallback";
+        : "still";
 
   return {
     weatherGeneratedAt,
@@ -560,6 +558,46 @@ export const resolveObservationFloor = (
   };
 };
 
+export const buildKellyProbabilityContext = ({
+  hourly,
+  insight,
+  distribution,
+  metarObservation,
+  options,
+  targetDate,
+  timeZone,
+  observationFloorOverride = null,
+}: {
+  hourly: HourlyWeatherResponse;
+  insight: MultiModelInsightResponse;
+  distribution: MultiModelDistributionResponse;
+  metarObservation: MetarObservation | null;
+  options: KellyRequestOptions;
+  targetDate: string;
+  timeZone: string;
+  observationFloorOverride?: KellyObservationFloor | null;
+}) => {
+  const reference = resolveReferenceTemperature(hourly, insight, metarObservation, options);
+  const observationFloor =
+    observationFloorOverride ??
+    resolveObservationFloor(hourly, metarObservation, options, {
+      targetDate,
+      timeZone,
+    });
+  const signalBundle = buildUsableSignals(insight, distribution, reference.value);
+  const curve = applyObservationFloorToCurve(buildProbabilityCurve(signalBundle.usableSignals), observationFloor.value);
+  const shrinkResult = buildShrink(signalBundle.usableSignals, signalBundle.totalModelCount, hourly.stale || distribution.stale || insight.stale);
+
+  return {
+    reference,
+    observationFloor,
+    signalBundle,
+    curve,
+    shrink: shrinkResult.value,
+    shrinkResult,
+  };
+};
+
 const buildRankWeight = (rank: number, total: number): number => {
   if (rank === 0) {
     return 1.25;
@@ -786,6 +824,43 @@ const applyObservationFloorToCurve = (
     };
   });
 };
+
+const toPolymarketCandidateFromMarket = (market: KellyMarketRow): PolymarketCandidate => ({
+  marketId: market.marketId,
+  slug: market.slug,
+  title: market.title,
+  marketUrl: market.marketUrl,
+  conditionId: market.conditionId,
+  contractType: market.contractType,
+  unit: market.unit,
+  bucketStartC: market.bucketStartC,
+  bucketEndC: market.bucketEndC,
+  bucketLabel: market.bucketLabel,
+  lifecycle: market.lifecycle,
+  inactiveReason: market.inactiveReason,
+  parseStatus: market.parseStatus,
+  exclusionReason: market.exclusionReason,
+  yesTokenId: market.yesTokenId,
+  noTokenId: market.noTokenId,
+  updatedAt: market.updatedAt,
+  eventTitle: null,
+  eventUrl: null,
+  liquidity: market.liquidity,
+  volume24h: market.volume24h,
+});
+
+export const rebaseKellyMarketsForObservationFloor = (
+  markets: KellyMarketRow[],
+  curve: KellyProbabilityCurvePoint[],
+  shrink: number,
+  observationFloorC: number | null,
+): KellyMarketRow[] =>
+  buildKellyMarkets(
+    markets.map((market) => toPolymarketCandidateFromMarket(market)),
+    applyObservationFloorToCurve(curve, observationFloorC),
+    shrink,
+    observationFloorC,
+  );
 
 const isCandidateBlockedByObservationFloor = (
   candidate: PolymarketCandidate,
@@ -1724,17 +1799,23 @@ export const buildKellyWorkbench = ({
     options.minEdge && Number.isFinite(options.minEdge) && options.minEdge >= 0 ? clamp(options.minEdge, 0, 1) : DEFAULT_MIN_EDGE;
   const riskMode = options.riskMode ?? DEFAULT_RISK_MODE;
   const availableTargetDates = resolveAvailableTargetDates(distribution.availableTimestamps, location.timezone);
-  const reference = resolveReferenceTemperature(hourly, insight, metarObservation, options);
-  const observationFloor =
-    observationFloorOverride ??
-    resolveObservationFloor(hourly, metarObservation, options, {
-      targetDate,
-      timeZone: location.timezone,
-    });
-  const signalBundle = buildUsableSignals(insight, distribution, reference.value);
-  const curve = applyObservationFloorToCurve(buildProbabilityCurve(signalBundle.usableSignals), observationFloor.value);
-  const shrinkResult = buildShrink(signalBundle.usableSignals, signalBundle.totalModelCount, hourly.stale || distribution.stale || insight.stale);
-  const shrink = shrinkResult.value;
+  const {
+    reference,
+    observationFloor,
+    signalBundle,
+    curve,
+    shrink,
+    shrinkResult,
+  } = buildKellyProbabilityContext({
+    hourly,
+    insight,
+    distribution,
+    metarObservation,
+    options,
+    targetDate,
+    timeZone: location.timezone,
+    observationFloorOverride,
+  });
   const distributionSummary = buildDistributionSummary(
     curve,
     shrink,
@@ -1920,6 +2001,7 @@ export const buildStreamMarketPatches = (markets: KellyMarketRow[]): KellyStream
     .map((market) => ({
       lifecycle: market.lifecycle,
       inactiveReason: market.inactiveReason,
+      observationFloorBlocked: market.observationFloorBlocked ?? false,
       entrySourceYes: market.entrySourceYes,
       entrySourceNo: market.entrySourceNo,
       marketId: market.marketId,
@@ -1929,6 +2011,10 @@ export const buildStreamMarketPatches = (markets: KellyMarketRow[]): KellyStream
       yesBestAsk: market.yesBestAsk,
       noBestBid: market.noBestBid,
       noBestAsk: market.noBestAsk,
+      rawProbabilityYes: market.rawProbabilityYes,
+      rawProbabilityNo: market.rawProbabilityNo,
+      fairYes: market.fairYes,
+      fairNo: market.fairNo,
       spreadPct: market.spreadPct,
       edgeYes: market.edgeYes,
       edgeNo: market.edgeNo,

@@ -623,6 +623,7 @@ export interface KellyStreamMarketPatch {
   marketId: string;
   lifecycle: KellyMarketLifecycle;
   inactiveReason: KellyInactiveReason | null;
+  observationFloorBlocked: boolean;
   entrySourceYes: KellyEntrySource;
   entrySourceNo: KellyEntrySource;
   yesPrice: number | null;
@@ -631,6 +632,10 @@ export interface KellyStreamMarketPatch {
   yesBestAsk: number | null;
   noBestBid: number | null;
   noBestAsk: number | null;
+  rawProbabilityYes: number;
+  rawProbabilityNo: number;
+  fairYes: number;
+  fairNo: number;
   spreadPct: number | null;
   edgeYes: number;
   edgeNo: number;
