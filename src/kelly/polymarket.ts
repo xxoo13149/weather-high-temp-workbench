@@ -1,5 +1,3 @@
-import WebSocket, { type RawData } from "ws";
-
 import { config, type RegisteredLocation } from "../config.js";
 import type {
   KellyContractType,
@@ -15,14 +13,33 @@ import { fetchJson, fetchText } from "../lib/http.js";
 
 const POLYMARKET_EVENT_BASE_URL = "https://polymarket.com/event";
 const POLYMARKET_DISCOVERY_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 2_500);
-const POLYMARKET_MAX_SEARCH_TERMS = 6;
+const POLYMARKET_MAX_SEARCH_TERMS = 3;
 const POLYMARKET_DISCOVERY_CONCURRENCY = 2;
-const POLYMARKET_ORDERBOOK_CONCURRENCY = 4;
+const POLYMARKET_ORDERBOOK_CONCURRENCY = 12;
 const POLYMARKET_MAX_EVENT_PAYLOAD_CHARS = 1_500_000;
 const POLYMARKET_MAX_EVENT_VISIT_COUNT = 25_000;
 const POLYMARKET_STREAM_HEARTBEAT_MS = 10_000;
 const POLYMARKET_STREAM_RECONNECT_BASE_MS = 1_500;
 const POLYMARKET_STREAM_RECONNECT_MAX_MS = 15_000;
+const POLYMARKET_ORDERBOOK_EMPTY_ERROR = "Polymarket orderbook fetch returned no usable books.";
+const KELLY_MARKET_CITY_NAME_OVERRIDES: Partial<Record<RegisteredLocation["id"], string>> = {
+  // Masroor is inside Karachi, but Polymarket does not currently publish a dedicated Masroor market.
+  // Keep discovery aligned to the exact venue name so we degrade safely instead of silently reusing Karachi contracts.
+  masroor_opmr: "Masroor",
+};
+
+type RuntimeWebSocketInstance = {
+  readyState: number;
+  send(payload: string): void;
+  close(): void;
+  addEventListener?: (event: string, handler: (payload?: unknown) => void) => void;
+  on?: (event: string, handler: (payload?: unknown) => void) => RuntimeWebSocketInstance;
+};
+
+type RuntimeWebSocketCtor = {
+  new (url: string): RuntimeWebSocketInstance;
+  OPEN?: number;
+};
 type RawOrderLevel = {
   price?: string | number | null;
   size?: string | number | null;
@@ -177,6 +194,75 @@ const toLocalDate = (isoLike: string, timeZone: string): string | null => {
 };
 
 const unique = <T>(values: T[]): T[] => Array.from(new Set(values));
+
+const resolveKellyMarketCityName = (location: RegisteredLocation) =>
+  KELLY_MARKET_CITY_NAME_OVERRIDES[location.id] ?? location.cityName;
+
+const textDecoder = new TextDecoder();
+
+const resolveRuntimeWebSocketCtor = (): RuntimeWebSocketCtor => {
+  const nativeCtor = (globalThis as { WebSocket?: RuntimeWebSocketCtor }).WebSocket;
+  if (nativeCtor) {
+    return nativeCtor;
+  }
+
+  throw new Error("Native WebSocket is unavailable in the current runtime.");
+};
+
+const attachSocketListener = (
+  socket: RuntimeWebSocketInstance,
+  event: "open" | "message" | "close" | "error",
+  handler: (payload?: unknown) => void,
+) => {
+  if (typeof socket.addEventListener === "function") {
+    if (event === "message") {
+      socket.addEventListener(event, (payload) => {
+        const data =
+          payload && typeof payload === "object" && "data" in (payload as { data?: unknown })
+            ? (payload as { data?: unknown }).data
+            : payload;
+        handler(data);
+      });
+      return;
+    }
+
+    socket.addEventListener(event, () => {
+      handler();
+    });
+    return;
+  }
+
+  if (typeof socket.on === "function") {
+    socket.on(event, handler);
+    return;
+  }
+
+  throw new Error(`WebSocket runtime does not support '${event}' listeners.`);
+};
+
+const toPayloadText = async (payload: unknown): Promise<string> => {
+  if (typeof payload === "string") {
+    return payload;
+  }
+
+  if (payload instanceof ArrayBuffer) {
+    return textDecoder.decode(new Uint8Array(payload));
+  }
+
+  if (ArrayBuffer.isView(payload)) {
+    return textDecoder.decode(new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength));
+  }
+
+  if (typeof Blob !== "undefined" && payload instanceof Blob) {
+    return await payload.text();
+  }
+
+  if (payload == null) {
+    return "";
+  }
+
+  return String(payload);
+};
 
 const sanitizeTemperatureText = (value: string): string =>
   value
@@ -545,12 +631,12 @@ const buildLocationTokens = (location: RegisteredLocation): string[] =>
     [
       location.code,
       location.shortLabel,
-      location.cityName,
+      resolveKellyMarketCityName(location),
       location.displayName,
       location.countryName,
-      `${location.cityName} airport`,
-      `${location.cityName} weather`,
-      `${location.cityName} high temperature`,
+      `${resolveKellyMarketCityName(location)} airport`,
+      `${resolveKellyMarketCityName(location)} weather`,
+      `${resolveKellyMarketCityName(location)} high temperature`,
     ]
       .map((value) => normalizeText(value))
       .filter(Boolean),
@@ -558,7 +644,7 @@ const buildLocationTokens = (location: RegisteredLocation): string[] =>
 
 const buildSearchTerms = (location: RegisteredLocation, targetDate: string): string[] => {
   const [isoDate, shortDateWithYear, longDateWithYear, shortDate, longDate] = buildTargetDateTokens(targetDate);
-  const city = location.cityName;
+  const city = resolveKellyMarketCityName(location);
 
   return unique(
     [
@@ -600,7 +686,7 @@ const buildEventSlugCandidates = (location: RegisteredLocation, targetDate: stri
     .toLowerCase();
   const day = String(parsed.getUTCDate());
   const year = String(parsed.getUTCFullYear());
-  const citySlug = slugifyPolymarketSegment(location.cityName);
+  const citySlug = slugifyPolymarketSegment(resolveKellyMarketCityName(location));
   const displaySlug = slugifyPolymarketSegment(location.displayName.replace(/\b(?:airport|international)\b/gi, ""));
 
   return unique(
@@ -609,6 +695,21 @@ const buildEventSlugCandidates = (location: RegisteredLocation, targetDate: stri
       .map((placeSlug) => `highest-temperature-in-${placeSlug}-on-${month}-${day}-${year}`),
   );
 };
+
+const normalizeDiscoveryCandidates = (
+  records: Iterable<Record<string, unknown>>,
+  location: RegisteredLocation,
+  targetDate: string,
+): PolymarketCandidate[] =>
+  Array.from(records)
+    .map((entry) => normalizeCandidate(entry, location, targetDate))
+    .filter((entry): entry is PolymarketCandidate => Boolean(entry))
+    .sort((left, right) => {
+      if (left.parseStatus !== right.parseStatus) {
+        return left.parseStatus === "matched" ? -1 : 1;
+      }
+      return (right.volume24h ?? 0) - (left.volume24h ?? 0);
+    });
 
 const extractPageMarketRecords = (html: string, eventSlug: string): Record<string, unknown>[] => {
   const match = html.match(/<script id="__NEXT_DATA__" type="application\/json"[^>]*>([\s\S]*?)<\/script>/i);
@@ -1280,7 +1381,9 @@ export class PolymarketClient {
   private async fetchEventPageMarkets(location: RegisteredLocation, targetDate: string): Promise<Record<string, unknown>[]> {
     for (const eventSlug of buildEventSlugCandidates(location, targetDate)) {
       try {
-        const html = await fetchText(`${POLYMARKET_EVENT_BASE_URL}/${eventSlug}`);
+        const html = await fetchText(`${POLYMARKET_EVENT_BASE_URL}/${eventSlug}`, {
+          signal: AbortSignal.timeout(POLYMARKET_DISCOVERY_TIMEOUT_MS),
+        });
         const records = extractPageMarketRecords(html, eventSlug);
         if (records.length > 0) {
           return records;
@@ -1295,82 +1398,51 @@ export class PolymarketClient {
 
   async discoverMarkets(location: RegisteredLocation, targetDate: string): Promise<PolymarketDiscoveryResult> {
     const collected = new Map<string, Record<string, unknown>>();
-
-    for (const entry of await this.fetchExactEventMarkets(location, targetDate)) {
-      const title =
-        parseString(entry.question) ??
-        parseString(entry.title) ??
-        parseString(entry.groupItemTitle) ??
-        parseString(entry.slug) ??
-        `exact-event-${collected.size}`;
-      collected.set(marketKey(entry, title), entry);
-    }
-
     const searchTerms = buildSearchTerms(location, targetDate).slice(0, POLYMARKET_MAX_SEARCH_TERMS);
-    if (collected.size === 0) {
-      const searchResults = await mapWithConcurrency(
-        searchTerms,
-        POLYMARKET_DISCOVERY_CONCURRENCY,
-        async (term) => ({ term, results: await this.searchMarkets(term) }),
-      );
 
-      for (const { term, results } of searchResults) {
-        for (const entry of results) {
-          const title =
-            parseString(entry.question) ??
-            parseString(entry.title) ??
-            parseString(entry.groupItemTitle) ??
-            parseString(entry.slug) ??
-            `${term}-${collected.size}`;
-          collected.set(marketKey(entry, title), entry);
-        }
-      }
-    }
-
-    if (collected.size === 0) {
-      for (const entry of await this.fetchEventPageMarkets(location, targetDate)) {
+    const addCollectedRecords = (
+      entries: Iterable<Record<string, unknown>>,
+      fallbackPrefix: string,
+    ) => {
+      for (const entry of entries) {
         const title =
           parseString(entry.question) ??
           parseString(entry.title) ??
           parseString(entry.groupItemTitle) ??
           parseString(entry.slug) ??
-          `page-${collected.size}`;
+          `${fallbackPrefix}-${collected.size}`;
         collected.set(marketKey(entry, title), entry);
       }
+    };
+
+    const hasMatchedCandidates = () =>
+      normalizeDiscoveryCandidates(collected.values(), location, targetDate).some((candidate) => candidate.parseStatus === "matched");
+
+    const searchResults = await mapWithConcurrency(
+      searchTerms,
+      POLYMARKET_DISCOVERY_CONCURRENCY,
+      async (term) => ({ term, results: await this.searchMarkets(term) }),
+    );
+
+    for (const { term, results } of searchResults) {
+      addCollectedRecords(results, term);
+    }
+
+    if (!hasMatchedCandidates()) {
+      addCollectedRecords(await this.fetchExactEventMarkets(location, targetDate), "exact-event");
+    }
+
+    if (!hasMatchedCandidates()) {
+      addCollectedRecords(await this.fetchEventPageMarkets(location, targetDate), "page");
     }
 
     if (collected.size === 0) {
-      for (const entry of await this.fallbackActiveMarkets()) {
-        const title =
-          parseString(entry.question) ??
-          parseString(entry.title) ??
-          parseString(entry.groupItemTitle) ??
-          parseString(entry.slug) ??
-          `fallback-${collected.size}`;
-        collected.set(marketKey(entry, title), entry);
-      }
+      addCollectedRecords(await this.fallbackActiveMarkets(), "fallback");
     }
 
-    const candidates = Array.from(collected.values())
-      .map((entry) => normalizeCandidate(entry, location, targetDate))
-      .filter((entry): entry is PolymarketCandidate => Boolean(entry))
-      .sort((left, right) => {
-        if (left.parseStatus !== right.parseStatus) {
-          return left.parseStatus === "matched" ? -1 : 1;
-        }
-        return (right.volume24h ?? 0) - (left.volume24h ?? 0);
-      });
-
-    const finalCandidates = Array.from(collected.values())
-      .map((entry) => normalizeCandidate(entry, location, targetDate))
-      .filter((entry): entry is PolymarketCandidate => Boolean(entry))
-      .sort((left, right) => {
-        if (left.parseStatus !== right.parseStatus) {
-          return left.parseStatus === "matched" ? -1 : 1;
-        }
-        return (right.volume24h ?? 0) - (left.volume24h ?? 0);
-      });
+    const finalCandidates = normalizeDiscoveryCandidates(collected.values(), location, targetDate);
     const { active: visibleCandidates, inactive: inactiveCandidates } = partitionDiscoveryCandidates(finalCandidates);
+    const linkedCandidates = [...visibleCandidates, ...inactiveCandidates].filter((candidate) => candidate.parseStatus === "matched");
 
     return {
       fetchedAt: new Date().toISOString(),
@@ -1380,9 +1452,9 @@ export class PolymarketClient {
         meteoblueWeekUrl: location.weekPageUrl,
         meteoblueMultimodelUrl: location.multimodelPageUrl,
         polymarketSearchUrl: `${this.gammaBaseUrl}/public-search?q=${encodeURIComponent(
-          searchTerms[0] ?? `${location.cityName} high temperature ${targetDate}`,
+          searchTerms[0] ?? `${resolveKellyMarketCityName(location)} high temperature ${targetDate}`,
         )}`,
-        marketUrls: visibleCandidates
+        marketUrls: linkedCandidates
           .map((candidate) => candidate.marketUrl)
           .filter((value): value is string => Boolean(value))
           .slice(0, 12),
@@ -1414,10 +1486,13 @@ export class PolymarketClient {
         }
       });
 
+    const resolvedEntries = entries.filter((entry): entry is NormalizedOrderBook => Boolean(entry));
+    if (uniqueTokenIds.length > 0 && resolvedEntries.length === 0) {
+      throw new Error(POLYMARKET_ORDERBOOK_EMPTY_ERROR);
+    }
+
     return new Map(
-      entries
-        .filter((entry): entry is NormalizedOrderBook => Boolean(entry))
-        .map((entry) => [entry.tokenId, entry]),
+      resolvedEntries.map((entry) => [entry.tokenId, entry]),
     );
   }
 
@@ -1440,10 +1515,27 @@ export class PolymarketClient {
       };
     }
 
+    let socketCtor: RuntimeWebSocketCtor;
+    try {
+      socketCtor = resolveRuntimeWebSocketCtor();
+    } catch (error) {
+      onMessage({
+        type: "status",
+        generatedAt: new Date().toISOString(),
+        state: "unavailable",
+        reasonCode: "upstream_error",
+        message: error instanceof Error ? error.message : "Polymarket WebSocket runtime is unavailable.",
+      });
+      return {
+        close() {},
+      };
+    }
+
+    const socketOpenState = socketCtor.OPEN ?? 1;
     let closed = false;
-    let socket: WebSocket | null = null;
-    let heartbeatTimer: NodeJS.Timeout | null = null;
-    let reconnectTimer: NodeJS.Timeout | null = null;
+    let socket: RuntimeWebSocketInstance | null = null;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempt = 0;
 
     const clearHeartbeat = () => {
@@ -1497,10 +1589,10 @@ export class PolymarketClient {
         return;
       }
 
-      const nextSocket = new WebSocket(this.clobWsUrl);
+      const nextSocket = new socketCtor(this.clobWsUrl);
       socket = nextSocket;
 
-      nextSocket.on("open", () => {
+      attachSocketListener(nextSocket, "open", () => {
         if (socket !== nextSocket || closed) {
           return;
         }
@@ -1526,7 +1618,7 @@ export class PolymarketClient {
         // Quiet books are valid, so close/error should drive reconnects instead
         // of a synthetic idle watchdog.
         heartbeatTimer = setInterval(() => {
-          if (nextSocket.readyState !== WebSocket.OPEN) {
+          if (nextSocket.readyState !== socketOpenState) {
             return;
           }
 
@@ -1539,20 +1631,21 @@ export class PolymarketClient {
         return;
       });
 
-      nextSocket.on("message", (payload: RawData) => {
-        if (socket !== nextSocket || closed) {
-          return;
-        }
+      attachSocketListener(nextSocket, "message", (payload) => {
+        void (async () => {
+          if (socket !== nextSocket || closed) {
+            return;
+          }
 
-        const rawText = payload.toString();
-        if (!rawText.trim() || isKeepaliveText(rawText)) {
-          return;
-        }
+          const rawText = await toPayloadText(payload);
+          if (!rawText.trim() || isKeepaliveText(rawText)) {
+            return;
+          }
 
-        let parsed: unknown = rawText;
-        try {
-          parsed = JSON.parse(rawText);
-        } catch {
+          let parsed: unknown = rawText;
+          try {
+            parsed = JSON.parse(rawText);
+          } catch {
           if (/\berror\b/i.test(rawText)) {
             onMessage({
               type: "status",
@@ -1593,9 +1686,10 @@ export class PolymarketClient {
             message: "Polymarket 上游实时流返回异常，当前回退到周期性盘口同步。",
           });
         }
+        })();
       });
 
-      nextSocket.on("close", () => {
+      attachSocketListener(nextSocket, "close", () => {
         if (socket !== nextSocket) {
           return;
         }
@@ -1607,7 +1701,7 @@ export class PolymarketClient {
         }
       });
 
-      nextSocket.on("error", () => {
+      attachSocketListener(nextSocket, "error", () => {
         if (socket !== nextSocket) {
           return;
         }
@@ -1655,7 +1749,7 @@ export const buildDiscoveryWarnings = (candidates: PolymarketCandidate[]): strin
   }
 
   if (matchedCount > 0) {
-    return ["已匹配到市场，但当前都已结束或暂不可交易。"];
+    return [];
   }
 
   return ["已发现候选市场，但未能稳定解析出符合当前地点和日期的温度档位。"];

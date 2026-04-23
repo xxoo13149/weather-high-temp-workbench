@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-const { fetchJsonMock, MockWebSocket, wsInstances } = vi.hoisted(() => {
+const { fetchJsonMock, MockWebSocket, MockNativeWebSocket, wsInstances, nativeWsInstances } = vi.hoisted(() => {
   const fetchJsonMock = vi.fn();
   const wsInstances: MockWebSocket[] = [];
+  const nativeWsInstances: MockNativeWebSocket[] = [];
 
   class MockWebSocket {
     static OPEN = 1;
@@ -39,10 +40,46 @@ const { fetchJsonMock, MockWebSocket, wsInstances } = vi.hoisted(() => {
     }
   }
 
+  class MockNativeWebSocket {
+    static OPEN = 1;
+    static CLOSED = 3;
+
+    readyState = MockNativeWebSocket.OPEN;
+    sent: string[] = [];
+    private readonly handlers = new Map<string, Array<(payload?: unknown) => void>>();
+
+    constructor(public readonly url: string) {
+      nativeWsInstances.push(this);
+    }
+
+    addEventListener(event: string, handler: (payload?: unknown) => void) {
+      const existing = this.handlers.get(event) ?? [];
+      existing.push(handler);
+      this.handlers.set(event, existing);
+    }
+
+    send(payload: string) {
+      this.sent.push(String(payload));
+    }
+
+    close() {
+      this.readyState = MockNativeWebSocket.CLOSED;
+      this.emit("close");
+    }
+
+    emit(event: string, payload?: unknown) {
+      for (const handler of this.handlers.get(event) ?? []) {
+        handler(payload);
+      }
+    }
+  }
+
   return {
     fetchJsonMock,
     MockWebSocket,
+    MockNativeWebSocket,
     wsInstances,
+    nativeWsInstances,
   };
 });
 
@@ -61,6 +98,8 @@ describe("PolymarketClient", () => {
     vi.resetModules();
     fetchJsonMock.mockReset();
     wsInstances.length = 0;
+    nativeWsInstances.length = 0;
+    vi.stubGlobal("WebSocket", MockWebSocket);
     fetchJsonMock.mockResolvedValue([
       {
         id: "market-1",
@@ -83,7 +122,9 @@ describe("PolymarketClient", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
     wsInstances.length = 0;
+    nativeWsInstances.length = 0;
   });
 
   test("discovers and parses a Fahrenheit range market", async () => {
@@ -103,6 +144,30 @@ describe("PolymarketClient", () => {
     expect(result.candidates[0]?.bucketEndC).toBeCloseTo(28.33, 2);
     expect(result.candidates[0]?.bucketLabel).toBe("82.0F - 83.0F");
     expect(result.candidates[0]?.title).toBe("Will the highest temperature in Miami be between 82-83 F on April 8?");
+  });
+
+  test("prefers search discovery before exact event probing", async () => {
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+
+    await client.discoverMarkets(LOCATION_REGISTRY.miami_mia, "2026-04-08");
+
+    expect(fetchJsonMock).toHaveBeenCalled();
+    expect(fetchJsonMock.mock.calls.some(([url]) => String(url).includes("/public-search"))).toBe(true);
+    expect(fetchJsonMock.mock.calls.some(([url]) => String(url).includes("/events?limit=1&slug="))).toBe(false);
+  });
+
+  test("keeps Masroor discovery aligned to the exact venue instead of silently reusing Karachi markets", async () => {
+    fetchJsonMock.mockResolvedValue([]);
+
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+
+    await client.discoverMarkets(LOCATION_REGISTRY.masroor_opmr, "2026-04-22");
+
+    const requestedUrls = fetchJsonMock.mock.calls.map(([url]) => String(url));
+    expect(requestedUrls.some((url) => url.includes("Masroor"))).toBe(true);
+    expect(requestedUrls.some((url) => url.includes("Karachi"))).toBe(false);
   });
 
   test("filters closed and non-accepting markets during discovery", async () => {
@@ -356,6 +421,17 @@ describe("PolymarketClient", () => {
     });
   });
 
+  test("fetchOrderBooks throws when every token request fails so callers can fall back to stale books", async () => {
+    fetchJsonMock.mockRejectedValue(new Error("upstream unavailable"));
+
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+
+    await expect(client.fetchOrderBooks(["token-1", "token-2"])).rejects.toThrow(
+      "Polymarket orderbook fetch returned no usable books.",
+    );
+  });
+
   test("treats official market channel signals as repricing triggers and preserves upstream timestamps", async () => {
     const { PolymarketClient } = await import("../src/kelly/polymarket.js");
     const client = new PolymarketClient();
@@ -411,6 +487,7 @@ describe("PolymarketClient", () => {
       ),
     );
 
+    await Promise.resolve();
     expect(signals).toEqual(["2026-04-07T01:38:20.000Z", "2026-04-07T01:38:25.000Z"]);
     handle.close();
   });
@@ -566,6 +643,53 @@ describe("PolymarketClient", () => {
     handle.close();
   });
 
+  test("uses the native Worker WebSocket runtime when available", async () => {
+    vi.stubGlobal("WebSocket", MockNativeWebSocket);
+    vi.stubGlobal("WebSocketPair", class MockWorkerWebSocketPair {});
+
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+    const messages: unknown[] = [];
+    const signals: string[] = [];
+
+    const handle = client.createMarketStream(
+      ["token-1"],
+      (message) => {
+        messages.push(message);
+      },
+      (occurredAt) => {
+        signals.push(occurredAt);
+      },
+    );
+
+    expect(wsInstances).toHaveLength(0);
+    expect(nativeWsInstances).toHaveLength(1);
+
+    const socket = nativeWsInstances.at(-1);
+    socket?.emit("open");
+    socket?.emit("message", {
+      data: JSON.stringify({
+        event_type: "price_change",
+        asset_id: "token-1",
+        timestamp: 1_775_525_900,
+      }),
+    });
+
+    await Promise.resolve();
+    expect(messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "status",
+          state: "connected",
+          reasonCode: "ws_connected",
+        }),
+      ]),
+    );
+    expect(signals).toEqual(["2026-04-07T01:38:20.000Z"]);
+
+    handle.close();
+  });
+
   test("parses 16C titles without producing negative buckets", async () => {
     fetchJsonMock.mockResolvedValue([
       {
@@ -591,5 +715,45 @@ describe("PolymarketClient", () => {
     expect(candidate).toBeDefined();
     expect(candidate?.bucketEndC).toBeGreaterThanOrEqual(16);
     expect(candidate?.bucketLabel).toContain("16");
+  });
+
+  test("does not emit a warning when matched markets are present but temporarily inactive", async () => {
+    const { buildDiscoveryWarnings } = await import("../src/kelly/polymarket.js");
+
+    expect(
+      buildDiscoveryWarnings([
+        {
+          marketId: "market-inactive",
+          slug: "market-inactive",
+          title: "Inactive market",
+          marketUrl: "https://example.com/market/inactive",
+          conditionId: "condition-inactive",
+          contractType: "exact",
+          unit: "C",
+          bucketStartC: 22,
+          bucketEndC: 22,
+          bucketLabel: "22C",
+          lifecycle: "inactive",
+          inactiveReason: "closed",
+          parseStatus: "matched",
+          exclusionReason: null,
+          yesTokenId: "yes-inactive",
+          noTokenId: "no-inactive",
+          updatedAt: "2026-04-08T23:59:00.000Z",
+          eventTitle: "Highest temperature test event",
+          eventUrl: "https://example.com/event/inactive",
+          liquidity: 100,
+          volume24h: 10,
+          description: null,
+          resolutionSource: null,
+          active: false,
+          closed: true,
+          acceptingOrders: false,
+          archived: false,
+          enableOrderBook: true,
+          endsAt: "2026-04-08T23:59:00.000Z",
+        },
+      ] as any),
+    ).toEqual([]);
   });
 });
