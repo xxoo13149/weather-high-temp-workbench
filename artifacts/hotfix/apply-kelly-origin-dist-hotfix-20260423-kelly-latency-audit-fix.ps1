@@ -34,12 +34,19 @@ if (Test-Path -LiteralPath $extractPath) {
 Expand-Archive -LiteralPath $resolvedZipPath -DestinationPath $extractPath -Force
 
 $extractedDistPath = Join-Path $extractPath "dist"
-if (!(Test-Path -LiteralPath $extractedDistPath)) {
-  throw "Extracted archive does not contain dist directory: $extractedDistPath"
+$sourceDistPath = $null
+
+if (Test-Path -LiteralPath $extractedDistPath) {
+  $sourceDistPath = (Resolve-Path -LiteralPath $extractedDistPath).Path
+} elseif (Test-Path -LiteralPath (Join-Path $extractPath "src\index.js")) {
+  $sourceDistPath = (Resolve-Path -LiteralPath $extractPath).Path
+} else {
+  throw "Extracted archive does not contain a deployable dist payload. Checked: $extractedDistPath and $extractPath"
 }
 
 Remove-Item -LiteralPath $targetDistPath -Recurse -Force
-Copy-Item -LiteralPath $extractedDistPath -Destination $targetDistPath -Recurse -Force
+New-Item -ItemType Directory -Path $targetDistPath -Force | Out-Null
+Copy-Item -Path (Join-Path $sourceDistPath "*") -Destination $targetDistPath -Recurse -Force
 
 if (!(Test-Path -LiteralPath $ServiceScriptPath)) {
   throw "Service control script not found: $ServiceScriptPath"
@@ -56,6 +63,7 @@ $sampleResponse = Invoke-RestMethod -Uri "http://127.0.0.1:8081/api/weather/kell
   appDirectory = $resolvedAppDirectory
   zipPath = $resolvedZipPath
   backupDistPath = $backupDistPath
+  deployedFrom = $sourceDistPath
   buildId = $healthResponse.buildId
   healthOk = [bool]($healthResponse.ok -or $healthResponse.healthOk)
   sampleLocationId = $sampleResponse.location.id
