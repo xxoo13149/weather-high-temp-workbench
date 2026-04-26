@@ -19,6 +19,8 @@ tmp_*
 current-page*.png
 page*.png
 docs/stitch/
+docs/private/
 docs/tmp_*
 data/favorites.json
+.local/
 m[[]1])

@@ -16,13 +16,16 @@ describe("RefreshableCache", () => {
 
     const first = await cache.get();
     expect(first.stale).toBe(false);
+    expect(first.freshness).toBe("fresh");
 
     await new Promise((resolve) => setTimeout(resolve, 5));
     const second = await cache.get({ allowStaleOnError: true });
 
     expect(second.value).toEqual({ value: "fresh" });
     expect(second.stale).toBe(true);
+    expect(second.freshness).toBe("fallback_error");
     expect(cache.peek().lastError).toContain("boom");
+    expect(cache.peek().freshness).toBe("fallback_error");
   });
 
   it("deduplicates concurrent refreshes", async () => {
@@ -40,6 +43,29 @@ describe("RefreshableCache", () => {
     expect(first.value).toBe(2);
     expect(second.value).toBe(2);
     expect(calls).toBe(2);
+  });
+
+  it("reuses an in-flight load even when later callers request forceRefresh", async () => {
+    let calls = 0;
+    let release!: (value: number) => void;
+    const cache = new RefreshableCache(1, async () => {
+      calls += 1;
+      return await new Promise<number>((resolve) => {
+        release = resolve;
+      });
+    });
+
+    const first = cache.get({ forceRefresh: true });
+    const second = cache.get({ forceRefresh: true });
+
+    expect(calls).toBe(1);
+
+    release(7);
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(firstResult.value).toBe(7);
+    expect(secondResult.value).toBe(7);
+    expect(calls).toBe(1);
   });
 
   it("returns stale value immediately and refreshes in background when staleWhileRevalidate is enabled", async () => {
@@ -66,7 +92,9 @@ describe("RefreshableCache", () => {
       expect(stale.value).toBe(1);
       expect(stale.cacheHit).toBe(true);
       expect(stale.stale).toBe(true);
+      expect(stale.freshness).toBe("revalidating");
       expect(cache.peek().inFlight).toBe(true);
+      expect(cache.peek().freshness).toBe("revalidating");
       expect(calls).toBe(2);
 
       release(2);
@@ -76,6 +104,39 @@ describe("RefreshableCache", () => {
       const refreshed = await cache.get();
       expect(refreshed.value).toBe(2);
       expect(refreshed.stale).toBe(false);
+      expect(refreshed.freshness).toBe("fresh");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("escalates background revalidation failure to fallback_error on the next stale read", async () => {
+    vi.useFakeTimers();
+
+    try {
+      let calls = 0;
+      const cache = new RefreshableCache(1, async () => {
+        calls += 1;
+        if (calls === 1) {
+          return 1;
+        }
+
+        throw new Error("background boom");
+      });
+
+      await cache.get();
+      await vi.advanceTimersByTimeAsync(5);
+
+      const revalidating = await cache.get({ staleWhileRevalidate: true });
+      expect(revalidating.freshness).toBe("revalidating");
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const fallback = await cache.get({ staleWhileRevalidate: true });
+      expect(fallback.stale).toBe(true);
+      expect(fallback.freshness).toBe("fallback_error");
+      expect(cache.peek().freshness).toBe("fallback_error");
     } finally {
       vi.useRealTimers();
     }

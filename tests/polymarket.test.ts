@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-const { fetchJsonMock, MockWebSocket, MockNativeWebSocket, wsInstances, nativeWsInstances } = vi.hoisted(() => {
+const { fetchJsonMock, fetchTextMock, MockWebSocket, MockNativeWebSocket, wsInstances, nativeWsInstances } = vi.hoisted(() => {
   const fetchJsonMock = vi.fn();
+  const fetchTextMock = vi.fn();
   const wsInstances: MockWebSocket[] = [];
   const nativeWsInstances: MockNativeWebSocket[] = [];
 
@@ -76,6 +77,7 @@ const { fetchJsonMock, MockWebSocket, MockNativeWebSocket, wsInstances, nativeWs
 
   return {
     fetchJsonMock,
+    fetchTextMock,
     MockWebSocket,
     MockNativeWebSocket,
     wsInstances,
@@ -85,6 +87,7 @@ const { fetchJsonMock, MockWebSocket, MockNativeWebSocket, wsInstances, nativeWs
 
 vi.mock("../src/lib/http.js", () => ({
   fetchJson: fetchJsonMock,
+  fetchText: fetchTextMock,
 }));
 
 vi.mock("ws", () => ({
@@ -97,9 +100,11 @@ describe("PolymarketClient", () => {
   beforeEach(() => {
     vi.resetModules();
     fetchJsonMock.mockReset();
+    fetchTextMock.mockReset();
     wsInstances.length = 0;
     nativeWsInstances.length = 0;
     vi.stubGlobal("WebSocket", MockWebSocket);
+    fetchTextMock.mockResolvedValue("");
     fetchJsonMock.mockResolvedValue([
       {
         id: "market-1",
@@ -157,7 +162,110 @@ describe("PolymarketClient", () => {
     expect(fetchJsonMock.mock.calls.some(([url]) => String(url).includes("/events?limit=1&slug="))).toBe(false);
   });
 
-  test("keeps Masroor discovery aligned to the exact venue instead of silently reusing Karachi markets", async () => {
+  test("merges multiple search endpoints for the same term and keeps the stronger market record", async () => {
+    fetchJsonMock.mockImplementation(async (url: string) => {
+      if (url.includes("/public-search?q=")) {
+        return [
+          {
+            id: "market-merge",
+            slug: "highest-temperature-in-miami-on-april-8-2026-82-83f",
+            question: "Will the highest temperature in Miami be between 82-83 F on April 8?",
+            eventTitle: "Highest temperature in Miami on April 8?",
+            conditionId: "condition-merge",
+            outcomes: ["Yes", "No"],
+            acceptingOrders: true,
+          },
+        ];
+      }
+
+      if (url.includes("/public-search?query=")) {
+        return [
+          {
+            id: "market-merge",
+            slug: "highest-temperature-in-miami-on-april-8-2026-82-83f",
+            question: "Will the highest temperature in Miami be between 82-83 F on April 8?",
+            conditionId: "condition-merge",
+            outcomes: ["Yes", "No"],
+            clobTokenIds: ["yes-merge", "no-merge"],
+            liquidity: 34000,
+            volume24hr: 12000,
+            acceptingOrders: true,
+          },
+        ];
+      }
+
+      if (url.includes("/markets?search=")) {
+        return [
+          {
+            id: "market-merge",
+            slug: "highest-temperature-in-miami-on-april-8-2026-82-83f",
+            question: "Will the highest temperature in Miami be between 82-83 F on April 8?",
+            conditionId: "condition-merge",
+            description: "Merged description from the broader markets search endpoint.",
+            resolutionSource: "https://example.com/miami-resolution",
+            event: {
+              slug: "highest-temperature-in-miami-on-april-8-2026",
+              title: "Highest temperature in Miami on April 8?",
+            },
+            acceptingOrders: true,
+          },
+        ];
+      }
+
+      return [];
+    });
+
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+    const result = await client.discoverMarkets(LOCATION_REGISTRY.miami_mia, "2026-04-08");
+    const candidate = result.candidates.find((entry) => entry.marketId === "market-merge");
+
+    expect(candidate).toMatchObject({
+      parseStatus: "matched",
+      yesTokenId: "yes-merge",
+      noTokenId: "no-merge",
+      description: "Merged description from the broader markets search endpoint.",
+      resolutionSource: "https://example.com/miami-resolution",
+      eventUrl: "https://polymarket.com/event/highest-temperature-in-miami-on-april-8-2026",
+    });
+    expect(fetchJsonMock.mock.calls.some(([url]) => String(url).includes("/public-search?q="))).toBe(true);
+    expect(fetchJsonMock.mock.calls.some(([url]) => String(url).includes("/markets?search="))).toBe(true);
+  });
+
+  test("falls back to the public-search query variant when primary search endpoints are empty", async () => {
+    fetchJsonMock.mockImplementation(async (url: string) => {
+      if (url.includes("/public-search?q=") || url.includes("/markets?search=")) {
+        return [];
+      }
+
+      if (url.includes("/public-search?query=")) {
+        return [
+          {
+            id: "market-query-fallback",
+            slug: "highest-temperature-in-miami-on-april-8-2026-82-83f",
+            question: "Will the highest temperature in Miami be between 82-83 F on April 8?",
+            conditionId: "condition-query-fallback",
+            outcomes: ["Yes", "No"],
+            clobTokenIds: ["yes-query-fallback", "no-query-fallback"],
+            liquidity: 12000,
+            volume24hr: 3000,
+            acceptingOrders: true,
+          },
+        ];
+      }
+
+      return [];
+    });
+
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+
+    await client.discoverMarkets(LOCATION_REGISTRY.miami_mia, "2026-04-08");
+
+    expect(fetchJsonMock.mock.calls.some(([url]) => String(url).includes("/public-search?query="))).toBe(true);
+  });
+
+  test("maps Masroor discovery to Karachi because Polymarket publishes that city contract name", async () => {
     fetchJsonMock.mockResolvedValue([]);
 
     const { PolymarketClient } = await import("../src/kelly/polymarket.js");
@@ -166,8 +274,187 @@ describe("PolymarketClient", () => {
     await client.discoverMarkets(LOCATION_REGISTRY.masroor_opmr, "2026-04-22");
 
     const requestedUrls = fetchJsonMock.mock.calls.map(([url]) => String(url));
-    expect(requestedUrls.some((url) => url.includes("Masroor"))).toBe(true);
-    expect(requestedUrls.some((url) => url.includes("Karachi"))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes("Karachi"))).toBe(true);
+  });
+
+  test("falls back to exact event discovery when search returns only unresolved candidates", async () => {
+    fetchJsonMock.mockImplementation(async (url: string) => {
+      if (url.includes("/public-search") || url.includes("/markets?search=")) {
+        return [
+          {
+            id: "search-unresolved",
+            slug: "highest-temperature-in-guangzhou-on-april-24-2026-22c",
+            question: "Highest temperature market",
+            conditionId: "condition-search-unresolved",
+            outcomes: ["Yes", "No"],
+            acceptingOrders: true,
+          },
+        ];
+      }
+
+      if (url.includes("/events?limit=1&slug=highest-temperature-in-guangzhou-on-april-24-2026")) {
+        return {
+          events: [
+            {
+              slug: "highest-temperature-in-guangzhou-on-april-24-2026",
+              title: "Highest temperature in Guangzhou on April 24?",
+              markets: [
+                {
+                  id: "exact-event-match",
+                  question: "Will the highest temperature in Guangzhou be 22C on April 24?",
+                  conditionId: "condition-exact-event",
+                  outcomes: ["Yes", "No"],
+                  clobTokenIds: ["yes-exact-event", "no-exact-event"],
+                  volume24hr: 9000,
+                  liquidity: 24000,
+                  acceptingOrders: true,
+                },
+              ],
+            },
+          ],
+        };
+      }
+
+      return [];
+    });
+
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+    const result = await client.discoverMarkets(LOCATION_REGISTRY.guangzhou_can, "2026-04-24");
+    const candidate = result.candidates.find((entry) => entry.marketId === "exact-event-match");
+
+    expect(candidate).toMatchObject({
+      parseStatus: "matched",
+      yesTokenId: "yes-exact-event",
+      noTokenId: "no-exact-event",
+      eventUrl: "https://polymarket.com/event/highest-temperature-in-guangzhou-on-april-24-2026",
+    });
+    expect(fetchJsonMock.mock.calls.some(([url]) => String(url).includes("/events?limit=1&slug=highest-temperature-in-guangzhou-on-april-24-2026"))).toBe(true);
+  });
+
+  test("falls back to event page discovery when exact event lookup returns no markets", async () => {
+    fetchJsonMock.mockImplementation(async (url: string) => {
+      if (url.includes("/public-search") || url.includes("/markets?search=")) {
+        return [
+          {
+            id: "page-unresolved",
+            slug: "highest-temperature-in-singapore-on-april-24-2026-31c",
+            question: "Highest temperature market",
+            conditionId: "condition-page-unresolved",
+            outcomes: ["Yes", "No"],
+            acceptingOrders: true,
+          },
+        ];
+      }
+
+      if (url.includes("/events?limit=1&slug=")) {
+        return [];
+      }
+
+      return [];
+    });
+
+    fetchTextMock.mockImplementation(async (url: string) => {
+      if (!url.includes("/event/highest-temperature-in-singapore-on-april-24-2026")) {
+        return "";
+      }
+
+      return `<!doctype html><html><body><script id="__NEXT_DATA__" type="application/json">${JSON.stringify({
+        props: {
+          pageProps: {
+            event: {
+              slug: "highest-temperature-in-singapore-on-april-24-2026",
+              title: "Highest temperature in Singapore on April 24?",
+              markets: [
+                {
+                  id: "page-match",
+                  question: "Will the highest temperature in Singapore be 31C on April 24?",
+                  conditionId: "condition-page-match",
+                  outcomes: ["Yes", "No"],
+                  clobTokenIds: ["yes-page", "no-page"],
+                  liquidity: 21000,
+                  volume24hr: 7500,
+                  acceptingOrders: true,
+                },
+              ],
+            },
+          },
+        },
+      })}</script></body></html>`;
+    });
+
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+    const result = await client.discoverMarkets(LOCATION_REGISTRY.singapore_sin, "2026-04-24");
+    const candidate = result.candidates.find((entry) => entry.marketId === "page-match");
+
+    expect(candidate).toMatchObject({
+      parseStatus: "matched",
+      yesTokenId: "yes-page",
+      noTokenId: "no-page",
+      eventUrl: "https://polymarket.com/event/highest-temperature-in-singapore-on-april-24-2026",
+    });
+    expect(fetchTextMock).toHaveBeenCalled();
+  });
+
+  test("falls back to active markets even when unresolved candidates were already collected", async () => {
+    fetchJsonMock.mockImplementation(async (url: string) => {
+      if (url.includes("/public-search") || url.includes("/markets?search=")) {
+        return [
+          {
+            id: "active-fallback-unresolved",
+            slug: "highest-temperature-in-lagos-on-april-24-2026-30c",
+            question: "Highest temperature market",
+            conditionId: "condition-active-fallback-unresolved",
+            outcomes: ["Yes", "No"],
+            acceptingOrders: true,
+          },
+        ];
+      }
+
+      if (url.includes("/events?limit=1&slug=")) {
+        return [];
+      }
+
+      if (url.includes("/markets?active=true&closed=false&limit=100&offset=0")) {
+        return [
+          {
+            id: "active-fallback-match",
+            slug: "highest-temperature-in-lagos-on-april-24-2026-30c",
+            question: "Will the highest temperature in Lagos be 30C on April 24?",
+            eventTitle: "Highest temperature in Lagos on April 24?",
+            conditionId: "condition-active-fallback-match",
+            outcomes: ["Yes", "No"],
+            clobTokenIds: ["yes-active-fallback", "no-active-fallback"],
+            volume24hr: 5400,
+            liquidity: 16000,
+            acceptingOrders: true,
+          },
+        ];
+      }
+
+      if (url.includes("/markets?active=true&closed=false&limit=100&offset=100")) {
+        return [];
+      }
+
+      return [];
+    });
+
+    fetchTextMock.mockResolvedValue("");
+
+    const { PolymarketClient } = await import("../src/kelly/polymarket.js");
+    const client = new PolymarketClient();
+    const result = await client.discoverMarkets(LOCATION_REGISTRY.lagos_los, "2026-04-24");
+    const candidate = result.candidates.find((entry) => entry.marketId === "active-fallback-match");
+
+    expect(candidate).toMatchObject({
+      parseStatus: "matched",
+      yesTokenId: "yes-active-fallback",
+      noTokenId: "no-active-fallback",
+    });
+    expect(
+      fetchJsonMock.mock.calls.some(([url]) => String(url).includes("/markets?active=true&closed=false&limit=100&offset=0")),
+    ).toBe(true);
   });
 
   test("filters closed and non-accepting markets during discovery", async () => {

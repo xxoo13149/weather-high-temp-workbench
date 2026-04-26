@@ -1,7 +1,14 @@
 import { config } from "./config.js";
 import { createApp } from "./app.js";
+import { MeteoblueWeatherService } from "./providers/meteoblue/service.js";
+import { startKellyPrewarmLoop } from "./server/kelly-prewarm.js";
 
-const app = createApp();
+const service = new MeteoblueWeatherService();
+const app = createApp(service);
+
+process.on("unhandledRejection", (error) => {
+  app.log.error({ error }, "[runtime] unhandled rejection");
+});
 
 const assertJsonResponse = async (url: string) => {
   const response = await fetch(url, {
@@ -50,6 +57,7 @@ const start = async (): Promise<void> => {
 
   try {
     await runStartupSmokeChecks(resolveSmokeOrigin(address));
+    startKellyPrewarmLoop(service, app.log);
   } catch (error) {
     app.log.error(error);
     await app.close();

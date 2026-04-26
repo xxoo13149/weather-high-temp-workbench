@@ -5,6 +5,8 @@ import { AppError } from "../../domain/errors.js";
 export const MULTIMODEL_IMAGE_VERSION = "2026-04-04.2";
 export const MULTIMODEL_HIGHCHARTS_VERSION = "2026-04-04.2";
 
+type ParsedTemperatureUnit = "C" | "F";
+
 export interface MultiModelPageModelMeta {
   modelCode: string;
   sourceDisplayName: string;
@@ -70,6 +72,19 @@ const assertHighchartsUrl = (url: string): string => {
   }
 
   return url;
+};
+
+export const resolveMultiModelTemperatureUnit = (
+  url: string,
+  fallbackUnit: ParsedTemperatureUnit = "C",
+): ParsedTemperatureUnit => {
+  try {
+    const parsed = new URL(url);
+    const rawUnit = (parsed.searchParams.get("temperature_units") ?? "").trim().toUpperCase();
+    return rawUnit === "F" || rawUnit === "C" ? rawUnit : fallbackUnit;
+  } catch {
+    return fallbackUnit;
+  }
 };
 
 const extractFirstAttrUrl = ($: ReturnType<typeof load>, selectors: string[], attrs: string[]): string | null => {

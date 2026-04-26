@@ -1,8 +1,10 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import type { WeatherService } from "../src/domain/weather.js";
+import type { KellyRuntimeHealth, ServiceRuntimeStatus, WeatherService } from "../src/domain/weather.js";
 import { createApp } from "../src/app.js";
 
 const frontendDistDir = join(process.cwd(), "tests", "fixtures", "frontend-dist");
@@ -98,6 +100,38 @@ const buildLocationInfo = (locationId: keyof typeof locationMap) => ({
   timezone: locationMap[locationId].timezone,
 });
 
+const getDisplayUnit = (locationId: keyof typeof locationMap) => (locationId === "miami_mia" ? "F" : "C");
+
+const runtimeStatus: ServiceRuntimeStatus = {
+  caches: {
+    week: {
+      entryCount: 2,
+      freshCount: 2,
+      revalidatingCount: 0,
+      fallbackErrorCount: 0,
+      inFlightCount: 0,
+      lastSuccessAt: "2026-03-27T15:30:00.000Z",
+    },
+    multiModelImage: {
+      entryCount: 1,
+      freshCount: 1,
+      revalidatingCount: 0,
+      fallbackErrorCount: 0,
+      inFlightCount: 0,
+      lastSuccessAt: "2026-03-27T15:30:00.000Z",
+    },
+    multiModelDistribution: {
+      entryCount: 1,
+      freshCount: 1,
+      revalidatingCount: 0,
+      fallbackErrorCount: 0,
+      inFlightCount: 0,
+      lastSuccessAt: "2026-03-27T15:30:00.000Z",
+    },
+  },
+  kelly: null,
+};
+
 const createService = (): WeatherService => {
   const getHourly = vi.fn().mockImplementation(async (locationId: keyof typeof locationMap, mode = "1h", limit?: number) => ({
     location: buildLocationInfo(locationId),
@@ -107,6 +141,7 @@ const createService = (): WeatherService => {
     periodHours: mode === "3h" ? 3 : 1,
     sourceType: "week-meteogram-highcharts",
     stale: false,
+    freshness: "fresh",
     pageUrl: `https://example.com/week/${locationId}`,
     parserVersion: "test",
     items: [],
@@ -122,6 +157,7 @@ const createService = (): WeatherService => {
     fetchedAt: "2026-03-27T15:30:00.000Z",
     sourceObservedAt: "2026-03-27T15:30:00.000Z",
     stale: false,
+    freshness: "fresh",
     pageUrl: `https://example.com/week/${locationId}`,
     parserVersion: "test",
     available: true,
@@ -146,11 +182,81 @@ const createService = (): WeatherService => {
     cacheHit: true,
   }));
 
+  const getMetarSnapshot = vi.fn().mockImplementation(async (locationId: keyof typeof locationMap) => ({
+    observation: {
+      location: buildLocationInfo(locationId),
+      stationId: locationId === "miami_mia" ? "KMIA" : "ZSPD",
+      observedAt: "2026-03-27T15:25:00.000Z",
+      temperatureC: locationId === "miami_mia" ? 26 : 19,
+      dewpointC: locationId === "miami_mia" ? 20 : 12,
+      windDirectionDegrees: 140,
+      windSpeedKts: 8,
+      rawReport: "METAR TEST",
+      stationName: locationId === "miami_mia" ? "Miami International Airport" : "Shanghai Pudong International Airport",
+      sourceUrl: `https://example.com/metar/${locationId}`,
+      fetchedAt: "2026-03-27T15:30:00.000Z",
+      stale: false,
+      freshness: "fresh" as const,
+      cacheHit: true,
+    },
+    recentTemperatures: [
+      {
+        observedAt: "2026-03-27T15:25:00.000Z",
+        temperatureC: locationId === "miami_mia" ? 26 : 19,
+      },
+    ],
+  }));
+
+  const getTafSnapshot = vi.fn().mockImplementation(async (locationId: keyof typeof locationMap) => ({
+    forecast: {
+      location: buildLocationInfo(locationId),
+      stationId: locationId === "miami_mia" ? "KMIA" : "ZSPD",
+      stationName: locationId === "miami_mia" ? "Miami Intl" : "Shanghai/Pudong Intl",
+      issuedAt: "2026-03-27T14:00:00.000Z",
+      validFrom: "2026-03-27T15:00:00.000Z",
+      validTo: "2026-03-28T18:00:00.000Z",
+      rawTaf: "TAF TEST",
+      sourceUrl: `https://metarcentral.com/airport/${locationId === "miami_mia" ? "KMIA" : "ZSPD"}/taf`,
+      officialSourceUrl: `https://aviationweather.gov/api/data/taf?format=json&ids=${locationId === "miami_mia" ? "KMIA" : "ZSPD"}`,
+      activeForecast: {
+        changeLabel: "BASE",
+        plainEnglish: "Visibility will be excellent.",
+        timeFrom: "2026-03-27T15:00:00.000Z",
+        timeTo: "2026-03-27T21:00:00.000Z",
+        visibilityKm: 10,
+        clouds: ["SCT040"],
+        windDirectionDegrees: 100,
+        windSpeedKts: 8,
+        windGustKts: null,
+        flightCategory: "VFR" as const,
+      },
+      fetchedAt: "2026-03-27T15:30:00.000Z",
+      stale: false,
+      freshness: "fresh" as const,
+      cacheHit: true,
+    },
+    forecasts: [
+      {
+        changeLabel: "BASE",
+        plainEnglish: "Visibility will be excellent.",
+        timeFrom: "2026-03-27T15:00:00.000Z",
+        timeTo: "2026-03-27T21:00:00.000Z",
+        visibilityKm: 10,
+        clouds: ["SCT040"],
+        windDirectionDegrees: 100,
+        windSpeedKts: 8,
+        windGustKts: null,
+        flightCategory: "VFR" as const,
+      },
+    ],
+  }));
+
   const getMultiModelImage = vi.fn().mockResolvedValue({
     contentType: "image/png",
     body: Buffer.from("png"),
     cacheHit: true,
     stale: false,
+    freshness: "fresh",
     headers: {
       "x-weather-stale": "false",
     },
@@ -163,6 +269,11 @@ const createService = (): WeatherService => {
     imageUrlFound: false,
     cacheHit: false,
     stale: false,
+    freshness: "fresh",
+    imageStatus: "unavailable",
+    analysisStatus: "unavailable",
+    displayUnit: getDisplayUnit(locationId),
+    fallbackDisplayUnit: getDisplayUnit(locationId),
     lastError: null,
     lastSuccessAt: null,
     imageUrl: null,
@@ -174,13 +285,20 @@ const createService = (): WeatherService => {
       location: buildLocationInfo(locationId),
       fetchedAt: "2026-03-27T15:30:00.000Z",
       selectedTimestamp: timestamp ?? "2026-03-28T03:00:00+08:00",
+      selectedTimestampReason: "requested" as const,
+      resolvedTimestamp: timestamp ?? "2026-03-28T03:00:00+08:00",
+      resolvedTimestampReason: "requested" as const,
       requestedTimestamp: timestamp ?? "2026-03-28T03:00:00+08:00",
+      requestedTimestampValid: true,
       availableTimestamps: ["2026-03-28T03:00:00+08:00"],
       bucketSizeC,
       sourceType: "meteoblue-page-highcharts",
       pageUrl: `https://example.com/multimodel/${locationId}`,
       cacheHit: true,
       stale: false,
+      freshness: "fresh",
+      displayUnit: getDisplayUnit(locationId),
+      fallbackDisplayUnit: getDisplayUnit(locationId),
       warnings: [],
       modelCount: 1,
       modelInventory,
@@ -220,11 +338,18 @@ const createService = (): WeatherService => {
       location: buildLocationInfo(locationId),
       fetchedAt: "2026-03-27T15:30:00.000Z",
       stale: false,
+      freshness: "fresh",
       cacheHit: true,
       pageUrl: `https://example.com/multimodel/${locationId}`,
       sourceType: "meteoblue-page-highcharts",
+      displayUnit: getDisplayUnit(locationId),
+      fallbackDisplayUnit: getDisplayUnit(locationId),
+      requestedTimestamp: timestamp ?? "2026-03-28T03:00:00+08:00",
+      requestedTimestampValid: true,
+      resolvedTimestamp: timestamp ?? "2026-03-28T03:00:00+08:00",
+      resolvedTimestampReason: "requested" as const,
       selectedTimestamp: timestamp ?? "2026-03-28T03:00:00+08:00",
-      selectedTimestampReason: "requested",
+      selectedTimestampReason: "requested" as const,
       availableTimestamps: ["2026-03-28T03:00:00+08:00"],
       modelCount: 1,
       modelInventory,
@@ -408,6 +533,8 @@ const createService = (): WeatherService => {
   return {
     getHourly,
     getWeatherReport,
+    getMetarSnapshot,
+    getTafSnapshot,
     getMultiModelImage,
     getMultiModelStatus,
     getMultiModelDistribution,
@@ -421,10 +548,13 @@ const createService = (): WeatherService => {
       fetchedAt: "2026-03-27T15:31:00.000Z",
       locationIds: ["shanghai_pvg"],
     }),
+    getSystemStatus: vi.fn(() => runtimeStatus),
   } as unknown as WeatherService;
 };
 
 afterEach(() => {
+  delete process.env.KELLY_WATCHDOG_STATUS_FILE;
+  delete process.env.SERVICE_NAME;
   vi.restoreAllMocks();
 });
 
@@ -442,6 +572,154 @@ describe("createApp", () => {
         startedAt: expect.any(String),
       }),
     );
+
+    await app.close();
+  });
+
+  test("includes Kelly runtime diagnostics on /healthz when the service exposes them", async () => {
+    const service = createService() as WeatherService & {
+      getKellyRuntimeHealth(): KellyRuntimeHealth;
+    };
+    service.getKellyRuntimeHealth = vi.fn(() => ({
+      service: "kelly-origin" as const,
+      openStreamCount: 3,
+      activeHubCount: 2,
+      fallbackMode: true,
+      lastSignalAt: "2026-04-12T00:00:00.000Z",
+      lastRepricedAt: "2026-04-12T00:00:01.000Z",
+      lastOrderbookAt: "2026-04-12T00:00:01.000Z",
+      lastSnapshotSuccessAt: "2026-04-12T00:00:00.000Z",
+      lastSnapshotErrorAt: null,
+      lastSnapshotError: null,
+      lastMarketDiscoveryAt: "2026-04-12T00:00:00.000Z",
+      lastStreamEventAt: "2026-04-12T00:00:02.000Z",
+      lastStageTimingsMs: {
+        hourly: 1,
+        report: 2,
+        metar: 3,
+        insight: 4,
+        distribution: 5,
+        marketDiscovery: 6,
+        orderbook: 7,
+        pricing: 8,
+        total: 9,
+      },
+    }));
+
+    const app = createApp(service, { frontendDistDir });
+    const response = await app.inject({ method: "GET", url: "/healthz" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        service: "weather-service",
+        runtime: expect.objectContaining({
+          service: "kelly-origin",
+          openStreamCount: 3,
+          activeHubCount: 2,
+          fallbackMode: true,
+          lastSignalAt: "2026-04-12T00:00:00.000Z",
+        }),
+      }),
+    );
+
+    await app.close();
+  });
+
+  test("includes watchdog diagnostics on /healthz when the local status file exists", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "weather-kelly-watchdog-"));
+    const statusFile = join(tempDir, "watchdog-status.json");
+    process.env.KELLY_WATCHDOG_STATUS_FILE = statusFile;
+
+    await writeFile(
+      statusFile,
+      JSON.stringify({
+        checkedAt: "2026-04-14T00:00:00.000Z",
+        healthy: true,
+        consecutiveHealthFailures: 0,
+        lastRestartAt: null,
+        lastHealthError: null,
+        lastSmokeAt: "2026-04-14T00:00:00.000Z",
+        lastSmokeError: null,
+      }),
+      "utf8",
+    );
+
+    const app = createApp(createService(), { frontendDistDir });
+    const response = await app.inject({ method: "GET", url: "/healthz" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        watchdog: expect.objectContaining({
+          healthy: true,
+          consecutiveHealthFailures: 0,
+          checkedAt: "2026-04-14T00:00:00.000Z",
+        }),
+      }),
+    );
+
+    await app.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("reports source contracts and runtime cache state on /api/system/status", async () => {
+    const app = createApp(createService(), { frontendDistDir });
+    const response = await app.inject({ method: "GET", url: "/api/system/status" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("application/json");
+    expect(response.json()).toMatchObject({
+      ok: true,
+      service: "weather-service",
+      roadmap: {
+        profile: "polyweather-absorption-v1",
+        cleanRoom: true,
+        probabilityLayerEnabled: false,
+        marketNarrative: "qualitative-only",
+      },
+      sourceContractsVersion: "2026-04-22",
+      locationCoverage: {
+        totalEnabled: expect.any(Number),
+        byRolloutTier: expect.objectContaining({
+          "tier-1": expect.any(Number),
+        }),
+      },
+      runtime: {
+        caches: {
+          week: expect.objectContaining({
+            entryCount: 2,
+          }),
+        },
+        kelly: null,
+      },
+      sourceCoverage: expect.arrayContaining([
+        expect.objectContaining({
+          scope: "current",
+          key: "meteoblue-week-page",
+          productionCount: expect.any(Number),
+        }),
+        expect.objectContaining({
+          scope: "target",
+          key: "open-meteo-multi-model",
+          plannedCount: expect.any(Number),
+        }),
+      ]),
+    });
+
+    await app.close();
+  });
+
+  test("serves source contract and runtime counters on /metrics", async () => {
+    const app = createApp(createService(), { frontendDistDir });
+    const response = await app.inject({ method: "GET", url: "/metrics" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/plain");
+    expect(response.body).toContain("weather_runtime_info");
+    expect(response.body).toContain("weather_location_rollout_tier_total");
+    expect(response.body).toContain('weather_source_contract_total{scope="target",source="open-meteo-multi-model"');
+    expect(response.body).toContain('weather_runtime_cache_entries{cache="week"} 2');
 
     await app.close();
   });
@@ -499,10 +777,23 @@ describe("createApp", () => {
     expect(service.getHourly).toHaveBeenCalledWith("miami_mia", "1h", 6);
     expect(service.getMultiModelStatus).toHaveBeenCalledWith("miami_mia");
     expect(service.getWeatherReport).toHaveBeenCalledWith("miami_mia");
+    expect(service.getMetarSnapshot).toHaveBeenCalledWith("miami_mia");
+    expect(service.getTafSnapshot).toHaveBeenCalledWith("miami_mia");
+    expect(service.getMultiModelDistribution).not.toHaveBeenCalled();
     expect(response.json()).toMatchObject({
       locationDirectory: expect.arrayContaining([
-        expect.objectContaining({ id: "shanghai_pvg" }),
-        expect.objectContaining({ id: "miami_mia" }),
+        expect.objectContaining({
+          id: "shanghai_pvg",
+          sourceMetadata: expect.objectContaining({
+            contractVersion: "2026-04-22",
+          }),
+        }),
+        expect.objectContaining({
+          id: "miami_mia",
+          sourceMetadata: expect.objectContaining({
+            rolloutTier: "tier-1",
+          }),
+        }),
       ]),
       hourly: {
         location: {
@@ -515,11 +806,142 @@ describe("createApp", () => {
         },
         textZh: reportZh,
       },
+      metar: {
+        observation: {
+          stationId: "KMIA",
+          temperatureC: 26,
+        },
+        recentTemperatures: expect.any(Array),
+        recentReports: [
+          expect.objectContaining({
+            stationId: "KMIA",
+            rawReport: "METAR TEST",
+          }),
+        ],
+      },
+      taf: {
+        forecast: {
+          stationId: "KMIA",
+          activeForecast: {
+            changeLabel: "BASE",
+            flightCategory: "VFR",
+          },
+        },
+      },
       multimodel: {
         location: {
           id: "miami_mia",
         },
         imageProxyUrl: "/api/weather/multimodel/image?allowStale=true&locationId=miami_mia",
+      },
+      sourceMetadata: {
+        contract: expect.objectContaining({
+          rolloutTier: "tier-1",
+          currentSources: expect.objectContaining({
+            baselineForecast: expect.objectContaining({
+              key: "meteoblue-week-page",
+              status: "production",
+            }),
+          }),
+        }),
+        freshness: {
+          hourly: "fresh",
+          report: "fresh",
+          multimodel: "fresh",
+        },
+      },
+      intradaySignals: expect.objectContaining({
+        confidence: "high",
+        nextObservationAt: null,
+        evidence: expect.any(Array),
+      }),
+      marketReference: expect.objectContaining({
+        mode: "qualitative-only",
+        kellyRoute: "/kelly",
+      }),
+    });
+
+    await app.close();
+  });
+
+  test("keeps dashboard available when TAF fetch fails cold", async () => {
+    const service = createService();
+    vi.mocked(service.getTafSnapshot).mockRejectedValueOnce(new Error("taf upstream down"));
+    const app = createApp(service, { frontendDistDir });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/weather/dashboard?mode=1h&limit=6&locationId=miami_mia",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      metar: {
+        observation: {
+          stationId: "KMIA",
+        },
+      },
+      taf: {
+        forecast: null,
+        forecasts: [],
+      },
+    });
+
+    await app.close();
+  });
+
+  test("keeps dashboard sync stable while upstream data revalidates in background", async () => {
+    const service = createService();
+    vi.mocked(service.getHourly).mockResolvedValueOnce({
+      ...(await service.getHourly("miami_mia", "1h", 6)),
+      freshness: "revalidating",
+      stale: false,
+    });
+    const app = createApp(service, { frontendDistDir });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/weather/dashboard?mode=1h&limit=6&locationId=miami_mia",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      sync: {
+        state: "fresh",
+        freshness: "fresh",
+      },
+      hourly: {
+        freshness: "revalidating",
+        stale: false,
+      },
+    });
+
+    await app.close();
+  });
+
+  test("surfaces fallback_error dashboard sync only on true stale fallback", async () => {
+    const service = createService();
+    vi.mocked(service.getWeatherReport).mockResolvedValueOnce({
+      ...(await service.getWeatherReport("miami_mia")),
+      freshness: "fallback_error",
+      stale: true,
+    });
+    const app = createApp(service, { frontendDistDir });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/weather/dashboard?mode=1h&limit=6&locationId=miami_mia",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      sync: {
+        state: "fallback_error",
+        freshness: "fallback_error",
+      },
+      report: {
+        freshness: "fallback_error",
+        stale: true,
       },
     });
 

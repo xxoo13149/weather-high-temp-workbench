@@ -1,4 +1,5 @@
 import { CONFIG } from "./config";
+import type { KellyTemperatureUnit } from "./types";
 
 const WIND_DIRECTION_DEGREES: Record<string, number> = {
   N: 0,
@@ -30,6 +31,7 @@ const WIND_DIRECTION_DEGREES: Record<string, number> = {
 const timeFormatterCache = new Map<string, Intl.DateTimeFormat>();
 const dateTimeFormatterCache = new Map<string, Intl.DateTimeFormat>();
 const monthDayFormatterCache = new Map<string, Intl.DateTimeFormat>();
+const FALLBACK_TIME_ZONE = "UTC";
 
 const buildFormatterKey = (locale: string, timeZone: string | null) => `${locale}::${timeZone ?? "local"}`;
 
@@ -114,7 +116,7 @@ const formatWithFormatter = (
   try {
     return resolveFormatter(timeZone).format(date);
   } catch {
-    return resolveFormatter(undefined).format(date);
+    return resolveFormatter(FALLBACK_TIME_ZONE).format(date);
   }
 };
 
@@ -126,6 +128,21 @@ export const formatDateTime = (isoString: string | null | undefined, timeZone?: 
 
 export const formatMonthDay = (isoString: string | null | undefined, timeZone?: string) =>
   formatWithFormatter(isoString, getMonthDayFormatter, timeZone);
+
+export const formatShortMonthDay = (value: string | null | undefined, timeZone?: string) => {
+  if (!value) {
+    return CONFIG.fallback.nullValue;
+  }
+
+  const plainDateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (plainDateMatch) {
+    const [, , month, day] = plainDateMatch;
+    return `${month}/${day}`;
+  }
+
+  const iso = value.includes("T") ? value : `${value}T00:00:00Z`;
+  return formatMonthDay(iso, timeZone);
+};
 
 export const formatNumber = (value: number | null | undefined, digits = 1) => {
   if (value === null || value === undefined || Number.isNaN(value)) {
@@ -139,6 +156,48 @@ export const formatNumber = (value: number | null | undefined, digits = 1) => {
 
   return rounded.toFixed(digits).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
 };
+
+export const convertTemperatureFromC = (valueC: number, unit: KellyTemperatureUnit) =>
+  unit === "F" ? (valueC * 9) / 5 + 32 : valueC;
+
+export const convertTemperatureToC = (value: number, unit: KellyTemperatureUnit) =>
+  unit === "F" ? ((value - 32) * 5) / 9 : value;
+
+export const convertTemperatureDeltaFromC = (valueC: number, unit: KellyTemperatureUnit) =>
+  unit === "F" ? (valueC * 9) / 5 : valueC;
+
+export const formatTemperature = (
+  valueC: number | null | undefined,
+  unit: KellyTemperatureUnit,
+  digits = 1,
+) =>
+  valueC === null || valueC === undefined || Number.isNaN(valueC)
+    ? CONFIG.fallback.nullValue
+    : `${formatNumber(convertTemperatureFromC(valueC, unit), digits)}°${unit}`;
+
+export const formatTemperatureDelta = (
+  valueC: number | null | undefined,
+  unit: KellyTemperatureUnit,
+  digits = 1,
+  signed = false,
+) => {
+  if (valueC === null || valueC === undefined || Number.isNaN(valueC)) {
+    return CONFIG.fallback.nullValue;
+  }
+
+  const converted = convertTemperatureDeltaFromC(valueC, unit);
+  const sign = signed ? (converted >= 0 ? "+" : "") : converted > 0 ? "+" : "";
+  return `${sign}${formatNumber(converted, digits)}°${unit}`;
+};
+
+export const formatTemperatureInputValue = (
+  valueC: number | null | undefined,
+  unit: KellyTemperatureUnit,
+  digits = 1,
+) =>
+  valueC === null || valueC === undefined || Number.isNaN(valueC)
+    ? ""
+    : formatNumber(convertTemperatureFromC(valueC, unit), digits);
 
 export const valueOrDash = (value: number | null | undefined, suffix = "", digits = 1) =>
   value === null || value === undefined || Number.isNaN(value)

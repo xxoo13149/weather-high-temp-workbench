@@ -34,14 +34,14 @@ export const KellyControlBar = ({
   onRiskModeChange,
   onRefresh,
 }: KellyControlBarProps) => (
-  <section className="kelly-block">
+  <section className="kelly-block kelly-control-panel">
     <div className="kelly-block__header">
       <div>
         <div className="eyebrow">控制条</div>
         <h3 className="kelly-block__title">地点和日期立即切换，参数改动先草稿，点击刷新分析后应用</h3>
       </div>
-      <div className="text-sm text-white/52">
-        优势 = 我们估值 - 当前可买价。建议金额 = Kelly × 本金，`minEdge` 只影响高亮和执行建议。
+      <div className="kelly-control-panel__hint">
+        `minEdge` 只影响高亮和执行建议，地点与日期切换立即生效。
       </div>
     </div>
 
@@ -132,7 +132,7 @@ export const KellyControlBar = ({
         </select>
       </label>
 
-      <div className="kelly-field">
+      <div className="kelly-field kelly-field--actions">
         <span className="kelly-field__label">动作</span>
         <div className="kelly-control-actions">
           <Button

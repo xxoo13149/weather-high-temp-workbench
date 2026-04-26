@@ -24,6 +24,8 @@ const isPolymarketUrl = (url: string) => {
   }
 };
 
+const shouldPreferShellTransport = (url: string) => isPolymarketUrl(url) && !isWorkerRuntime();
+
 const buildCurlCommand = (url: string, init?: RequestInit) => {
   const headers = {
     ...defaultHeaders,
@@ -93,7 +95,8 @@ const fetchWithShellFallback = async (url: string, init?: RequestInit): Promise<
 
   const [{ execFile }, { promisify }] = await Promise.all([import("node:child_process"), import("node:util")]);
   const execFileAsync = promisify(execFile);
-  const { command, args } = buildCurlCommand(url, init);
+  const { command, args } =
+    process.platform === "win32" ? buildWindowsWebRequestCommand(url, init) : buildCurlCommand(url, init);
 
   try {
     const { stdout } = await execFileAsync(command, args, {
@@ -140,21 +143,39 @@ const fetchWithHandling = async (
   return response;
 };
 
-export const fetchText = async (url: string): Promise<string> => {
+export const fetchText = async (url: string, init?: RequestInit): Promise<string> => {
+  if (shouldPreferShellTransport(url)) {
+    try {
+      const body = await fetchWithShellFallback(url, init);
+      return body.toString("utf-8");
+    } catch {
+      // Fall through to native fetch so Workers and non-shell environments keep working.
+    }
+  }
+
   try {
-    const response = await fetchWithHandling(url, "UPSTREAM_FETCH_FAILED", "Failed to fetch");
+    const response = await fetchWithHandling(url, "UPSTREAM_FETCH_FAILED", "Failed to fetch", init);
     return await response.text();
   } catch (error) {
     if (!isPolymarketUrl(url) || isWorkerRuntime()) {
       throw error;
     }
 
-    const body = await fetchWithShellFallback(url);
+    const body = await fetchWithShellFallback(url, init);
     return body.toString("utf-8");
   }
 };
 
 export const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
+  if (shouldPreferShellTransport(url)) {
+    try {
+      const body = await fetchWithShellFallback(url, init);
+      return JSON.parse(body.toString("utf-8")) as T;
+    } catch {
+      // Fall through to native fetch so Workers and non-shell environments keep working.
+    }
+  }
+
   try {
     const response = await fetchWithHandling(url, "UPSTREAM_JSON_FETCH_FAILED", "Failed to fetch JSON", init);
     return (await response.json()) as T;
@@ -183,13 +204,18 @@ export const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> 
 
 export const fetchBinary = async (
   url: string,
+  init?: RequestInit,
 ): Promise<{ body: Buffer; contentType: string; headers: Headers }> => {
   let response: Response;
 
   try {
     response = await fetch(url, {
-      headers: defaultHeaders,
-      signal: AbortSignal.timeout(config.httpTimeoutMs),
+      ...init,
+      headers: {
+        ...defaultHeaders,
+        ...(init?.headers ?? {}),
+      },
+      signal: init?.signal ?? AbortSignal.timeout(config.httpTimeoutMs),
     });
   } catch (error) {
     throw new AppError(502, "UPSTREAM_IMAGE_FETCH_FAILED", `Failed to fetch image ${url}: ${String(error)}`, {

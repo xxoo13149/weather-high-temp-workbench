@@ -43,9 +43,9 @@ export const UI_TEXT = {
     wind: "风",
     currentPrecipitation: "当前降水",
     currentWind: "当前风速",
-    sourcePage: "源站页面",
+    sourcePage: "天气原页",
     timelineTitle: "24 小时预测轨道",
-    timelineDescription: "轨道聚焦时间与温度，降水集中在顶部摘要和固定检查器里呈现。",
+    timelineDescription: "轨道展示温度和降水变化，点选小时即可看清当前这一格的细项。",
     now: "现在",
     peak: "峰值",
     peakTemperature: "最高温",
@@ -100,7 +100,7 @@ export const UI_TEXT = {
     temperatureSpreadCaption: "当前时刻的离散范围",
     catalogCoverage: "资料覆盖",
     fullRanking: "完整模型排序",
-    rankingLoading: "完整模型排序正在同步...",
+    rankingLoading: "完整模型排序后台更新中...",
     waitingModelData: "等待模型数据",
     clearLock: "清除锁定",
     hasCatalog: "有资料",
@@ -111,7 +111,7 @@ export const UI_TEXT = {
     peakDistribution: "峰值时段分布",
     temperatureDistribution: "当前温区分布",
     highestPeakDistribution: "最高温分布",
-    distributionLoading: "分布数据正在同步...",
+    distributionLoading: "分布数据后台更新中...",
     clear: "清除",
     clearAll: "清除筛选",
     modelUnit: "个模型",
@@ -200,12 +200,51 @@ export const UI_TEXT = {
   },
 } as const;
 
+const MULTIMODEL_STATUS_LABELS = {
+  ready: "就绪",
+  revalidating: "后台刷新中",
+  fallback_error: "缓存回退",
+  unavailable: "不可用",
+} as const;
+
+const MULTIMODEL_STATUS_CAPTIONS = {
+  analysis: {
+    ready: "多模型分析数据已就绪。",
+    revalidating:
+      "正在后台刷新，当前先显示最近一次成功的分析结果。",
+    fallback_error:
+      "最新分析刷新失败，当前回退到最近一次成功结果。",
+    unavailable: "当前地区暂无可用的多模型分析数据。",
+  },
+  image: {
+    ready: "官方原图已就绪。",
+    revalidating:
+      "正在后台刷新，当前先显示最近一张可用图像。",
+    fallback_error:
+      "最新原图拉取失败，当前回退到最近一张可用图像。",
+    unavailable: "当前地区暂无可用的官方原图。",
+  },
+} as const;
+
 export const translateStatusLabel = (status: string | null | undefined) => {
   if (!status) {
     return CONFIG.fallback.nullValue;
   }
 
-  return CONFIG.text.statusMapping[status.toLowerCase()] ?? status;
+  const normalized = status.toLowerCase();
+  return MULTIMODEL_STATUS_LABELS[normalized as keyof typeof MULTIMODEL_STATUS_LABELS] ?? CONFIG.text.statusMapping[normalized] ?? status;
+};
+
+export const describeMultimodelStatus = (
+  surface: "analysis" | "image",
+  status: string | null | undefined,
+) => {
+  if (!status) {
+    return CONFIG.fallback.nullValue;
+  }
+
+  const normalized = status.toLowerCase() as keyof (typeof MULTIMODEL_STATUS_CAPTIONS)["analysis"];
+  return MULTIMODEL_STATUS_CAPTIONS[surface][normalized] ?? status;
 };
 
 export const translatePredictabilityLabel = (value: string | null | undefined) => {
@@ -254,6 +293,11 @@ const isFavoritesRouteNoiseWarning = (warning: string) => {
   return normalized.includes("route not found") && normalized.includes("/api/user/favorites");
 };
 
+const isRequestedTimestampFallbackWarning = (warning: string) => {
+  const normalized = normalizeWarning(warning);
+  return normalized.includes("requested timestamp was unavailable") && normalized.includes("nearest available timestamp");
+};
+
 const isFieldCoverageWarning = (warning: string) =>
   /^1h (feelslikec|precipitationprobabilitypct|winddirection) missing for \d+\/\d+ hours from source table\.$/i.test(
     warning.trim(),
@@ -278,16 +322,18 @@ const isSevereWarning = (warning: string) => {
 const shouldDisplayWarning = (warning: string) =>
   !isInternalModelParseWarning(warning) && !isFavoritesRouteNoiseWarning(warning);
 
-export const collectDisplayWarnings = ({
+const collectWarnings = ({
   dashboardWarnings,
   reportWarnings,
   insightWarnings,
   distributionWarnings,
+  suppressRequestedTimestampFallback = false,
 }: {
   dashboardWarnings?: string[];
   reportWarnings?: string[];
   insightWarnings?: string[];
   distributionWarnings?: string[];
+  suppressRequestedTimestampFallback?: boolean;
 }) =>
   Array.from(
     new Set(
@@ -298,20 +344,44 @@ export const collectDisplayWarnings = ({
         ...(distributionWarnings ?? []),
       ]
         .filter((warning): warning is string => Boolean(warning) && shouldDisplayWarning(warning))
+        .filter((warning) => !(suppressRequestedTimestampFallback && isRequestedTimestampFallbackWarning(warning)))
         .map((warning) => translateWarning(warning)),
     ),
   );
+
+export const collectDisplayWarnings = ({
+  dashboardWarnings,
+  reportWarnings,
+  insightWarnings,
+  distributionWarnings,
+  suppressRequestedTimestampFallback = false,
+}: {
+  dashboardWarnings?: string[];
+  reportWarnings?: string[];
+  insightWarnings?: string[];
+  distributionWarnings?: string[];
+  suppressRequestedTimestampFallback?: boolean;
+}) =>
+  collectWarnings({
+    dashboardWarnings,
+    reportWarnings,
+    insightWarnings,
+    distributionWarnings,
+    suppressRequestedTimestampFallback,
+  });
 
 export const collectHomeDisplayWarnings = ({
   dashboardWarnings,
   reportWarnings,
   insightWarnings,
   distributionWarnings,
+  suppressRequestedTimestampFallback = false,
 }: {
   dashboardWarnings?: string[];
   reportWarnings?: string[];
   insightWarnings?: string[];
   distributionWarnings?: string[];
+  suppressRequestedTimestampFallback?: boolean;
 }) =>
   Array.from(
     new Set(
@@ -322,6 +392,7 @@ export const collectHomeDisplayWarnings = ({
         ...(distributionWarnings ?? []),
       ]
         .filter((warning): warning is string => Boolean(warning) && shouldDisplayWarning(warning))
+        .filter((warning) => !(suppressRequestedTimestampFallback && isRequestedTimestampFallbackWarning(warning)))
         .filter((warning) => isSevereWarning(warning))
         .map((warning) => translateWarning(warning)),
     ),

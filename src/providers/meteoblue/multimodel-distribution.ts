@@ -1,5 +1,7 @@
 ﻿import { AppError } from "../../domain/errors.js";
+import { getLocationFallbackDisplayUnit } from "../../config.js";
 import type {
+  KellyTemperatureUnit,
   LocationInfo,
   MultiModelDistributionBucket,
   MultiModelDistributionMember,
@@ -9,14 +11,19 @@ import type {
   MultiModelInsightRankedModel,
   MultiModelInsightResponse,
   MultiModelInventoryItem,
+  MultiModelTimestampResolutionReason,
 } from "../../domain/weather.js";
 import { fetchText } from "../../lib/http.js";
 import { parseLocalDateTimeInTimeZone, toIsoInTimeZone } from "../../lib/time.js";
 import {
   extractMultiModelHighchartsUrl,
+  extractMultiModelImageUrl,
   extractMultiModelPageInventory,
   MULTIMODEL_HIGHCHARTS_VERSION,
+  resolveMultiModelTemperatureUnit,
 } from "./multimodel.js";
+
+type ParsedTemperatureUnit = "C" | "F";
 
 interface HighchartsPoint {
   x?: number;
@@ -60,9 +67,14 @@ export interface MultiModelTemperatureDataset {
 export interface MultiModelDistributionCacheValue {
   fetchedAt: string;
   pageFetchedAt: string;
+  pageHtml?: string;
   highchartsUrl: string;
+  highchartsRawJson?: string;
   dataset: MultiModelTemperatureDataset;
+  pageInventory?: ReturnType<typeof extractMultiModelPageInventory>;
   modelInventory: MultiModelInventoryItem[];
+  pngUrl?: string | null;
+  sourceTemperatureUnit?: ParsedTemperatureUnit;
   warnings: string[];
 }
 
@@ -97,8 +109,25 @@ const normalizedModelDisplayNameMap: Record<string, string> = {
   UMGLOBAL10: "UM Global 10 km",
 };
 
-const formatBucketLabel = (bucketStartC: number, bucketEndC: number): string =>
-  `${bucketStartC.toFixed(1)} - ${bucketEndC.toFixed(1)} °C`;
+const roundBucketBoundary = (value: number): number => Number.parseFloat(value.toFixed(4));
+
+const convertTemperatureFromC = (valueC: number, unit: KellyTemperatureUnit): number =>
+  unit === "F" ? (valueC * 9) / 5 + 32 : valueC;
+
+const convertTemperatureToC = (value: number, unit: KellyTemperatureUnit): number =>
+  unit === "F" ? ((value - 32) * 5) / 9 : value;
+
+const formatBucketTemperature = (valueC: number, unit: KellyTemperatureUnit): string =>
+  convertTemperatureFromC(valueC, unit).toFixed(1);
+
+const formatBucketLabel = (
+  bucketStartC: number,
+  bucketEndC: number,
+  displayUnit: KellyTemperatureUnit,
+): string => `${formatBucketTemperature(bucketStartC, displayUnit)} - ${formatBucketTemperature(bucketEndC, displayUnit)} °${displayUnit}`;
+
+const resolveLocationDisplayUnit = (locationId: LocationInfo["id"]): KellyTemperatureUnit =>
+  getLocationFallbackDisplayUnit(locationId);
 
 const parseHighchartsJson = (raw: string): HighchartsConfig => {
   try {
@@ -251,6 +280,8 @@ const buildChartEndpointPreview = (highchartsUrl: string): string => {
 const toLocalDateKey = (isoTimestamp: string): string => isoTimestamp.slice(0, 10);
 
 const round2 = (value: number): number => Number.parseFloat(value.toFixed(2));
+const normalizeTemperatureToC = (value: number, unit: ParsedTemperatureUnit): number =>
+  unit === "F" ? round2(((value - 32) * 5) / 9) : round2(value);
 
 const buildStats = (values: number[]): {
   minTemperatureC: number;
@@ -510,7 +541,11 @@ const isInternalInventoryAlignmentWarning = (warning: string): boolean =>
   /^Model [A-Z0-9_]+ exists in highcharts but is absent from selected page inventory\.$/.test(warning) ||
   /^No model table row matched selected domain [A-Z0-9_]+\.$/.test(warning);
 
-export const parseMultiModelHighcharts = (raw: string, timeZone: string): MultiModelTemperatureDataset => {
+export const parseMultiModelHighcharts = (
+  raw: string,
+  timeZone: string,
+  temperatureUnit: ParsedTemperatureUnit = "C",
+): MultiModelTemperatureDataset => {
   const config = parseHighchartsJson(raw);
   const seriesList = (config.series ?? []).filter(isTemperatureModelSeries);
 
@@ -553,7 +588,10 @@ export const parseMultiModelHighcharts = (raw: string, timeZone: string): MultiM
     return {
       modelName,
       displayName: normalizedModelDisplayNameMap[modelName] ?? modelName,
-      values: timestamps.map((timestamp) => valuesByTimestamp.get(timestamp) ?? null),
+      values: timestamps.map((timestamp) => {
+        const value = valuesByTimestamp.get(timestamp);
+        return typeof value === "number" ? normalizeTemperatureToC(value, temperatureUnit) : null;
+      }),
     };
   });
 
@@ -570,36 +608,38 @@ export const parseMultiModelHighcharts = (raw: string, timeZone: string): MultiM
 
 const buildBuckets = (
   members: MultiModelDistributionMember[],
-  bucketSizeC: number,
+  bucketSize: number,
+  displayUnit: KellyTemperatureUnit,
   getTemperature: (member: MultiModelDistributionMember) => number,
 ): MultiModelDistributionBucket[] => {
-  const groups = new Map<number, MultiModelDistributionBucket>();
+  const groups = new Map<string, MultiModelDistributionBucket>();
+  const resolvedBucketSize = Number.isFinite(bucketSize) && bucketSize > 0 ? bucketSize : 1;
 
   for (const member of members) {
     const value = getTemperature(member);
-    const bucketStartC = Math.floor(value / bucketSizeC) * bucketSizeC;
-    const existing = groups.get(bucketStartC);
+    const valueInDisplayUnit = convertTemperatureFromC(value, displayUnit);
+    const bucketStartDisplay = Math.floor(valueInDisplayUnit / resolvedBucketSize) * resolvedBucketSize;
+    const bucketEndDisplay = Number.parseFloat((bucketStartDisplay + resolvedBucketSize).toFixed(6));
+    const bucketStartC = roundBucketBoundary(convertTemperatureToC(bucketStartDisplay, displayUnit));
+    const bucketEndC = roundBucketBoundary(convertTemperatureToC(bucketEndDisplay, displayUnit));
+    const bucketKey = bucketStartDisplay.toFixed(6);
+    const existing = groups.get(bucketKey);
     if (existing) {
       existing.count += 1;
       existing.models.push(member.modelName);
       continue;
     }
 
-    const bucketEndC = Number.parseFloat((bucketStartC + bucketSizeC).toFixed(2));
-    groups.set(bucketStartC, {
+    groups.set(bucketKey, {
       bucketStartC,
       bucketEndC,
-      label: `${bucketStartC.toFixed(1)} - ${bucketEndC.toFixed(1)} °C`,
+      label: formatBucketLabel(bucketStartC, bucketEndC, displayUnit),
       count: 1,
       models: [member.modelName],
     });
   }
 
   return Array.from(groups.values())
-    .map((bucket) => ({
-      ...bucket,
-      label: formatBucketLabel(bucket.bucketStartC, bucket.bucketEndC),
-    }))
     .sort((left, right) => left.bucketStartC - right.bucketStartC);
 };
 
@@ -607,8 +647,12 @@ export const summarizeMultiModelTemperatureDataset = (
   dataset: MultiModelTemperatureDataset,
   selectedTimestamp?: string,
   bucketSizeC = 1,
+  displayUnit: KellyTemperatureUnit = "C",
 ): {
+  requestedTimestamp: string | null;
+  requestedTimestampValid: boolean;
   selectedTimestamp: string;
+  selectedTimestampReason: MultiModelTimestampResolutionReason;
   availableTimestamps: string[];
   members: MultiModelDistributionMember[];
   distribution: MultiModelDistributionBucket[];
@@ -621,12 +665,8 @@ export const summarizeMultiModelTemperatureDataset = (
 } => {
   validateDatasetOrThrow(dataset);
 
-  const selectedIndex = selectedTimestamp ? dataset.timestamps.indexOf(selectedTimestamp) : 0;
-  if (selectedTimestamp && selectedIndex < 0) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'timestamp' must match one of the available hourly timestamps.");
-  }
-
-  const index = selectedIndex >= 0 ? selectedIndex : 0;
+  const selection = resolveInsightSelection(dataset, selectedTimestamp, undefined);
+  const index = selection.index;
   const selectedDayTimestamp = dataset.timestamps[index] ?? dataset.timestamps[0];
   const sameDayIndices = selectedDayTimestamp
     ? collectLocalDayIndices(dataset.timestamps, selectedDayTimestamp)
@@ -675,11 +715,14 @@ export const summarizeMultiModelTemperatureDataset = (
   const stats = buildStats(members.map((member) => member.temperatureC));
 
   return {
+    requestedTimestamp: selection.requestedTimestamp,
+    requestedTimestampValid: selection.requestedTimestampValid,
     selectedTimestamp: dataset.timestamps[index] ?? dataset.timestamps[0],
+    selectedTimestampReason: selection.reason,
     availableTimestamps: [...dataset.timestamps],
     members,
-    distribution: buildBuckets(members, bucketSizeC, (member) => member.temperatureC),
-    peakDistribution: buildBuckets(members, bucketSizeC, (member) => member.peakTemperatureC),
+    distribution: buildBuckets(members, bucketSizeC, displayUnit, (member) => member.temperatureC),
+    peakDistribution: buildBuckets(members, bucketSizeC, displayUnit, (member) => member.peakTemperatureC),
     stats,
   };
 };
@@ -689,9 +732,11 @@ const resolveInsightSelection = (
   requestedTimestamp: string | undefined,
   nowIso: string | undefined,
 ): {
+  requestedTimestamp: string | null;
+  requestedTimestampValid: boolean;
   index: number;
   selectedTimestamp: string;
-  reason: "requested" | "nearest-now" | "first-available";
+  reason: MultiModelTimestampResolutionReason;
 } => {
   if (dataset.timestamps.length === 0) {
     throw new AppError(
@@ -706,18 +751,54 @@ const resolveInsightSelection = (
 
   if (requestedTimestamp) {
     const index = dataset.timestamps.indexOf(requestedTimestamp);
-    if (index < 0) {
-      throw new AppError(
-        400,
-        "BAD_REQUEST",
-        "Query parameter 'timestamp' must match one of the available hourly timestamps.",
-      );
+    if (index >= 0) {
+      return {
+        requestedTimestamp,
+        requestedTimestampValid: true,
+        index,
+        selectedTimestamp: dataset.timestamps[index] ?? dataset.timestamps[0],
+        reason: "requested",
+      };
+    }
+
+    const requestedMs = Date.parse(requestedTimestamp);
+    if (!Number.isNaN(requestedMs)) {
+      let nearestIndex = 0;
+      let nearestDistance = Number.POSITIVE_INFINITY;
+
+      for (let candidateIndex = 0; candidateIndex < dataset.timestamps.length; candidateIndex += 1) {
+        const candidateTimestamp = dataset.timestamps[candidateIndex];
+        if (!candidateTimestamp) {
+          continue;
+        }
+
+        const timestampMs = Date.parse(candidateTimestamp);
+        if (Number.isNaN(timestampMs)) {
+          continue;
+        }
+
+        const distance = Math.abs(timestampMs - requestedMs);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestIndex = candidateIndex;
+        }
+      }
+
+      return {
+        requestedTimestamp,
+        requestedTimestampValid: false,
+        index: nearestIndex,
+        selectedTimestamp: dataset.timestamps[nearestIndex] ?? dataset.timestamps[0],
+        reason: "requested-fallback",
+      };
     }
 
     return {
-      index,
-      selectedTimestamp: dataset.timestamps[index] ?? dataset.timestamps[0],
-      reason: "requested",
+      requestedTimestamp,
+      requestedTimestampValid: false,
+      index: 0,
+      selectedTimestamp: dataset.timestamps[0],
+      reason: "requested-fallback",
     };
   }
 
@@ -746,6 +827,8 @@ const resolveInsightSelection = (
 
     if (nearestIndex >= 0) {
       return {
+        requestedTimestamp: null,
+        requestedTimestampValid: false,
         index: nearestIndex,
         selectedTimestamp: dataset.timestamps[nearestIndex] ?? dataset.timestamps[0],
         reason: "nearest-now",
@@ -754,6 +837,8 @@ const resolveInsightSelection = (
   }
 
   return {
+    requestedTimestamp: null,
+    requestedTimestampValid: false,
     index: 0,
     selectedTimestamp: dataset.timestamps[0],
     reason: "first-available",
@@ -866,11 +951,13 @@ export const buildMultiModelInsightResponse = (
   freshness: {
     stale: boolean;
     cacheHit: boolean;
+    freshnessState: MultiModelInsightResponse["freshness"];
   },
 ): MultiModelInsightResponse => {
   const cacheWarnings = cacheValue.warnings.filter((warning) => !isInternalInventoryAlignmentWarning(warning));
   const selection = resolveInsightSelection(cacheValue.dataset, options.requestedTimestamp, options.nowIso);
-  const currentSummary = summarizeMultiModelTemperatureDataset(cacheValue.dataset, selection.selectedTimestamp, 1);
+  const displayUnit = resolveLocationDisplayUnit(location.id);
+  const currentSummary = summarizeMultiModelTemperatureDataset(cacheValue.dataset, selection.selectedTimestamp, 1, displayUnit);
   const referenceTemperatureC =
     typeof options.actualTemperatureC === "number" && Number.isFinite(options.actualTemperatureC)
       ? round2(options.actualTemperatureC)
@@ -927,6 +1014,8 @@ export const buildMultiModelInsightResponse = (
   ];
   if (selection.reason === "nearest-now") {
     warnings.push("No timestamp query was provided; selected the nearest timestamp to the current server time.");
+  } else if (selection.reason === "requested-fallback") {
+    warnings.push("Requested timestamp was unavailable; selected the nearest available timestamp from the chart.");
   } else if (selection.reason === "first-available") {
     warnings.push("Could not resolve nearest-now timestamp; selected the first available timestamp from the chart.");
   }
@@ -938,9 +1027,16 @@ export const buildMultiModelInsightResponse = (
     location,
     fetchedAt: cacheValue.fetchedAt,
     stale: freshness.stale,
+    freshness: freshness.freshnessState,
     cacheHit: freshness.cacheHit,
     pageUrl,
     sourceType: "meteoblue-page-highcharts",
+    displayUnit,
+    fallbackDisplayUnit: displayUnit,
+    requestedTimestamp: selection.requestedTimestamp,
+    requestedTimestampValid: selection.requestedTimestampValid,
+    resolvedTimestamp: selection.selectedTimestamp,
+    resolvedTimestampReason: selection.reason,
     selectedTimestamp: selection.selectedTimestamp,
     selectedTimestampReason: selection.reason,
     availableTimestamps: [...cacheValue.dataset.timestamps],
@@ -975,22 +1071,36 @@ export const buildMultiModelInsightResponse = (
 export const loadMultiModelDistribution = async (
   pageUrl: string,
   timeZone: string,
+  signal?: AbortSignal,
+  fallbackTemperatureUnit: ParsedTemperatureUnit = "C",
 ): Promise<MultiModelDistributionCacheValue> => {
-  const pageHtml = await fetchText(pageUrl);
+  const pageHtml = await fetchText(pageUrl, signal ? { signal } : undefined);
   const pageFetchedAt = new Date().toISOString();
   const highchartsUrl = extractMultiModelHighchartsUrl(pageHtml);
-  const highchartsText = await fetchText(highchartsUrl);
+  const highchartsText = await fetchText(highchartsUrl, signal ? { signal } : undefined);
+  const sourceTemperatureUnit = resolveMultiModelTemperatureUnit(highchartsUrl, fallbackTemperatureUnit);
+  const parsedDataset = parseMultiModelHighcharts(highchartsText, timeZone, sourceTemperatureUnit);
+  const pageInventory = extractMultiModelPageInventory(pageHtml);
+  const inventoryBuilt = buildModelInventory(parsedDataset, pageInventory);
+  let pngUrl: string | null = null;
 
-  const parsedDataset = parseMultiModelHighcharts(highchartsText, timeZone);
-  const inventorySource = extractMultiModelPageInventory(pageHtml);
-  const inventoryBuilt = buildModelInventory(parsedDataset, inventorySource);
+  try {
+    pngUrl = extractMultiModelImageUrl(pageHtml);
+  } catch {
+    pngUrl = null;
+  }
 
   return {
     fetchedAt: new Date().toISOString(),
     pageFetchedAt,
+    pageHtml,
     highchartsUrl,
+    highchartsRawJson: highchartsText,
     dataset: inventoryBuilt.dataset,
+    pageInventory,
     modelInventory: inventoryBuilt.modelInventory,
+    pngUrl,
+    sourceTemperatureUnit,
     warnings: inventoryBuilt.warnings,
   };
 };
@@ -1005,12 +1115,13 @@ export const buildMultiModelDistributionResponse = (
   freshness: {
     stale: boolean;
     cacheHit: boolean;
+    freshnessState: MultiModelDistributionResponse["freshness"];
   },
 ): MultiModelDistributionResponse => {
   const cacheWarnings = cacheValue.warnings.filter((warning) => !isInternalInventoryAlignmentWarning(warning));
-  const effectiveTimestamp =
-    requestedTimestamp ?? resolveInsightSelection(cacheValue.dataset, undefined, nowIso).selectedTimestamp;
-  const summary = summarizeMultiModelTemperatureDataset(cacheValue.dataset, effectiveTimestamp, bucketSizeC);
+  const selection = resolveInsightSelection(cacheValue.dataset, requestedTimestamp, nowIso);
+  const displayUnit = resolveLocationDisplayUnit(location.id);
+  const summary = summarizeMultiModelTemperatureDataset(cacheValue.dataset, selection.selectedTimestamp, bucketSizeC, displayUnit);
   const dominantBucket = [...summary.distribution].sort(
     (left, right) => right.count - left.count || left.bucketStartC - right.bucketStartC,
   )[0] ?? summary.distribution[0];
@@ -1034,11 +1145,18 @@ export const buildMultiModelDistributionResponse = (
     location,
     fetchedAt: cacheValue.fetchedAt,
     stale: freshness.stale,
+    freshness: freshness.freshnessState,
     cacheHit: freshness.cacheHit,
     pageUrl,
     sourceType: "meteoblue-page-highcharts",
-    requestedTimestamp: requestedTimestamp ?? null,
+    displayUnit,
+    fallbackDisplayUnit: displayUnit,
+    requestedTimestamp: selection.requestedTimestamp,
+    requestedTimestampValid: selection.requestedTimestampValid,
+    resolvedTimestamp: summary.selectedTimestamp,
+    resolvedTimestampReason: selection.reason,
     selectedTimestamp: summary.selectedTimestamp,
+    selectedTimestampReason: selection.reason,
     availableTimestamps: summary.availableTimestamps,
     bucketSizeC,
     modelCount: summary.members.length,
@@ -1070,6 +1188,13 @@ export const buildMultiModelDistributionResponse = (
     warnings: Array.from(
       new Set([
         ...cacheWarnings,
+        ...(selection.reason === "requested-fallback"
+          ? ["Requested timestamp was unavailable; selected the nearest available timestamp from the chart."]
+          : selection.reason === "nearest-now"
+            ? ["No timestamp query was provided; selected the nearest timestamp to the current server time."]
+            : selection.reason === "first-available"
+              ? ["Could not resolve nearest-now timestamp; selected the first available timestamp from the chart."]
+              : []),
         ...collectDistributionWarnings(summary),
         ...collectInventoryWarnings(
           cacheValue.modelInventory,

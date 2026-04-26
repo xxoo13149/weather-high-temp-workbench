@@ -15,10 +15,343 @@ vi.mock("../src/lib/http.js", () => ({
   fetchBinary: fetchBinaryMock,
 }));
 
+import { LOCATION_REGISTRY } from "../src/config.js";
+import { AppError } from "../src/domain/errors.js";
 import { FavoritesStore } from "../src/lib/favorites-store.js";
 import { MeteoblueWeatherService } from "../src/providers/meteoblue/service.js";
 
 const fixture = (name: string): string => readFileSync(join(process.cwd(), "tests", "fixtures", name), "utf8");
+const kellyLocation = LOCATION_REGISTRY.shanghai_pvg;
+
+const buildKellySnapshotRequestKeyForTest = (
+  locationId: string,
+  targetDate: string,
+  options: Record<string, unknown> = {},
+) =>
+  [
+    locationId,
+    targetDate,
+    options.bankroll ?? "default-bankroll",
+    options.riskMode ?? "default-risk",
+    options.minEdge ?? "default-edge",
+    options.actualTemperatureC ?? "default-temp",
+    options.selectedHourTimestamp ?? "default-hour",
+  ].join("::");
+
+const createKellyOrderBook = (tokenId: string, bestAsk: number, updatedAt = "2026-03-28T10:00:01.000Z") => ({
+  tokenId,
+  bestBid: Number((bestAsk - 0.02).toFixed(3)),
+  bestAsk,
+  midpoint: Number((bestAsk - 0.01).toFixed(3)),
+  updatedAt,
+  status: "available" as const,
+});
+
+const createKellyHourlyResponse = () =>
+  ({
+    location: { id: kellyLocation.id, name: kellyLocation.name, timezone: kellyLocation.timezone },
+    fetchedAt: "2026-03-28T10:00:00.000Z",
+    sourceObservedAt: "2026-03-28T10:00:00.000Z",
+    mode: "1h",
+    periodHours: 1,
+    sourceType: "week-table-1h",
+    stale: false,
+    freshness: "fresh",
+    pageUrl: kellyLocation.weekPageUrl,
+    parserVersion: "test",
+    items: [
+      {
+        timestamp: "2026-03-28T12:00:00+08:00",
+        endAt: null,
+        summary: null,
+        summaryZh: "午后升温",
+        iconUrl: null,
+        temperatureC: 20,
+        feelsLikeC: 20,
+        windDirection: null,
+        windSpeedKphMin: null,
+        windSpeedKphMax: null,
+        precipitationMm: null,
+        precipitationProbabilityPct: null,
+      },
+    ],
+    fieldCoverage: {
+      precipitationProbabilityPct: {
+        availableHours: 0,
+        totalHours: 1,
+        source: "week-table-1h",
+        completeness: "missing",
+        missingReasons: {
+          "source-unpublished": 1,
+          "parser-unrecognized": 0,
+          "fallback-unavailable": 0,
+        },
+      },
+      feelsLikeC: {
+        availableHours: 1,
+        totalHours: 1,
+        source: "week-table-1h",
+        completeness: "full",
+        missingReasons: {
+          "source-unpublished": 0,
+          "parser-unrecognized": 0,
+          "fallback-unavailable": 0,
+        },
+      },
+      windDirection: {
+        availableHours: 0,
+        totalHours: 1,
+        source: "week-table-1h",
+        completeness: "missing",
+        missingReasons: {
+          "source-unpublished": 1,
+          "parser-unrecognized": 0,
+          "fallback-unavailable": 0,
+        },
+      },
+      mixedSources: ["week-table-1h"],
+    },
+    partial: false,
+    warnings: [],
+    cacheHit: true,
+    current: {
+      timestamp: "2026-03-28T12:00:00+08:00",
+      temperatureC: 20,
+      index: 0,
+    },
+  }) as any;
+
+const createKellyWeatherReport = () =>
+  ({
+    location: { id: kellyLocation.id, name: kellyLocation.name, timezone: kellyLocation.timezone },
+    fetchedAt: "2026-03-28T10:00:00.000Z",
+    sourceObservedAt: "2026-03-28T10:00:00.000Z",
+    stale: false,
+    freshness: "fresh",
+    cacheHit: true,
+    pageUrl: kellyLocation.weekPageUrl,
+    parserVersion: "test",
+    available: true,
+    titleEn: "Weather report",
+    sourceTextEn: "Warm afternoon expected.",
+    textZh: "午后升温，最高气温接近 27C。",
+    metrics: {
+      forecastDayLabel: "Friday",
+      maxTemperatureC: 27,
+      uvIndex: null,
+      overnightWindKphMin: null,
+      overnightWindKphMax: null,
+      daytimeWindKphMin: null,
+      daytimeWindKphMax: null,
+      overnightWindDirection: null,
+      daytimeWindDirection: null,
+      confidence: "high",
+      predictability: "high",
+      predictabilityScore: 3,
+    },
+    warnings: [],
+  }) as any;
+
+const createKellyInsight = () =>
+  ({
+    location: { id: kellyLocation.id, name: kellyLocation.name, timezone: kellyLocation.timezone },
+    fetchedAt: "2026-03-28T10:00:00.000Z",
+    stale: false,
+    freshness: "fresh",
+    cacheHit: true,
+    pageUrl: kellyLocation.multimodelPageUrl,
+    sourceType: "meteoblue-page-highcharts",
+    displayUnit: kellyLocation.fallbackDisplayUnit,
+    fallbackDisplayUnit: kellyLocation.fallbackDisplayUnit,
+    requestedTimestamp: "2026-03-28T12:00:00+08:00",
+    requestedTimestampValid: true,
+    resolvedTimestamp: "2026-03-28T12:00:00+08:00",
+    resolvedTimestampReason: "requested",
+    selectedTimestamp: "2026-03-28T12:00:00+08:00",
+    selectedTimestampReason: "requested",
+    availableTimestamps: ["2026-03-28T12:00:00+08:00"],
+    modelCount: 3,
+    modelInventory: [
+      {
+        modelName: "IFS",
+        displayName: "IFS",
+        pageOrder: 0,
+        pageLastUpdatedAt: null,
+        pageLastUpdatedLabel: null,
+        sourceDisplayName: "IFS",
+        modelCode: "IFS",
+      },
+    ],
+    referenceTemperature: { temperatureC: 20, source: "assumed-client-value" },
+    closestModel: null,
+    rankedModels: [
+      {
+        modelName: "IFS",
+        currentTemperatureC: 20,
+        deltaToActualTemperatureC: 0,
+        dayPeakTemperatureC: 27,
+        dayPeakTimestamp: "2026-03-28T15:00:00+08:00",
+      },
+    ],
+    peakTimeDistribution: [],
+    sourceProof: {
+      dataFromPage: true,
+      usesOfficialApi: false,
+      chartFormat: "highcharts",
+      pageFetchedAt: "2026-03-28T10:00:00.000Z",
+      chartEndpoint: "https://example.com/chart",
+      parserVersion: "test",
+      modelNames: ["IFS"],
+      timestampCount: 1,
+      timestampSource: "point-name-local",
+      xLabelOffsetMinutes: null,
+    },
+    warnings: [],
+  }) as any;
+
+const createKellyDistribution = () =>
+  ({
+    location: { id: kellyLocation.id, name: kellyLocation.name, timezone: kellyLocation.timezone },
+    fetchedAt: "2026-03-28T10:00:00.000Z",
+    stale: false,
+    freshness: "fresh",
+    cacheHit: true,
+    pageUrl: kellyLocation.multimodelPageUrl,
+    sourceType: "meteoblue-page-highcharts",
+    displayUnit: kellyLocation.fallbackDisplayUnit,
+    fallbackDisplayUnit: kellyLocation.fallbackDisplayUnit,
+    requestedTimestamp: "2026-03-28T12:00:00+08:00",
+    requestedTimestampValid: true,
+    resolvedTimestamp: "2026-03-28T12:00:00+08:00",
+    resolvedTimestampReason: "requested",
+    selectedTimestamp: "2026-03-28T12:00:00+08:00",
+    selectedTimestampReason: "requested",
+    availableTimestamps: ["2026-03-28T12:00:00+08:00"],
+    bucketSizeC: 1,
+    modelCount: 3,
+    modelInventory: [
+      {
+        modelName: "IFS",
+        displayName: "IFS",
+        pageOrder: 0,
+        pageLastUpdatedAt: null,
+        pageLastUpdatedLabel: null,
+        sourceDisplayName: "IFS",
+        modelCode: "IFS",
+      },
+    ],
+    members: [
+      {
+        modelName: "IFS",
+        temperatureC: 20,
+        peakTemperatureC: 27,
+        peakTimestamp: "2026-03-28T15:00:00+08:00",
+      },
+    ],
+    distribution: [],
+    peakDistribution: [],
+    sourceProof: {
+      dataFromPage: true,
+      usesOfficialApi: false,
+      chartFormat: "highcharts",
+      pageFetchedAt: "2026-03-28T10:00:00.000Z",
+      chartEndpoint: "https://example.com/chart",
+      parserVersion: "test",
+      modelNames: ["IFS"],
+      timestampCount: 1,
+      timestampSource: "point-name-local",
+      xLabelOffsetMinutes: null,
+    },
+    highlights: {
+      spreadTemperatureC: 0,
+      dominantBucket: null,
+      dominantPeakBucket: null,
+      coolestMember: null,
+      warmestMember: null,
+      highestPeakMember: null,
+    },
+    stats: {
+      minTemperatureC: 20,
+      maxTemperatureC: 20,
+      meanTemperatureC: 20,
+    },
+    warnings: [],
+  }) as any;
+
+const createRetainedKellyMarket = () =>
+  ({
+    marketId: "market-27c",
+    slug: "market-27c",
+    title: "Will the high temperature in Shanghai be at least 27C on Mar 28, 2026?",
+    marketUrl: "https://example.com/market-27c",
+    conditionId: "condition-27c",
+    liquidity: 4000,
+    volume24h: 1200,
+    contractType: "atLeast",
+    unit: "C",
+    bucketStartC: 27,
+    bucketEndC: null,
+    bucketLabel: ">= 27.0C",
+    lifecycle: "tradable",
+    inactiveReason: null,
+    parseStatus: "matched",
+    exclusionReason: null,
+    yesTokenId: "yes-27c",
+    noTokenId: "no-27c",
+    entrySourceYes: "best-ask",
+    entrySourceNo: "best-ask",
+    yesPrice: 0.41,
+    noPrice: 0.61,
+    yesBestBid: 0.39,
+    yesBestAsk: 0.41,
+    noBestBid: 0.59,
+    noBestAsk: 0.61,
+    spreadPct: 0.02,
+    rawProbabilityYes: 0.6,
+    rawProbabilityNo: 0.4,
+    fairYes: 0.6,
+    fairNo: 0.4,
+    edgeYes: 0.19,
+    edgeNo: -0.21,
+    kellyYes: 0.1,
+    kellyNo: 0,
+    recommendedSide: "yes",
+    suggestedStake: 100,
+    updatedAt: "2026-03-28T10:00:01.000Z",
+  }) as any;
+
+const seedRetainedKellySnapshot = (service: MeteoblueWeatherService, options: Record<string, unknown> = {}) => {
+  const snapshot = {
+    targetDate: "2026-03-28",
+    generatedAt: "2026-03-28T10:00:02.000Z",
+    markets: [createRetainedKellyMarket()],
+    inactiveMarkets: [],
+    unresolvedMarkets: [],
+    sourceLinks: {
+      meteoblueWeekUrl: kellyLocation.weekPageUrl,
+      meteoblueMultimodelUrl: kellyLocation.multimodelPageUrl,
+      polymarketSearchUrl: "https://example.com/search",
+      marketUrls: ["https://example.com/market-27c"],
+    },
+    freshness: {
+      weatherGeneratedAt: "2026-03-28T10:00:00.000Z",
+      marketDiscoveredAt: "2026-03-28T10:00:00.000Z",
+      orderbookFetchedAt: "2026-03-28T10:00:01.000Z",
+      repricedAt: "2026-03-28T10:00:02.000Z",
+      lastStreamEventAt: null,
+      marketMotionState: "still",
+    },
+    warnings: [],
+  } as any;
+
+  (service as any).kellySnapshotResults.set(buildKellySnapshotRequestKeyForTest(kellyLocation.id, "2026-03-28", options), {
+    expiresAt: Date.now() + 60_000,
+    staleUntil: Date.now() + 20 * 60_000,
+    snapshot,
+  });
+
+  return snapshot;
+};
 
 describe("MeteoblueWeatherService", () => {
   beforeEach(() => {
@@ -422,6 +755,7 @@ describe("MeteoblueWeatherService", () => {
       distributionSummary: {
         shrink: 0.86,
       },
+      warnings: [],
     } as any);
     const request = {
       targetDate: "2026-03-28",
@@ -436,11 +770,14 @@ describe("MeteoblueWeatherService", () => {
     expect(second).toBe(first);
     expect(buildKellyWorkbenchSnapshot).toHaveBeenCalledTimes(1);
 
-    vi.advanceTimersByTime(5_001);
+    vi.advanceTimersByTime(30_001);
 
-    await service.getKellyWorkbench("miami_mia", request);
+    const third = await service.getKellyWorkbench("miami_mia", request);
+    await Promise.resolve();
 
     expect(buildKellyWorkbenchSnapshot).toHaveBeenCalledTimes(2);
+    expect(third.generatedAt).toBe(first.generatedAt);
+    expect(third.warnings).toEqual(expect.arrayContaining([expect.stringContaining("后台刷新中")]));
   });
 
   test("preserves the previous Kelly market snapshot when a force refresh comes back empty", async () => {
@@ -532,11 +869,234 @@ describe("MeteoblueWeatherService", () => {
     await expect(service.getMetarSnapshot("shanghai_pvg")).resolves.toEqual({
       observation: null,
       recentTemperatures: [],
+      recentReports: [],
+      recentObservations: [],
     });
     await expect(service.getTafSnapshot("shanghai_pvg")).resolves.toEqual({
       forecast: null,
       forecasts: [],
     });
+  });
+
+  test("reuses retained discovery and orderbook snapshots when Kelly stage refreshes time out", async () => {
+    const service = new MeteoblueWeatherService();
+    const options = {
+      targetDate: "2026-03-28",
+    };
+    const retainedSnapshot = seedRetainedKellySnapshot(service, options);
+    const marketCache = {
+      peek: vi.fn(() => ({
+        entry: null,
+        inFlight: false,
+        lastError: null,
+        freshness: null,
+      })),
+      get: vi
+        .fn()
+        .mockRejectedValue(
+          new AppError(
+            503,
+            "KELLY_MARKET_DISCOVERY_STAGE_TIMEOUT",
+            "Kelly market discovery stage exceeded 3500ms.",
+            { retryable: true },
+          ),
+        ),
+      set: vi.fn(),
+    };
+    const orderBookCache = {
+      peek: vi.fn(() => ({
+        entry: null,
+        inFlight: false,
+        lastError: null,
+        freshness: null,
+      })),
+      get: vi
+        .fn()
+        .mockRejectedValue(
+          new AppError(503, "KELLY_ORDERBOOK_STAGE_TIMEOUT", "Kelly orderbook stage exceeded 4000ms.", {
+            retryable: true,
+          }),
+        ),
+      set: vi.fn(),
+    };
+
+    vi.spyOn(service, "getHourly").mockResolvedValue(createKellyHourlyResponse());
+    vi.spyOn(service, "getWeatherReport").mockResolvedValue(createKellyWeatherReport());
+    vi.spyOn(service, "getMetarSnapshot").mockResolvedValue({
+      observation: null,
+      recentTemperatures: [],
+    });
+    vi.spyOn(service, "getTafSnapshot").mockResolvedValue({
+      forecast: null,
+      forecasts: [],
+    });
+    vi.spyOn(service, "getMultiModelInsight").mockResolvedValue(createKellyInsight());
+    vi.spyOn(service, "getMultiModelDistribution").mockResolvedValue(createKellyDistribution());
+    vi.spyOn(service as any, "getKellyMarketCache").mockReturnValue(marketCache);
+    vi.spyOn(service as any, "getKellyOrderBookCache").mockReturnValue(orderBookCache);
+
+    const snapshot = await (service as any).buildKellyWorkbenchSnapshot(
+      kellyLocation.id,
+      (service as any).requireLocation(kellyLocation.id),
+      "2026-03-28",
+      options,
+    );
+
+    expect(snapshot.markets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          marketId: retainedSnapshot.markets[0].marketId,
+          yesBestAsk: retainedSnapshot.markets[0].yesBestAsk,
+          noBestAsk: retainedSnapshot.markets[0].noBestAsk,
+        }),
+      ]),
+    );
+    expect(snapshot.warnings).toEqual(
+      expect.arrayContaining([
+        "METAR 实况当前不可用，Kelly 下界约束回退到站点当前小时温度。",
+        "市场目录刷新较慢，当前沿用上一轮市场结果。",
+        "盘口刷新较慢，当前沿用最近一次可用价格。",
+      ]),
+    );
+    expect(snapshot.warnings).not.toContain("市场目录刷新较慢，当前先展示天气判断，稍后会自动补齐。");
+    expect(snapshot.warnings).not.toContain("盘口刷新较慢，当前先展示市场档位与天气判断，价格稍后自动补齐。");
+    expect(marketCache.set).toHaveBeenCalledWith(
+      expect.objectContaining({
+        candidates: expect.arrayContaining([expect.objectContaining({ marketId: retainedSnapshot.markets[0].marketId })]),
+      }),
+      expect.any(Date),
+    );
+    expect(orderBookCache.set).toHaveBeenCalledWith(expect.any(Map), expect.any(Date));
+  });
+
+  test("does not add default warnings when METAR or TAF are served from stale cache", async () => {
+    const service = new MeteoblueWeatherService();
+    const discoveryResult = {
+      fetchedAt: "2026-03-28T10:00:00.000Z",
+      candidates: [
+        {
+          marketId: "market-27c",
+          slug: "market-27c",
+          title: "Will the high temperature in Shanghai be at least 27C on Mar 28, 2026?",
+          marketUrl: "https://example.com/market-27c",
+          conditionId: "condition-27c",
+          contractType: "atLeast",
+          unit: "C",
+          bucketStartC: 27,
+          bucketEndC: null,
+          bucketLabel: ">= 27.0C",
+          lifecycle: "tradable",
+          inactiveReason: null,
+          parseStatus: "matched",
+          exclusionReason: null,
+          yesTokenId: "yes-27c",
+          noTokenId: "no-27c",
+          updatedAt: "2026-03-28T10:00:00.000Z",
+          eventTitle: "Shanghai weather",
+          eventUrl: "https://example.com/event",
+          liquidity: 4000,
+          volume24h: 1200,
+          description: "Rule summary",
+          resolutionSource: "National Weather Service",
+        },
+      ],
+      inactiveCandidates: [],
+      sourceLinks: {
+        meteoblueWeekUrl: kellyLocation.weekPageUrl,
+        meteoblueMultimodelUrl: kellyLocation.multimodelPageUrl,
+        polymarketSearchUrl: "https://example.com/search",
+        marketUrls: ["https://example.com/market-27c"],
+      },
+    };
+    const orderBooks = new Map([
+      ["yes-27c", createKellyOrderBook("yes-27c", 0.41)],
+      ["no-27c", createKellyOrderBook("no-27c", 0.61)],
+    ]);
+
+    vi.spyOn(service, "getHourly").mockResolvedValue(createKellyHourlyResponse());
+    vi.spyOn(service, "getWeatherReport").mockResolvedValue(createKellyWeatherReport());
+    vi.spyOn(service, "getMetarSnapshot").mockResolvedValue({
+      observation: {
+        location: { id: kellyLocation.id, name: kellyLocation.name, timezone: kellyLocation.timezone },
+        stationId: "ZSPD",
+        observedAt: "2026-03-28T09:50:00.000Z",
+        temperatureC: 20,
+        dewpointC: 14,
+        windDirectionDegrees: 110,
+        windSpeedKts: 8,
+        rawReport: "METAR ZSPD 280950Z 11008KT 9999 FEW020 20/14 Q1015",
+        stationName: "Shanghai Pudong",
+        sourceUrl: "https://aviationweather.gov/api/data/metar?format=json&ids=ZSPD",
+        fetchedAt: "2026-03-28T10:00:00.000Z",
+        stale: true,
+        freshness: "fallback_error",
+        cacheHit: true,
+      },
+      recentTemperatures: [],
+    });
+    vi.spyOn(service, "getTafSnapshot").mockResolvedValue({
+      forecast: {
+        location: { id: kellyLocation.id, name: kellyLocation.name, timezone: kellyLocation.timezone },
+        stationId: "ZSPD",
+        stationName: "Shanghai Pudong",
+        issuedAt: "2026-03-28T09:00:00.000Z",
+        validFrom: "2026-03-28T09:00:00.000Z",
+        validTo: "2026-03-29T09:00:00.000Z",
+        rawTaf: "TAF ZSPD 280900Z 2809/2909 11008KT 9999 FEW020",
+        sourceUrl: "https://metar-taf.com/taf/ZSPD",
+        officialSourceUrl: "https://aviationweather.gov/api/data/taf?format=json&ids=ZSPD",
+        activeForecast: null,
+        fetchedAt: "2026-03-28T10:00:00.000Z",
+        stale: true,
+        freshness: "fallback_error",
+        cacheHit: true,
+      },
+      forecasts: [],
+    });
+    vi.spyOn(service, "getMultiModelInsight").mockResolvedValue(createKellyInsight());
+    vi.spyOn(service, "getMultiModelDistribution").mockResolvedValue(createKellyDistribution());
+    vi.spyOn(service as any, "getKellyMarketCache").mockReturnValue({
+      peek: vi.fn(() => ({
+        entry: null,
+        inFlight: false,
+        lastError: null,
+        freshness: null,
+      })),
+      get: vi.fn().mockResolvedValue({
+        value: discoveryResult,
+        cacheHit: false,
+        stale: false,
+        freshness: "fresh",
+      }),
+      set: vi.fn(),
+    });
+    vi.spyOn(service as any, "getKellyOrderBookCache").mockReturnValue({
+      peek: vi.fn(() => ({
+        entry: null,
+        inFlight: false,
+        lastError: null,
+        freshness: null,
+      })),
+      get: vi.fn().mockResolvedValue({
+        value: orderBooks,
+        cacheHit: false,
+        stale: false,
+        freshness: "fresh",
+      }),
+      set: vi.fn(),
+    });
+
+    const snapshot = await (service as any).buildKellyWorkbenchSnapshot(
+      kellyLocation.id,
+      (service as any).requireLocation(kellyLocation.id),
+      "2026-03-28",
+      {
+        targetDate: "2026-03-28",
+      },
+    );
+
+    expect(snapshot.warnings).not.toContain("METAR 实况当前使用最近一次成功缓存。");
+    expect(snapshot.warnings).not.toContain("TAF 机场预报当前使用最近一次成功缓存。");
   });
 
   test("falls back to the last Kelly snapshot when a later refresh fails", async () => {
@@ -659,13 +1219,72 @@ describe("MeteoblueWeatherService", () => {
     const first = await service.getKellyWorkbench("shanghai_pvg", { targetDate: "2026-04-24" });
     expect(first.generatedAt).toBe("2026-04-23T23:59:00.000Z");
 
-    vi.advanceTimersByTime(5_001);
+    vi.advanceTimersByTime(30_001);
 
     const second = await service.getKellyWorkbench("shanghai_pvg", { targetDate: "2026-04-24" });
+    expect(second.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("后台刷新中")]),
+    );
+    await vi.runAllTimersAsync();
+
+    const third = await service.getKellyWorkbench("shanghai_pvg", { targetDate: "2026-04-24" });
+    expect(third.generatedAt).toBe("2026-04-23T23:59:00.000Z");
+    expect(third.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("当前继续沿用上一轮可用结果")]),
+    );
+    expect(second.generatedAt).toBe("2026-04-23T23:59:00.000Z");
+  });
+
+  test("serves the cached Kelly snapshot when a force refresh stays slow", async () => {
+    const service = new MeteoblueWeatherService();
+    const buildKellyWorkbenchSnapshot = vi.spyOn(service as any, "buildKellyWorkbenchSnapshot");
+    const baseSnapshot = {
+      location: {
+        id: "shanghai_pvg",
+        name: "Shanghai Pudong International Airport",
+        timezone: "Asia/Shanghai",
+      },
+      targetDate: "2026-04-24",
+      availableTargetDates: ["2026-04-24"],
+      generatedAt: "2026-04-23T23:59:00.000Z",
+      distributionSummary: {
+        shrink: 0.8,
+      },
+      probabilityCurve: [],
+      warnings: [],
+    } as any;
+
+    let resolveRefresh: ((value: unknown) => void) | null = null;
+    const slowRefresh = new Promise((resolve) => {
+      resolveRefresh = resolve;
+    });
+
+    buildKellyWorkbenchSnapshot.mockResolvedValueOnce(baseSnapshot).mockImplementationOnce(() => slowRefresh as Promise<any>);
+
+    const first = await service.getKellyWorkbench("shanghai_pvg", { targetDate: "2026-04-24" });
+    expect(first.generatedAt).toBe("2026-04-23T23:59:00.000Z");
+
+    const pendingForceRefresh = service.getKellyWorkbench("shanghai_pvg", {
+      targetDate: "2026-04-24",
+      forceRefresh: true,
+    });
+    await vi.advanceTimersByTimeAsync(4_001);
+
+    const second = await pendingForceRefresh;
     expect(second.generatedAt).toBe("2026-04-23T23:59:00.000Z");
     expect(second.warnings).toEqual(
-      expect.arrayContaining([expect.stringContaining("当前继续沿用上一轮可用快照")]),
+      expect.arrayContaining([expect.stringContaining("后台刷新中")]),
     );
+
+    resolveRefresh?.({
+      ...baseSnapshot,
+      generatedAt: "2026-04-24T00:05:00.000Z",
+    });
+    const cacheKey = buildKellySnapshotRequestKeyForTest("shanghai_pvg", "2026-04-24");
+    await (service as any).kellySnapshotInFlight.get(cacheKey);
+
+    const third = await service.getKellyWorkbench("shanghai_pvg", { targetDate: "2026-04-24" });
+    expect(third.generatedAt).toBe("2026-04-24T00:05:00.000Z");
   });
 });
 

@@ -7,6 +7,7 @@ import type {
   MultiModelDistributionResponse,
   MultiModelInsightResponse,
   MultiModelStatusResponse,
+  SystemStatusResponse,
   UserFavoritesResponse,
   WeatherReportResponse,
 } from "./types";
@@ -22,6 +23,9 @@ export class WeatherApiError extends Error {
     this.payload = payload;
   }
 }
+
+const NETWORK_RETRY_DELAY_MS = 350;
+const TRANSIENT_API_RETRY_STATUSES = new Set([502, 503, 504]);
 
 const buildUrl = (
   basePath: string,
@@ -57,6 +61,25 @@ const isApiErrorPayload = (value: unknown): value is ApiErrorPayload =>
   "staleAvailable" in value &&
   "lastSuccessAt" in value;
 
+const isGetRequest = (init?: RequestInit) => (init?.method ?? "GET").toUpperCase() === "GET";
+
+const isAbortError = (error: unknown) =>
+  error instanceof DOMException
+    ? error.name === "AbortError"
+    : error instanceof Error
+      ? error.name === "AbortError"
+      : false;
+
+const isGenericFetchFailure = (error: unknown) =>
+  error instanceof Error &&
+  /failed to fetch|networkerror|load failed|network request failed/i.test(error.message);
+
+const shouldRetryTransientApiStatus = (
+  status: number,
+  payload: ApiErrorPayload | null,
+  init?: RequestInit,
+) => isGetRequest(init) && TRANSIENT_API_RETRY_STATUSES.has(status) && payload?.retryable !== false;
+
 const requestJson = async <T>(
   basePath: string,
   path: string,
@@ -64,20 +87,39 @@ const requestJson = async <T>(
   init?: RequestInit,
 ): Promise<T> => {
   const requestUrl = buildUrl(basePath, path, searchParams);
-  const response = await fetch(requestUrl, {
+  const requestInit: RequestInit = {
     ...init,
     headers: {
       accept: "application/json",
       ...(init?.body ? { "content-type": "application/json" } : {}),
       ...(init?.headers ?? {}),
     },
-  });
+  };
+  const executeFetch = async () => await fetch(requestUrl, requestInit);
+  let response: Response | null = null;
+  let attempt = 0;
 
-  if (!response.ok) {
+  while (attempt < 2) {
+    try {
+      response = await executeFetch();
+    } catch (error) {
+      if (!isGetRequest(init) || isAbortError(error) || !isGenericFetchFailure(error) || attempt > 0) {
+        throw error;
+      }
+
+      attempt += 1;
+      await new Promise((resolve) => globalThis.setTimeout(resolve, NETWORK_RETRY_DELAY_MS));
+      continue;
+    }
+
+    if (response.ok) {
+      break;
+    }
+
     let payload: ApiErrorPayload | null = null;
 
     try {
-      const json = (await response.json()) as unknown;
+      const json = (await response.clone().json()) as unknown;
       if (isApiErrorPayload(json)) {
         payload = json;
       }
@@ -85,7 +127,17 @@ const requestJson = async <T>(
       payload = null;
     }
 
+    if (attempt === 0 && shouldRetryTransientApiStatus(response.status, payload, init)) {
+      attempt += 1;
+      await new Promise((resolve) => globalThis.setTimeout(resolve, NETWORK_RETRY_DELAY_MS));
+      continue;
+    }
+
     throw new WeatherApiError(payload?.message ?? `Request failed with status ${response.status}.`, response.status, payload);
+  }
+
+  if (!response || !response.ok) {
+    throw new WeatherApiError("Request failed before a response was received.", 502, null);
   }
 
   const contentType = response.headers.get("content-type") ?? "";
@@ -117,6 +169,9 @@ export const weatherApi = {
 
   fetchReport: (locationId?: string) => requestJson<WeatherReportResponse>(CONFIG.api.BASE_URL, CONFIG.api.REPORT, { locationId }),
 
+  fetchSystemStatus: (init?: RequestInit) =>
+    requestJson<SystemStatusResponse>(CONFIG.api.SYSTEM_BASE_URL, CONFIG.api.SYSTEM_STATUS, undefined, init),
+
   fetchMultiModelStatus: (locationId?: string) =>
     requestJson<MultiModelStatusResponse>(CONFIG.api.BASE_URL, CONFIG.api.MULTIMODEL_STATUS, { locationId }),
 
@@ -147,6 +202,7 @@ export const weatherApi = {
     minEdge?: number,
     actualTemperatureC?: number,
     selectedHour?: string,
+    forceRefresh?: boolean,
     init?: RequestInit,
   ) =>
     requestJson<KellyWorkbenchResponse>(
@@ -160,6 +216,7 @@ export const weatherApi = {
         minEdge,
         actualTemperatureC,
         selectedHour,
+        forceRefresh,
       },
       init,
     ),
@@ -214,7 +271,14 @@ export const weatherApi = {
 
 export const getErrorMessage = (error: unknown, fallback: string) => {
   if (error instanceof WeatherApiError) {
+    if (!error.payload && isGenericFetchFailure(error)) {
+      return fallback;
+    }
     return error.payload?.message ?? error.message;
+  }
+
+  if (isGenericFetchFailure(error)) {
+    return fallback;
   }
 
   if (error instanceof Error && error.message) {

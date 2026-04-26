@@ -3,6 +3,7 @@ import type { HourlyWeatherItem } from "../../domain/weather.js";
 import { parseLocalDateTimeInTimeZone, toIsoInTimeZone } from "../../lib/time.js";
 
 export const WEEK_METEOGRAM_VERSION = "2026-03-29.2";
+type ParsedTemperatureUnit = "C" | "F";
 
 interface MeteogramRoot {
   credits?: {
@@ -96,6 +97,19 @@ export const extractWeekMeteogramHighchartsUrl = (html: string): string => {
   return assertWeekMeteogramHighchartsUrl(normalizeUrl(match[1]));
 };
 
+export const resolveWeekMeteogramTemperatureUnit = (
+  url: string,
+  fallbackUnit: ParsedTemperatureUnit = "C",
+): ParsedTemperatureUnit => {
+  try {
+    const parsed = new URL(url);
+    const rawUnit = (parsed.searchParams.get("temperature_units") ?? "").trim().toUpperCase();
+    return rawUnit === "F" || rawUnit === "C" ? rawUnit : fallbackUnit;
+  } catch {
+    return fallbackUnit;
+  }
+};
+
 const parseMeteogramJson = (raw: string): MeteogramRoot => {
   try {
     return JSON.parse(raw.replace(/^\uFEFF/, "")) as MeteogramRoot;
@@ -112,6 +126,8 @@ const parseMeteogramJson = (raw: string): MeteogramRoot => {
 };
 
 const round = (value: number, digits: number): number => Number.parseFloat(value.toFixed(digits));
+const normalizeTemperatureToC = (value: number, unit: ParsedTemperatureUnit): number =>
+  unit === "F" ? round(((value - 32) * 5) / 9, 1) : round(value, 1);
 
 const toWallClockValue = (timestamp: number): string => {
   const iso = new Date(timestamp).toISOString();
@@ -183,7 +199,11 @@ export interface ParsedWeekMeteogram {
   items: HourlyWeatherItem[];
 }
 
-export const parseWeekMeteogramHighcharts = (raw: string, timeZone: string): ParsedWeekMeteogram => {
+export const parseWeekMeteogramHighcharts = (
+  raw: string,
+  timeZone: string,
+  temperatureUnit: ParsedTemperatureUnit = "C",
+): ParsedWeekMeteogram => {
   const root = parseMeteogramJson(raw);
   const seriesList = root.series ?? [];
 
@@ -223,7 +243,7 @@ export const parseWeekMeteogramHighcharts = (raw: string, timeZone: string): Par
       summary: null,
       summaryZh: null,
       iconUrl: extractMarkerUrl(pictogram?.marker?.symbol),
-      temperatureC: typeof entry.point.y === "number" ? round(entry.point.y, 1) : null,
+      temperatureC: typeof entry.point.y === "number" ? normalizeTemperatureToC(entry.point.y, temperatureUnit) : null,
       feelsLikeC: null,
       windDirection: toWindDirection(windDirectionMap.get(entry.timestamp)?.direction),
       windSpeedKphMin: typeof windSpeed === "number" ? round(windSpeed, 1) : null,

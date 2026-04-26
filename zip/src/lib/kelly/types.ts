@@ -8,7 +8,7 @@ export type KellyTone = "neutral" | "accent" | "success" | "warning" | "danger";
 
 export type KellyMarketStatus = "tradable" | "thin" | "locked";
 
-export type KellyTimezoneGroup = "asia" | "europe" | "americas";
+export type KellyTimezoneGroup = "asia" | "europe" | "africa" | "americas" | "oceania";
 
 export interface KellyLocationOption {
   id: string;
@@ -218,7 +218,7 @@ export interface KellyWorkbenchData {
   summaryMetrics: KellySummaryMetric[];
   opportunities: KellyOpportunity[];
   opportunityEmptyState?: string | null;
-  probability: KellyProbabilityPanelData;
+  probability?: KellyProbabilityPanelData;
   markets: KellyMarketRow[];
   inactiveMarkets?: KellyMarketRow[];
   marketEmptyState?: string | null;

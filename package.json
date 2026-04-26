@@ -8,7 +8,6 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "dev:kelly-bridge": "tsx watch src/kelly-bridge.ts",
     "dev:web": "npm --prefix zip run dev",
     "dev:cloudflare": "npx wrangler dev",
     "stitch:explore": "node tools/stitch-concept.mjs explore",
@@ -19,9 +18,11 @@
     "check:encoding": "node tools/check-encoding.mjs",
     "check": "tsc --noEmit && npm --prefix zip run lint && node tools/check-encoding.mjs",
     "start": "node dist/index.js",
-    "start:kelly-bridge": "node dist/kelly-bridge.js",
     "deploy:cloudflare": "npx wrangler deploy",
-    "test": "vitest run"
+    "audit:production": "node tools/audit-production-city-health.mjs",
+    "test": "vitest run",
+    "test:pw": "node tools/playwright-location-regression.cjs",
+    "test:pw:online": "node tools/playwright-location-regression.cjs --suite=online-smoke"
   },
   "dependencies": {
     "@fastify/websocket": "^11.2.0",
@@ -36,5 +37,6 @@
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
-  }
+  },
+  "packageManager": "pnpm@9.15.9+sha512.68046141893c66fad01c079231128e9afb89ef87e2691d69e4d40eee228988295fd4682181bae55b58418c3a253bde65a505ec7c5f9403ece5cc3cd37dcf2531"
 }

@@ -6,10 +6,23 @@ import type {
   KellyWorkbenchResponse,
 } from "./types";
 
+const KELLY_FLOOR_ENTRY_PRICE = 0.1;
+const KELLY_FLOOR_ENTRY_EPSILON = 1e-6;
+
+const isFloorEntryPrice = (value: number | null | undefined) =>
+  typeof value === "number" && Number.isFinite(value) && value <= KELLY_FLOOR_ENTRY_PRICE + KELLY_FLOOR_ENTRY_EPSILON;
+
+export const shouldHideKellyFloorMarket = (
+  market: Pick<KellyMarketRow, "yesBestAsk" | "yesPrice" | "noBestAsk" | "noPrice">,
+) =>
+  isFloorEntryPrice(market.yesBestAsk ?? market.yesPrice) ||
+  isFloorEntryPrice(market.noBestAsk ?? market.noPrice);
+
 const isTradableKellyRow = (market: KellyMarketRow) =>
   market.parseStatus === "matched" &&
   market.lifecycle === "tradable" &&
-  (market.entrySourceYes !== "unavailable" || market.entrySourceNo !== "unavailable");
+  (market.entrySourceYes !== "unavailable" || market.entrySourceNo !== "unavailable") &&
+  !shouldHideKellyFloorMarket(market);
 
 const applyKellyPatch = (
   market: KellyMarketRow,
@@ -56,6 +69,7 @@ export const deriveKellyRecommendations = (
   const minEdge = typeof explicitMinEdge === "number" ? explicitMinEdge : minEdgeOrBankroll;
 
   return markets
+    .filter((market) => !shouldHideKellyFloorMarket(market))
     .filter((market) => market.recommendedSide !== "none")
     .map((market) => {
       const side: KellyRecommendation["side"] = market.recommendedSide === "yes" ? "yes" : "no";
@@ -92,6 +106,7 @@ export const deriveKellyRecommendations = (
 
 export const deriveKellyBestObservation = (markets: KellyMarketRow[]): KellyRecommendation | null => {
   const ranked = [...markets]
+    .filter((market) => !shouldHideKellyFloorMarket(market))
     .filter((market) => market.parseStatus === "matched")
     .sort((left, right) => {
       const leftEdge = Math.max(left.edgeYes, left.edgeNo);
@@ -136,6 +151,7 @@ export const mergeKellyStreamPatches = (
   const patched = combined.map((market) => applyKellyPatch(market, patchMap.get(market.marketId)));
   const markets = patched.filter(isTradableKellyRow);
   const inactiveMarkets = patched.filter((market) => !isTradableKellyRow(market));
+  const visibleTradableMarkets = markets.filter((market) => !shouldHideKellyFloorMarket(market));
 
   return {
     ...snapshot,
@@ -144,7 +160,7 @@ export const mergeKellyStreamPatches = (
     markets,
     inactiveMarkets,
     frameSeries: snapshot.frameSeries,
-    recommendations: deriveKellyRecommendations(markets, minEdge),
-    bestObservation: deriveKellyBestObservation(markets),
+    recommendations: deriveKellyRecommendations(visibleTradableMarkets, minEdge),
+    bestObservation: deriveKellyBestObservation(visibleTradableMarkets),
   };
 };

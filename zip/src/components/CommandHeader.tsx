@@ -58,7 +58,7 @@ export const CommandHeader = ({
   transitioning?: boolean;
   locationTimezone?: string;
   updatedAt: string | null;
-  syncState: "fresh" | "stale";
+  syncState: "fresh" | "fallback_error";
   refreshState: "idle" | "pending" | "success" | "error";
   refreshDisabled: boolean;
   currentPage: "home" | "analysis" | "kelly";
@@ -144,7 +144,7 @@ export const CommandHeader = ({
               >
                 <span className="inline-flex h-2.5 w-2.5 rounded-full bg-current" />
                 <span className="text-xs uppercase tracking-[0.12em] text-white/72">
-                  {syncState === "stale" ? HEADER_TEXT.stale : HEADER_TEXT.synced}
+                  {syncState === "fallback_error" ? HEADER_TEXT.stale : HEADER_TEXT.synced}
                 </span>
                 <span className="data-mono text-[11px] text-white/50">
                   {updatedAt ? formatDateTime(updatedAt, locationTimezone) : "--"}

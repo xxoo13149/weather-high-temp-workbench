@@ -6,6 +6,7 @@ import { describe, expect, test } from "vitest";
 import {
   extractWeekMeteogramHighchartsUrl,
   parseWeekMeteogramHighcharts,
+  resolveWeekMeteogramTemperatureUnit,
 } from "../src/providers/meteoblue/meteogram.js";
 
 const fixture = (name: string): string =>
@@ -41,5 +42,34 @@ describe("week meteogram parser", () => {
       windSpeedKphMax: 16.2,
       precipitationMm: 0.25,
     });
+  });
+
+  test("normalizes imperial meteogram temperatures back to canonical Celsius", () => {
+    const raw = JSON.stringify({
+      credits: {
+        text: "Last update: 2026-04-09 13:10",
+      },
+      series: [
+        {
+          name: "Temperature",
+          data: [
+            { name: "2026-04-09 00:00:00", y: 72 },
+            { name: "2026-04-09 01:00:00", y: 73.3 },
+          ],
+        },
+      ],
+    });
+
+    expect(
+      resolveWeekMeteogramTemperatureUnit(
+        "https://my.meteoblue.com/images/meteogram?temperature_units=F&windspeed_units=mph&format=highcharts",
+        "C",
+      ),
+    ).toBe("F");
+
+    const parsed = parseWeekMeteogramHighcharts(raw, "America/New_York", "F");
+
+    expect(parsed.items[0]?.temperatureC).toBeCloseTo(22.2, 1);
+    expect(parsed.items[1]?.temperatureC).toBeCloseTo(22.9, 1);
   });
 });

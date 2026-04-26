@@ -19,6 +19,24 @@ const location = {
   timezone: "Asia/Shanghai",
 };
 
+const miamiLocation = {
+  id: "miami_mia" as const,
+  name: "Miami International Airport",
+  timezone: "America/New_York",
+};
+
+const torontoLocation = {
+  id: "toronto_yyz" as const,
+  name: "Toronto Pearson International Airport",
+  timezone: "America/Toronto",
+};
+
+const freshMultiModelMeta = {
+  stale: false,
+  cacheHit: true,
+  freshnessState: "fresh" as const,
+};
+
 const modelInventory = [
   {
     modelName: "Model A",
@@ -60,7 +78,10 @@ describe("multimodel distribution parser", () => {
       "2026-03-28T05:00:00+08:00",
     ]);
     expect(dataset.models.map((model) => model.displayName)).toEqual(["IFS 0.25°", "ICON", "GEM 15 km"]);
+    expect(summary.requestedTimestamp).toBe("2026-03-28T04:00:00+08:00");
+    expect(summary.requestedTimestampValid).toBe(true);
     expect(summary.selectedTimestamp).toBe("2026-03-28T04:00:00+08:00");
+    expect(summary.selectedTimestampReason).toBe("requested");
     expect(summary.members).toEqual([
       {
         modelName: "GEM 15 km",
@@ -169,13 +190,18 @@ describe("multimodel distribution parser", () => {
         actualTemperatureC: 20,
         nowIso: "2026-03-31T09:10:00+08:00",
       },
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
 
+    expect(response.freshness).toBe("fresh");
+    expect(response.displayUnit).toBe("C");
+    expect(response.fallbackDisplayUnit).toBe("C");
+    expect(response.requestedTimestamp).toBe("2026-03-31T09:00:00+08:00");
+    expect(response.requestedTimestampValid).toBe(true);
+    expect(response.resolvedTimestamp).toBe("2026-03-31T09:00:00+08:00");
+    expect(response.resolvedTimestampReason).toBe("requested");
     expect(response.selectedTimestamp).toBe("2026-03-31T09:00:00+08:00");
+    expect(response.selectedTimestampReason).toBe("requested");
     expect(response.modelInventory).toHaveLength(3);
     expect(response.rankedModels.map((model) => model.modelName)).toEqual(["Model C", "Model B", "Model A"]);
     expect(response.peakTimeDistribution).toEqual([
@@ -226,10 +252,7 @@ describe("multimodel distribution parser", () => {
       {
         nowIso,
       },
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
     const distribution = buildMultiModelDistributionResponse(
       cacheValue,
@@ -238,14 +261,58 @@ describe("multimodel distribution parser", () => {
       undefined,
       nowIso,
       1,
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
 
     expect(insight.selectedTimestamp).toBe("2026-03-31T12:00:00+08:00");
     expect(distribution.selectedTimestamp).toBe(insight.selectedTimestamp);
+    expect(insight.resolvedTimestamp).toBe(insight.selectedTimestamp);
+    expect(distribution.resolvedTimestamp).toBe(distribution.selectedTimestamp);
+  });
+
+  test("uses explicit fallback display units per location instead of timezone-group guessing", () => {
+    const cacheValue = {
+      fetchedAt: "2026-03-31T01:30:00.000Z",
+      pageFetchedAt: "2026-03-31T01:29:00.000Z",
+      highchartsUrl: "https://example.com/images/meteogram_multimodel?format=highcharts&sig=abc",
+      dataset: {
+        timestamps: ["2026-03-31T09:00:00-04:00"],
+        models: [{ modelName: "A", displayName: "Model A", values: [27] }],
+        timestampSource: "point-name-local" as const,
+        detectedXOffsetMinutes: 0,
+      },
+      modelInventory: [modelInventory[0]!],
+      warnings: [],
+    };
+
+    const miamiResponse = buildMultiModelInsightResponse(
+      cacheValue,
+      miamiLocation,
+      "https://example.com/multimodel",
+      {
+        requestedTimestamp: "2026-03-31T09:00:00-04:00",
+        actualTemperatureC: 27,
+        nowIso: "2026-03-31T09:10:00-04:00",
+      },
+      freshMultiModelMeta,
+    );
+
+    const torontoResponse = buildMultiModelInsightResponse(
+      cacheValue,
+      torontoLocation,
+      "https://example.com/multimodel",
+      {
+        requestedTimestamp: "2026-03-31T09:00:00-04:00",
+        actualTemperatureC: 27,
+        nowIso: "2026-03-31T09:10:00-04:00",
+      },
+      freshMultiModelMeta,
+    );
+
+    expect(miamiResponse.displayUnit).toBe("F");
+    expect(miamiResponse.fallbackDisplayUnit).toBe("F");
+    expect(torontoResponse.displayUnit).toBe("C");
+    expect(torontoResponse.fallbackDisplayUnit).toBe("C");
   });
 
   test("filters internal inventory alignment warnings from both insight and distribution responses", () => {
@@ -281,10 +348,7 @@ describe("multimodel distribution parser", () => {
       {
         nowIso,
       },
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
     const distribution = buildMultiModelDistributionResponse(
       cacheValue,
@@ -293,10 +357,7 @@ describe("multimodel distribution parser", () => {
       undefined,
       nowIso,
       1,
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
 
     expect(insight.warnings).not.toContain("Selected model WRFGR is missing in parsed highcharts series.");
@@ -336,10 +397,7 @@ describe("multimodel distribution parser", () => {
         requestedTimestamp: "2026-03-31T20:00:00+08:00",
         actualTemperatureC: 20,
       },
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
 
     expect(response.closestModel).toEqual({
@@ -377,10 +435,7 @@ describe("multimodel distribution parser", () => {
       "2026-03-31T20:00:00+08:00",
       "2026-03-31T20:10:00+08:00",
       1,
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
 
     expect(distribution.members[0]).toEqual({
@@ -427,10 +482,7 @@ describe("multimodel distribution parser", () => {
       "2026-03-31T20:00:00+08:00",
       "2026-03-31T20:05:00+08:00",
       1,
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
 
     expect(distribution.highlights.highestPeakMember).toEqual({
@@ -569,10 +621,7 @@ describe("multimodel distribution parser", () => {
       undefined,
       nowIso,
       1,
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
     const insight = buildMultiModelInsightResponse(
       cacheValue,
@@ -581,14 +630,98 @@ describe("multimodel distribution parser", () => {
       {
         nowIso,
       },
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
 
     expect(distribution.selectedTimestamp).toBe("2026-03-31T12:00:00+08:00");
     expect(distribution.selectedTimestamp).toBe(insight.selectedTimestamp);
+  });
+
+  test("falls back invalid requested timestamp to nearest available and exposes Miami display unit", () => {
+    const response = buildMultiModelDistributionResponse(
+      {
+        fetchedAt: "2026-03-31T16:30:00.000Z",
+        pageFetchedAt: "2026-03-31T16:29:00.000Z",
+        highchartsUrl: "https://example.com/images/meteogram_multimodel?format=highcharts&temperature_units=F&sig=abc",
+        dataset: {
+          timestamps: [
+            "2026-03-31T09:00:00-04:00",
+            "2026-03-31T12:00:00-04:00",
+            "2026-03-31T15:00:00-04:00",
+          ],
+          models: [
+            { modelName: "A", displayName: "Model A", values: [21.11, 23.89, 25] },
+            { modelName: "B", displayName: "Model B", values: [20.56, 23.33, 24.44] },
+          ],
+          timestampSource: "point-name-local" as const,
+          detectedXOffsetMinutes: null,
+        },
+        modelInventory: modelInventory.slice(0, 2),
+        warnings: [],
+      },
+      miamiLocation,
+      "https://example.com/multimodel",
+      "2026-03-31T12:40:00-04:00",
+      "2026-03-31T12:41:00-04:00",
+      1,
+      freshMultiModelMeta,
+    );
+
+    expect(response.freshness).toBe("fresh");
+    expect(response.displayUnit).toBe("F");
+    expect(response.fallbackDisplayUnit).toBe("F");
+    expect(response.requestedTimestamp).toBe("2026-03-31T12:40:00-04:00");
+    expect(response.requestedTimestampValid).toBe(false);
+    expect(response.resolvedTimestamp).toBe("2026-03-31T12:00:00-04:00");
+    expect(response.resolvedTimestampReason).toBe("requested-fallback");
+    expect(response.selectedTimestamp).toBe("2026-03-31T12:00:00-04:00");
+    expect(response.selectedTimestampReason).toBe("requested-fallback");
+    expect(response.members).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          modelName: "Model A",
+          temperatureC: 23.89,
+        }),
+      ]),
+    );
+    expect(response.distribution.map((bucket) => bucket.label)).toEqual([
+      "73.0 - 74.0 °F",
+      "75.0 - 76.0 °F",
+    ]);
+    expect(response.distribution[0]).toMatchObject({
+      count: 1,
+      models: ["Model B"],
+    });
+    expect(response.distribution[1]).toMatchObject({
+      count: 1,
+      models: ["Model A"],
+    });
+    expect(response.warnings).toContain(
+      "Requested timestamp was unavailable; selected the nearest available timestamp from the chart.",
+    );
+  });
+
+  test("normalizes Fahrenheit multimodel curves into canonical Celsius before summarizing", () => {
+    const dataset = parseMultiModelHighcharts(
+      JSON.stringify({
+        series: [
+          {
+            name: "IFS025",
+            type: "scatter",
+            xAxis: 0,
+            yAxis: 0,
+            data: [
+              { name: "2026-03-31 09:00", y: 68 },
+              { name: "2026-03-31 12:00", y: 75.2 },
+            ],
+          },
+        ],
+      }),
+      "America/New_York",
+      "F",
+    );
+
+    expect(dataset.models[0]?.values).toEqual([20, 24]);
   });
 
   test("filters internal inventory alignment warnings from distribution responses", () => {
@@ -615,10 +748,7 @@ describe("multimodel distribution parser", () => {
       "2026-03-31T09:00:00+08:00",
       "2026-03-31T09:10:00+08:00",
       1,
-      {
-        stale: false,
-        cacheHit: true,
-      },
+      freshMultiModelMeta,
     );
 
     expect(response.warnings).toContain("distribution bucket totals did not match modelCount.");

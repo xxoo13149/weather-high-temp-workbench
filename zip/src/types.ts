@@ -1,6 +1,14 @@
 import type {
+  DataFreshnessState,
+  DashboardMetarSnapshot,
+  DashboardTafSnapshot,
+  DashboardSourceMetadata,
   HourlyWeatherItem,
   HourlyWeatherResponse,
+  IntradaySignalsSummary,
+  KellyTemperatureUnit,
+  MetarObservation,
+  MetarRecentReport,
   KellyBucketProbability,
   KellyDistributionSummary,
   KellyFramePoint,
@@ -15,10 +23,10 @@ import type {
   KellyWeatherEvidence,
   KellyFreshness,
   KellyStreamHealth,
-  KellyTemperatureUnit,
   KellyWorkbenchResponse as DomainKellyWorkbenchResponse,
   LocationDirectoryEntry,
   LocationInfo,
+  MultiModelAnalysisAvailability,
   MultiModelDistributionBucket,
   MultiModelDistributionHighlights,
   MultiModelDistributionMember,
@@ -28,14 +36,27 @@ import type {
   MultiModelInsightPeakTimeDistribution,
   MultiModelInsightRankedModel,
   MultiModelInsightResponse,
+  MultiModelImageAvailability,
   MultiModelStatusResponse,
+  MarketReferenceSummary,
+  SystemStatusResponse,
+  TafForecastSegment,
+  TafForecastOverview,
+  TafCloudLayerDetail,
+  TafDailySummary,
+  TafPhenomenon,
   WeatherReportMetrics,
   WeatherReportResponse,
 } from "../../src/domain/weather.ts";
 
 export type {
+  DataFreshnessState,
+  DashboardMetarSnapshot,
+  DashboardTafSnapshot,
+  DashboardSourceMetadata,
   HourlyWeatherItem,
   HourlyWeatherResponse,
+  IntradaySignalsSummary,
   KellyBucketProbability,
   KellyDistributionSummary,
   KellyFramePoint,
@@ -53,6 +74,9 @@ export type {
   KellyTemperatureUnit,
   LocationDirectoryEntry,
   LocationInfo,
+  MetarObservation,
+  MetarRecentReport,
+  MultiModelAnalysisAvailability,
   MultiModelDistributionBucket,
   MultiModelDistributionHighlights,
   MultiModelDistributionMember,
@@ -62,14 +86,20 @@ export type {
   MultiModelInsightPeakTimeDistribution,
   MultiModelInsightRankedModel,
   MultiModelInsightResponse,
+  MultiModelImageAvailability,
   MultiModelStatusResponse,
+  MarketReferenceSummary,
+  SystemStatusResponse,
+  TafCloudLayerDetail,
+  TafDailySummary,
+  TafForecastSegment,
+  TafForecastOverview,
+  TafPhenomenon,
   WeatherReportMetrics,
   WeatherReportResponse,
 };
 
-export type KellyWorkbenchResponse = DomainKellyWorkbenchResponse & {
-  displayUnit?: KellyTemperatureUnit;
-};
+export type KellyWorkbenchResponse = DomainKellyWorkbenchResponse;
 
 export interface ApiErrorPayload {
   code: string;
@@ -80,23 +110,29 @@ export interface ApiErrorPayload {
 }
 
 export interface DashboardSyncInfo {
-  state: "fresh" | "stale";
-  label: "synced" | "stale";
+  state: DataFreshnessState;
+  label: "synced" | "revalidating" | "fallback_error";
   updatedAt: string;
 }
 
 export interface DashboardResponse {
   generatedAt: string;
+  displayUnit: KellyTemperatureUnit;
   sync: DashboardSyncInfo;
   locationDirectory: LocationDirectoryEntry[];
   hourly: HourlyWeatherResponse;
   report: WeatherReportResponse;
+  metar: DashboardMetarSnapshot;
+  taf: DashboardTafSnapshot;
+  sourceMetadata: DashboardSourceMetadata;
+  intradaySignals: IntradaySignalsSummary;
+  marketReference: MarketReferenceSummary;
   multimodel: MultiModelStatusResponse & {
     imageProxyUrl: string;
     displayUpdatedAt: string | null;
     sourceType: "official-relayed-image";
     parity: "exact-image-relay";
-    statusLabel: "fresh" | "stale" | "unavailable";
+    statusLabel: "ready" | "revalidating" | "fallback_error" | "unavailable";
   };
 }
 
@@ -110,6 +146,7 @@ export type DockTimezoneGroup = LocationDirectoryEntry["timezoneGroup"];
 export interface DockLocation {
   id: string;
   code: string;
+  stationCodes: string[];
   displayName: string;
   displayNameZh: string;
   shortLabel: string;
@@ -118,6 +155,7 @@ export interface DockLocation {
   timezone: string;
   timezoneGroup: DockTimezoneGroup;
   temp: number | null;
+  displayUnit: KellyTemperatureUnit;
   isFavorite: boolean;
   isActive: boolean;
   enabled: boolean;

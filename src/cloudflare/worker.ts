@@ -1,14 +1,23 @@
-import { DEFAULT_LOCATION, LOCATION_DIRECTORY, LOCATION_REGISTRY } from "../config.js";
+import { DEFAULT_LOCATION, LOCATION_REGISTRY } from "../config.js";
 import { AppError, isAppError } from "../domain/errors.js";
 import type {
+  DashboardMetarSnapshot,
+  DashboardTafSnapshot,
   HourlyMode,
+  KellyCircuitState,
   KellyRequestOptions,
   KellyRiskMode,
   KellyStreamMessage,
-  LocationDirectoryEntry,
   LocationInfo,
 } from "../domain/weather.js";
-import { KELLY_BRIDGE_SHARED_SECRET_HEADER } from "../kelly/bridge-contract.js";
+import { normalizeDashboardMetarSnapshot } from "../domain/weather.js";
+import {
+  buildDashboardEnhancements,
+  buildLocationDirectory,
+  buildMetricsText,
+  buildSystemStatusResponse,
+  getLocationSourceContract,
+} from "../operational-metadata.js";
 import { MeteoblueWeatherService } from "../providers/meteoblue/service.js";
 import { CloudflareFavoritesStore, InMemoryFavoritesStore } from "./favorites-store.js";
 
@@ -22,9 +31,8 @@ type WorkerEnv = {
     get(key: string): Promise<string | null>;
     put(key: string, value: string): Promise<void>;
   };
-  KELLY_BRIDGE_BASE_URL?: string;
-  KELLY_BRIDGE_SHARED_SECRET?: string;
-  KELLY_BRIDGE_LOCAL_FALLBACK?: string;
+  KELLY_SERVER_BASE_URL?: string;
+  KELLY_STREAM_PROXY_MODE?: string;
 };
 
 type WorkerContext = {
@@ -41,30 +49,49 @@ type CloudflareWebSocket = WebSocket & {
   close(code?: number, reason?: string): void;
 };
 
-const KELLY_BRIDGE_TIMEOUT_MS = 12_000;
-const KELLY_BRIDGE_COOLDOWN_MS = 30_000;
+type CloudflareResponseWithWebSocket = Response & {
+  webSocket?: CloudflareWebSocket;
+};
+
+type KellyStreamProxyMode = "local-only" | "canary" | "remote-first";
+
+type KellyProxyCircuitTracker = {
+  failureTimestamps: number[];
+  consecutiveFailures: number;
+  openUntil: number | null;
+  halfOpenProbeInFlight: boolean;
+  lastOriginSuccessAt: string | null;
+  lastOriginFailureAt: string | null;
+  lastOriginFailureCode: string | null;
+  localFallbackActive: boolean;
+};
 
 let runtimeBuildId: string | null = null;
 let runtimeStartedAt: string | null = null;
 
-type KellyBridgeProxyState = {
-  consecutiveFailures: number;
-  cooldownUntil: number;
-  lastFailureAt: string | null;
-  lastFailureCode: string | null;
-  lastFailureMessage: string | null;
-  lastSuccessAt: string | null;
-};
-
 let servicePromise: Promise<MeteoblueWeatherService> | null = null;
-let kellyBridgeProxyState: KellyBridgeProxyState = {
+
+const KELLY_PROXY_FAILURE_THRESHOLD = 3;
+const KELLY_PROXY_FAILURE_WINDOW_MS = 60_000;
+const KELLY_PROXY_OPEN_DURATION_MS = 5 * 60_000;
+const KELLY_PROXY_GET_TIMEOUT_MS = 14_000;
+const DASHBOARD_PROXY_GET_TIMEOUT_MS = 14_000;
+const KELLY_PROXY_STREAM_TIMEOUT_MS = 6_000;
+
+const createKellyProxyCircuitTracker = (): KellyProxyCircuitTracker => ({
+  failureTimestamps: [],
   consecutiveFailures: 0,
-  cooldownUntil: 0,
-  lastFailureAt: null,
-  lastFailureCode: null,
-  lastFailureMessage: null,
-  lastSuccessAt: null,
-};
+  openUntil: null,
+  halfOpenProbeInFlight: false,
+  lastOriginSuccessAt: null,
+  lastOriginFailureAt: null,
+  lastOriginFailureCode: null,
+  localFallbackActive: false,
+});
+
+const kellyGetProxyCircuit = createKellyProxyCircuitTracker();
+const kellyStreamProxyCircuit = createKellyProxyCircuitTracker();
+const dashboardGetProxyCircuit = createKellyProxyCircuitTracker();
 
 const ensureRuntimeMetadata = () => {
   const rawBuildId =
@@ -100,23 +127,6 @@ const getService = async (env: WorkerEnv) => {
 
   return await servicePromise;
 };
-
-const buildLocationDirectory = (): LocationDirectoryEntry[] =>
-  LOCATION_DIRECTORY.map((location) => ({
-    id: location.id,
-    code: location.code,
-    displayName: location.displayName,
-    displayNameZh: location.displayNameZh,
-    shortLabel: location.shortLabel,
-    cityName: location.cityName,
-    countryName: location.countryName,
-    timezone: location.timezone,
-    timezoneGroup: location.timezoneGroup,
-    enabled: location.enabled,
-    sortOrder: location.sortOrder,
-    weekPageUrl: location.weekPageUrl,
-    multimodelPageUrl: location.multimodelPageUrl,
-  }));
 
 const parseMode = (raw: string | null): HourlyMode => {
   if (raw === null || raw === "" || raw === "1h") {
@@ -237,6 +247,22 @@ const parseKellyMinEdge = (raw: string | null): number | undefined => {
   return value;
 };
 
+const parseForceRefresh = (raw: string | null): boolean | undefined => {
+  if (raw === null || raw === "") {
+    return undefined;
+  }
+
+  if (raw === "true" || raw === "1") {
+    return true;
+  }
+
+  if (raw === "false" || raw === "0") {
+    return false;
+  }
+
+  throw new AppError(400, "BAD_REQUEST", "Query parameter 'forceRefresh' must be boolean.");
+};
+
 const parseQueryLocationId = (raw: string | null): LocationInfo["id"] => {
   if (raw === null || raw === "") {
     return DEFAULT_LOCATION;
@@ -270,16 +296,127 @@ const parseKellyOptions = (url: URL): KellyRequestOptions => ({
   minEdge: parseKellyMinEdge(url.searchParams.get("minEdge")),
   actualTemperatureC: parseActualTemperatureC(url.searchParams.get("actualTemperatureC")),
   selectedHourTimestamp: parseTimestamp(url.searchParams.get("selectedHour")),
+  forceRefresh: parseForceRefresh(url.searchParams.get("forceRefresh")),
 });
 
-const jsonResponse = (payload: unknown, status = 200) =>
+const DEFAULT_CACHE_CONTROL = "no-store, max-age=0";
+const EDGE_CACHE_TTL_SECONDS = {
+  hourly: 45,
+  report: 45,
+  dashboard: 30,
+  multimodelStatus: 45,
+  multimodelInsight: 90,
+  multimodelDistribution: 90,
+} as const;
+const EMPTY_DASHBOARD_METAR_SNAPSHOT: DashboardMetarSnapshot = normalizeDashboardMetarSnapshot();
+const EMPTY_DASHBOARD_TAF_SNAPSHOT: DashboardTafSnapshot = {
+  forecast: null,
+  forecasts: [],
+};
+
+const buildEdgeCacheControl = (ttlSeconds: number) =>
+  `public, max-age=0, s-maxage=${ttlSeconds}, stale-while-revalidate=${ttlSeconds}`;
+
+const jsonResponse = (payload: unknown, status = 200, headers?: HeadersInit) =>
   new Response(JSON.stringify(payload), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store, max-age=0",
+      "cache-control": DEFAULT_CACHE_CONTROL,
+      ...(headers ?? {}),
     },
   });
+
+const withEdgeJsonCache = async <T>(
+  request: Request,
+  ctx: WorkerContext,
+  ttlSeconds: number,
+  loader: () => Promise<T>,
+  options?: {
+    shouldCache?: (payload: T) => boolean;
+  },
+): Promise<Response> => {
+  const edgeCache =
+    typeof caches === "undefined" ? null : ((caches as CacheStorage & { default?: Cache }).default ?? null);
+  if (!edgeCache) {
+    return jsonResponse(await loader());
+  }
+
+  const cacheKey = new Request(request.url, {
+    method: "GET",
+  });
+  const cachedResponse = await edgeCache.match(cacheKey);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+
+  const cacheControl = buildEdgeCacheControl(ttlSeconds);
+  const payload = await loader();
+  if (options?.shouldCache && !options.shouldCache(payload)) {
+    return jsonResponse(payload);
+  }
+
+  const response = jsonResponse(payload, 200, {
+    "cache-control": cacheControl,
+    "cdn-cache-control": cacheControl,
+  });
+  ctx.waitUntil(edgeCache.put(cacheKey, response.clone()));
+  return response;
+};
+
+const hasFreshFreshness = (payload: unknown) =>
+  typeof payload !== "object" ||
+  payload === null ||
+  !("freshness" in payload) ||
+  (payload as { freshness?: unknown }).freshness === "fresh";
+
+const hasFreshDashboardSync = (payload: unknown) =>
+  typeof payload === "object" &&
+  payload !== null &&
+  "sync" in payload &&
+  typeof (payload as { sync?: { freshness?: unknown } }).sync?.freshness === "string" &&
+  (payload as { sync: { freshness: string } }).sync.freshness === "fresh";
+
+const resolvePayloadFreshness = (
+  payload: unknown,
+  staleFallback: boolean,
+): "fresh" | "revalidating" | "fallback_error" => {
+  if (typeof payload === "object" && payload !== null && typeof (payload as { freshness?: unknown }).freshness === "string") {
+    return (payload as { freshness: "fresh" | "revalidating" | "fallback_error" }).freshness;
+  }
+
+  return staleFallback ? "fallback_error" : "fresh";
+};
+
+const loadDashboardMetarSnapshot = async (
+  service: Awaited<ReturnType<typeof getService>>,
+  locationId: LocationInfo["id"],
+): Promise<DashboardMetarSnapshot> => {
+  if (!service.getMetarSnapshot) {
+    return EMPTY_DASHBOARD_METAR_SNAPSHOT;
+  }
+
+  try {
+    return normalizeDashboardMetarSnapshot(await service.getMetarSnapshot(locationId));
+  } catch {
+    return EMPTY_DASHBOARD_METAR_SNAPSHOT;
+  }
+};
+
+const loadDashboardTafSnapshot = async (
+  service: Awaited<ReturnType<typeof getService>>,
+  locationId: LocationInfo["id"],
+): Promise<DashboardTafSnapshot> => {
+  if (!service.getTafSnapshot) {
+    return EMPTY_DASHBOARD_TAF_SNAPSHOT;
+  }
+
+  try {
+    return await service.getTafSnapshot(locationId);
+  } catch {
+    return EMPTY_DASHBOARD_TAF_SNAPSHOT;
+  }
+};
 
 const handleError = (error: unknown) => {
   if (isAppError(error)) {
@@ -290,205 +427,6 @@ const handleError = (error: unknown) => {
   return jsonResponse(fallback.toPayload(), 500);
 };
 
-const normalizeBaseUrl = (value: string) => value.replace(/\/+$/, "");
-
-const resolveKellyBridgeBaseUrl = (env: WorkerEnv): string | null => {
-  const raw = env.KELLY_BRIDGE_BASE_URL?.trim();
-  return raw ? normalizeBaseUrl(raw) : null;
-};
-
-const recordKellyBridgeSuccess = (occurredAt: string) => {
-  kellyBridgeProxyState = {
-    ...kellyBridgeProxyState,
-    consecutiveFailures: 0,
-    cooldownUntil: 0,
-    lastSuccessAt: occurredAt,
-  };
-};
-
-const recordKellyBridgeFailure = (code: string, message: string, occurredAt: string) => {
-  kellyBridgeProxyState = {
-    ...kellyBridgeProxyState,
-    consecutiveFailures: kellyBridgeProxyState.consecutiveFailures + 1,
-    cooldownUntil: Date.now() + KELLY_BRIDGE_COOLDOWN_MS,
-    lastFailureAt: occurredAt,
-    lastFailureCode: code,
-    lastFailureMessage: message,
-  };
-};
-
-const resolveKellyBridgeCooldownError = () => {
-  const remainingMs = Math.max(0, kellyBridgeProxyState.cooldownUntil - Date.now());
-  const remainingSeconds = Math.max(1, Math.ceil(remainingMs / 1000));
-  return new AppError(
-    503,
-    "KELLY_BRIDGE_COOLDOWN",
-    `Kelly bridge 正在冷却恢复，约 ${remainingSeconds}s 后再试。当前继续保留上一份快照。`,
-    {
-      retryable: true,
-      lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
-    },
-  );
-};
-
-const readBridgeResponseMessage = async (response: Response): Promise<string | null> => {
-  try {
-    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-    if (contentType.includes("application/json")) {
-      const payload = (await response.clone().json()) as { message?: unknown } | null;
-      return typeof payload?.message === "string" ? payload.message : null;
-    }
-
-    const text = (await response.clone().text()).replace(/\s+/g, " ").trim();
-    return text ? text.slice(0, 240) : null;
-  } catch {
-    return null;
-  }
-};
-
-const isAbortError = (error: unknown) =>
-  error instanceof DOMException
-    ? error.name === "AbortError"
-    : error instanceof Error
-      ? error.name === "AbortError"
-      : false;
-
-const buildKellyBridgeRequest = (request: Request, env: WorkerEnv): Request | null => {
-  const bridgeBaseUrl = resolveKellyBridgeBaseUrl(env);
-  if (!bridgeBaseUrl) {
-    return null;
-  }
-
-  const incomingUrl = new URL(request.url);
-  const headers = new Headers(request.headers);
-  headers.delete("host");
-  headers.delete("cf-connecting-ip");
-  headers.delete("cf-ipcountry");
-  headers.delete("cf-ray");
-  headers.delete("x-forwarded-host");
-  headers.delete("x-forwarded-proto");
-  headers.set("x-forwarded-host", incomingUrl.host);
-  headers.set("x-forwarded-proto", incomingUrl.protocol.replace(":", ""));
-  const sharedSecret = env.KELLY_BRIDGE_SHARED_SECRET?.trim();
-  if (sharedSecret) {
-    headers.set(KELLY_BRIDGE_SHARED_SECRET_HEADER, sharedSecret);
-  }
-
-  return new Request(`${bridgeBaseUrl}${incomingUrl.pathname}${incomingUrl.search}`, {
-    method: request.method,
-    headers,
-    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
-    redirect: "manual",
-  });
-};
-
-const proxyKellyRequest = async (
-  request: Request,
-  env: WorkerEnv,
-  options?: {
-    expectWebSocket?: boolean;
-  },
-): Promise<Response | null> => {
-  const proxyRequest = buildKellyBridgeRequest(request, env);
-  if (!proxyRequest) {
-    return null;
-  }
-
-  if (kellyBridgeProxyState.cooldownUntil > Date.now()) {
-    throw resolveKellyBridgeCooldownError();
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), KELLY_BRIDGE_TIMEOUT_MS);
-
-  try {
-    const timedRequest = new Request(proxyRequest, {
-      signal: controller.signal,
-    });
-    const response = await fetch(timedRequest);
-    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-    const occurredAt = new Date().toISOString();
-    const expectsWebSocket = options?.expectWebSocket === true;
-    const isWebSocketUpgrade = response.status === 101;
-    const isJson = contentType.includes("application/json");
-    const isHtml = contentType.includes("text/html");
-
-    if (expectsWebSocket) {
-      if (isWebSocketUpgrade) {
-        recordKellyBridgeSuccess(occurredAt);
-        return response;
-      }
-
-      if (response.status >= 500 || isHtml) {
-        const detail = await readBridgeResponseMessage(response);
-        const message = detail
-          ? `Kelly bridge WebSocket 上游异常：${detail}`
-          : "Kelly bridge WebSocket 上游当前不可用。";
-        recordKellyBridgeFailure("KELLY_BRIDGE_UNAVAILABLE", message, occurredAt);
-        throw new AppError(502, "KELLY_BRIDGE_UNAVAILABLE", message, {
-          retryable: true,
-          lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
-        });
-      }
-
-      recordKellyBridgeSuccess(occurredAt);
-      return response;
-    }
-
-    if (response.ok && isJson) {
-      recordKellyBridgeSuccess(occurredAt);
-      return response;
-    }
-
-    if (!response.ok && response.status < 500 && isJson) {
-      recordKellyBridgeSuccess(occurredAt);
-      return response;
-    }
-
-    const detail = await readBridgeResponseMessage(response);
-    const code = response.status >= 500 || isHtml ? "KELLY_BRIDGE_UNAVAILABLE" : "KELLY_BRIDGE_BAD_RESPONSE";
-    const message =
-      code === "KELLY_BRIDGE_BAD_RESPONSE"
-        ? `Kelly bridge 返回了不可识别的响应（status ${response.status}，content-type ${contentType || "unknown"}）。`
-        : detail
-          ? `Kelly bridge 当前不可用：${detail}`
-          : `Kelly bridge 当前不可用（status ${response.status}）。`;
-    recordKellyBridgeFailure(code, message, occurredAt);
-    throw new AppError(response.status >= 500 ? 502 : 502, code, message, {
-      retryable: true,
-      lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
-    });
-  } catch (error) {
-    if (error instanceof AppError) {
-      throw error;
-    }
-
-    const occurredAt = new Date().toISOString();
-    if (isAbortError(error)) {
-      const message = `Kelly bridge 在 ${Math.round(KELLY_BRIDGE_TIMEOUT_MS / 1000)}s 内未完成响应。`;
-      recordKellyBridgeFailure("KELLY_BRIDGE_TIMEOUT", message, occurredAt);
-      throw new AppError(504, "KELLY_BRIDGE_TIMEOUT", message, {
-        retryable: true,
-        lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
-      });
-    }
-
-    const message = `Kelly bridge 请求失败：${error instanceof Error ? error.message : String(error)}`;
-    recordKellyBridgeFailure("KELLY_BRIDGE_UNAVAILABLE", message, occurredAt);
-    throw new AppError(
-      502,
-      "KELLY_BRIDGE_UNAVAILABLE",
-      message,
-      {
-        retryable: true,
-        lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
-      },
-    );
-  } finally {
-    clearTimeout(timeoutId);
-  }
-};
-
 const sendSocketMessage = (socket: CloudflareWebSocket, message: KellyStreamMessage) => {
   try {
     socket.send(JSON.stringify(message));
@@ -497,33 +435,760 @@ const sendSocketMessage = (socket: CloudflareWebSocket, message: KellyStreamMess
   }
 };
 
-const isKellyBridgeLocalFallbackEnabled = (env: WorkerEnv) => env.KELLY_BRIDGE_LOCAL_FALLBACK === "true";
+const createWebSocketUpgradeResponse = (client: CloudflareWebSocket): Response => {
+  try {
+    return new Response(null, {
+      status: 101,
+      ...( { webSocket: client } as ResponseInit ),
+    });
+  } catch {
+    const response = new Response(null, {
+      status: 200,
+      headers: {
+        "x-worker-websocket-upgrade": "101",
+      },
+    });
+    Object.defineProperty(response, "webSocket", {
+      configurable: true,
+      value: client,
+    });
+    return response;
+  }
+};
 
-const shouldFallbackToLocalKelly = (error: unknown, env: WorkerEnv) =>
-  isKellyBridgeLocalFallbackEnabled(env) &&
-  isAppError(error) &&
-  (
-    error.code === "KELLY_BRIDGE_TIMEOUT" ||
-    error.code === "KELLY_BRIDGE_UNAVAILABLE" ||
-    error.code === "KELLY_BRIDGE_BAD_RESPONSE" ||
-    error.code === "KELLY_BRIDGE_COOLDOWN"
+const resolveKellyServerBaseUrl = (env: WorkerEnv): string | null => {
+  const raw = env.KELLY_SERVER_BASE_URL?.trim();
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(raw);
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    throw new AppError(500, "INVALID_KELLY_SERVER_BASE_URL", "Worker env 'KELLY_SERVER_BASE_URL' must be a valid absolute URL.");
+  }
+};
+
+const resolveKellyStreamProxyMode = (env: WorkerEnv): KellyStreamProxyMode => {
+  const raw = env.KELLY_STREAM_PROXY_MODE?.trim().toLowerCase();
+  if (!raw) {
+    return "canary";
+  }
+
+  if (raw === "local-only" || raw === "canary" || raw === "remote-first") {
+    return raw;
+  }
+
+  throw new AppError(
+    500,
+    "INVALID_KELLY_STREAM_PROXY_MODE",
+    "Worker env 'KELLY_STREAM_PROXY_MODE' must be local-only, canary, or remote-first.",
   );
+};
+
+const buildOriginProxyRequest = (request: Request, env: WorkerEnv): Request | null => {
+  const baseUrl = resolveKellyServerBaseUrl(env);
+  if (!baseUrl) {
+    return null;
+  }
+
+  const incomingUrl = new URL(request.url);
+  const upstreamUrl = `${baseUrl}${incomingUrl.pathname}${incomingUrl.search}`;
+  const headers = new Headers(request.headers);
+  headers.set("x-weather-kelly-proxy", "cloudflare-worker");
+  if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+    headers.set("Connection", "Upgrade");
+    headers.set("Upgrade", "websocket");
+  }
+  return new Request(upstreamUrl, {
+    method: request.method,
+    headers,
+  });
+};
+
+const pruneKellyProxyFailures = (circuit: KellyProxyCircuitTracker, now = Date.now()) => {
+  circuit.failureTimestamps = circuit.failureTimestamps.filter(
+    (timestamp) => now - timestamp <= KELLY_PROXY_FAILURE_WINDOW_MS,
+  );
+};
+
+const resolveKellyProxyCircuitState = (circuit: KellyProxyCircuitTracker): KellyCircuitState => {
+  if (circuit.openUntil !== null) {
+    return Date.now() < circuit.openUntil ? "open" : "half-open";
+  }
+
+  return circuit.halfOpenProbeInFlight ? "half-open" : "closed";
+};
+
+const recordKellyOriginSuccess = (circuit: KellyProxyCircuitTracker) => {
+  circuit.failureTimestamps = [];
+  circuit.consecutiveFailures = 0;
+  circuit.openUntil = null;
+  circuit.halfOpenProbeInFlight = false;
+  circuit.lastOriginSuccessAt = new Date().toISOString();
+  circuit.localFallbackActive = false;
+};
+
+const recordKellyOriginFailure = (circuit: KellyProxyCircuitTracker, reasonCode: string) => {
+  const now = Date.now();
+  pruneKellyProxyFailures(circuit, now);
+  circuit.failureTimestamps.push(now);
+  circuit.consecutiveFailures += 1;
+  circuit.lastOriginFailureAt = new Date(now).toISOString();
+  circuit.lastOriginFailureCode = reasonCode;
+  circuit.localFallbackActive = true;
+  circuit.halfOpenProbeInFlight = false;
+
+  if (circuit.failureTimestamps.length >= KELLY_PROXY_FAILURE_THRESHOLD) {
+    circuit.openUntil = now + KELLY_PROXY_OPEN_DURATION_MS;
+  }
+};
+
+const shouldBypassKellyOrigin = (circuit: KellyProxyCircuitTracker) => {
+  if (circuit.openUntil === null) {
+    return false;
+  }
+
+  if (Date.now() < circuit.openUntil) {
+    return true;
+  }
+
+  if (circuit.halfOpenProbeInFlight) {
+    return true;
+  }
+
+  circuit.halfOpenProbeInFlight = true;
+  return false;
+};
+
+const isKellyOriginJsonResponse = (response: Response) =>
+  (response.headers.get("content-type") ?? "").toLowerCase().includes("application/json");
+
+const readKellyOriginJsonError = async (response: Response): Promise<{ code?: string; message?: string } | null> => {
+  try {
+    const payload = (await response.clone().json()) as unknown;
+    if (typeof payload !== "object" || payload === null) {
+      return null;
+    }
+
+    const record = payload as Record<string, unknown>;
+    return {
+      code: typeof record.code === "string" ? record.code : undefined,
+      message: typeof record.message === "string" ? record.message : undefined,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const isKellyOriginLocationVersionSkew = async (request: Request, response: Response) => {
+  if (response.status !== 400 || !isKellyOriginJsonResponse(response)) {
+    return false;
+  }
+
+  const rawLocationId = new URL(request.url).searchParams.get("locationId")?.trim();
+  if (!rawLocationId || !(rawLocationId in LOCATION_REGISTRY)) {
+    return false;
+  }
+
+  const payload = await readKellyOriginJsonError(response);
+  return (
+    payload?.code === "BAD_REQUEST" &&
+    typeof payload.message === "string" &&
+    payload.message.includes("Query parameter 'locationId' is not supported")
+  );
+};
+
+const extractKellyOriginMetarStationId = (payload: unknown) => {
+  if (typeof payload !== "object" || payload === null) {
+    return null;
+  }
+
+  const metarObservation = (payload as { weatherEvidence?: { metarObservation?: unknown } }).weatherEvidence?.metarObservation;
+  if (typeof metarObservation !== "object" || metarObservation === null) {
+    return null;
+  }
+
+  const stationId = (metarObservation as { stationId?: unknown }).stationId;
+  return typeof stationId === "string" && stationId.trim() !== "" ? stationId.trim().toUpperCase() : null;
+};
+
+const isKellyOriginMetarContractSkew = async (request: Request, response: Response) => {
+  if (!response.ok || !isKellyOriginJsonResponse(response)) {
+    return false;
+  }
+
+  const rawLocationId = new URL(request.url).searchParams.get("locationId")?.trim();
+  if (!rawLocationId || !(rawLocationId in LOCATION_REGISTRY)) {
+    return false;
+  }
+
+  const locationId = rawLocationId as LocationInfo["id"];
+  const contract = getLocationSourceContract(locationId);
+  if (
+    contract.currentSources.primaryObservation.key !== "aviationweather-metar" ||
+    !contract.currentSources.primaryObservation.stationCode
+  ) {
+    return false;
+  }
+
+  const payload = await response.clone().json().catch(() => null);
+  const stationId = extractKellyOriginMetarStationId(payload);
+  if (!stationId) {
+    return false;
+  }
+
+  return stationId !== contract.currentSources.primaryObservation.stationCode.trim().toUpperCase();
+};
+
+const extractDashboardOriginMetarStationId = (payload: unknown) => {
+  if (typeof payload !== "object" || payload === null) {
+    return null;
+  }
+
+  const metarObservation = (payload as { metar?: { observation?: unknown } }).metar?.observation;
+  if (typeof metarObservation !== "object" || metarObservation === null) {
+    return null;
+  }
+
+  const stationId = (metarObservation as { stationId?: unknown }).stationId;
+  if (typeof stationId === "string" && stationId.trim() !== "") {
+    return stationId.trim().toUpperCase();
+  }
+
+  return null;
+};
+
+const isDashboardOriginMetarContractSkew = async (request: Request, response: Response) => {
+  if (!response.ok || !isKellyOriginJsonResponse(response)) {
+    return false;
+  }
+
+  const rawLocationId = new URL(request.url).searchParams.get("locationId")?.trim();
+  if (!rawLocationId || !(rawLocationId in LOCATION_REGISTRY)) {
+    return false;
+  }
+
+  const locationId = rawLocationId as LocationInfo["id"];
+  const contract = getLocationSourceContract(locationId);
+  if (
+    contract.currentSources.primaryObservation.key !== "aviationweather-metar" ||
+    !contract.currentSources.primaryObservation.stationCode
+  ) {
+    return false;
+  }
+
+  const payload = await response.clone().json().catch(() => null);
+  const stationId = extractDashboardOriginMetarStationId(payload);
+  if (!stationId) {
+    return false;
+  }
+
+  return stationId !== contract.currentSources.primaryObservation.stationCode.trim().toUpperCase();
+};
+
+const isObjectRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const isDashboardOriginAviationContractSkew = async (_request: Request, response: Response) => {
+  if (!response.ok || !isKellyOriginJsonResponse(response)) {
+    return false;
+  }
+
+  const payload = await response.clone().json().catch(() => null);
+  if (!isObjectRecord(payload)) {
+    return false;
+  }
+
+  const metar = isObjectRecord(payload.metar) ? payload.metar : null;
+  const taf = isObjectRecord(payload.taf) ? payload.taf : null;
+  const tafForecast = taf && isObjectRecord(taf.forecast) ? taf.forecast : null;
+  const tafActiveForecast =
+    tafForecast && isObjectRecord(tafForecast.activeForecast) ? tafForecast.activeForecast : null;
+
+  const hasMetarObservation = metar ? isObjectRecord(metar.observation) : false;
+  const hasRecentMetarReports =
+    metar && (Array.isArray(metar.recentReports) || Array.isArray(metar.recentObservations));
+  const hasTafRaw = typeof tafForecast?.rawTaf === "string" && tafForecast.rawTaf.trim() !== "";
+  const hasTafDailySummary = isObjectRecord(tafForecast?.dailySummary);
+  const hasActiveCloudLayers = Array.isArray(tafActiveForecast?.cloudLayers);
+
+  return Boolean(
+    (hasMetarObservation && !hasRecentMetarReports) ||
+      (hasTafRaw && (!hasTafDailySummary || !hasActiveCloudLayers)),
+  );
+};
+
+type OriginProxyAttemptResult =
+  | { kind: "unconfigured" }
+  | { kind: "passthrough"; response: Response }
+  | { kind: "fallback"; reasonCode: string; circuitState: KellyCircuitState };
+
+const logOriginProxyResult = (
+  request: Request,
+  details: {
+    requestKind: "dashboard" | "get" | "stream";
+    originMode: "remote" | "local-fallback";
+    reasonCode: string;
+    circuitState: KellyCircuitState;
+  },
+) => {
+  const url = new URL(request.url);
+  const log = details.originMode === "remote" ? console.info : console.warn;
+  log("[kelly-proxy]", {
+    requestKind: details.requestKind,
+    originMode: details.originMode,
+    reasonCode: details.reasonCode,
+    circuitState: details.circuitState,
+    locationId: url.searchParams.get("locationId"),
+    targetDate: url.searchParams.get("targetDate"),
+  });
+};
+
+const fetchKellyOriginGet = async (
+  request: Request,
+  env: WorkerEnv,
+  timeoutMs: number,
+): Promise<OriginProxyAttemptResult> => {
+  const proxyRequest = buildOriginProxyRequest(request, env);
+  if (!proxyRequest) {
+    return { kind: "unconfigured" };
+  }
+
+  if (shouldBypassKellyOrigin(kellyGetProxyCircuit)) {
+    kellyGetProxyCircuit.localFallbackActive = true;
+    const circuitState = resolveKellyProxyCircuitState(kellyGetProxyCircuit);
+    logOriginProxyResult(request, {
+      requestKind: "get",
+      originMode: "local-fallback",
+      reasonCode: "origin_circuit_open",
+      circuitState,
+    });
+    return {
+      kind: "fallback",
+      reasonCode: "origin_circuit_open",
+      circuitState,
+    };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(
+      new Request(proxyRequest, {
+        signal: controller.signal,
+      }),
+    );
+
+    if (await isKellyOriginMetarContractSkew(request, response)) {
+      const reasonCode = "origin_metar_contract_skew";
+      recordKellyOriginFailure(kellyGetProxyCircuit, reasonCode);
+      logOriginProxyResult(request, {
+        requestKind: "get",
+        originMode: "local-fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+      });
+      return {
+        kind: "fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+      };
+    }
+
+    if (response.ok) {
+      recordKellyOriginSuccess(kellyGetProxyCircuit);
+      logOriginProxyResult(request, {
+        requestKind: "get",
+        originMode: "remote",
+        reasonCode: "origin_ok",
+        circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+      });
+      return {
+        kind: "passthrough",
+        response,
+      };
+    }
+
+    if (await isKellyOriginLocationVersionSkew(request, response)) {
+      const reasonCode = "origin_location_version_skew";
+      recordKellyOriginFailure(kellyGetProxyCircuit, reasonCode);
+      logOriginProxyResult(request, {
+        requestKind: "get",
+        originMode: "local-fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+      });
+      return {
+        kind: "fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+      };
+    }
+
+    if (response.status >= 400 && response.status < 500 && isKellyOriginJsonResponse(response)) {
+      recordKellyOriginSuccess(kellyGetProxyCircuit);
+      logOriginProxyResult(request, {
+        requestKind: "get",
+        originMode: "remote",
+        reasonCode: `origin_status_${response.status}`,
+        circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+      });
+      return {
+        kind: "passthrough",
+        response,
+      };
+    }
+
+    const reasonCode = `origin_status_${response.status}`;
+    recordKellyOriginFailure(kellyGetProxyCircuit, reasonCode);
+    logOriginProxyResult(request, {
+      requestKind: "get",
+      originMode: "local-fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+    });
+    return {
+      kind: "fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+    };
+  } catch (error) {
+    const reasonCode = error instanceof Error && error.name === "AbortError" ? "origin_timeout" : "origin_fetch_failed";
+    recordKellyOriginFailure(kellyGetProxyCircuit, reasonCode);
+    logOriginProxyResult(request, {
+      requestKind: "get",
+      originMode: "local-fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+    });
+    return {
+      kind: "fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+const fetchDashboardOriginGet = async (
+  request: Request,
+  env: WorkerEnv,
+  timeoutMs: number,
+): Promise<OriginProxyAttemptResult> => {
+  const proxyRequest = buildOriginProxyRequest(request, env);
+  if (!proxyRequest) {
+    return { kind: "unconfigured" };
+  }
+
+  if (shouldBypassKellyOrigin(dashboardGetProxyCircuit)) {
+    dashboardGetProxyCircuit.localFallbackActive = true;
+    const circuitState = resolveKellyProxyCircuitState(dashboardGetProxyCircuit);
+    logOriginProxyResult(request, {
+      requestKind: "dashboard",
+      originMode: "local-fallback",
+      reasonCode: "origin_circuit_open",
+      circuitState,
+    });
+    return {
+      kind: "fallback",
+      reasonCode: "origin_circuit_open",
+      circuitState,
+    };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(
+      new Request(proxyRequest, {
+        signal: controller.signal,
+      }),
+    );
+
+    if (await isKellyOriginLocationVersionSkew(request, response)) {
+      const reasonCode = "origin_location_version_skew";
+      recordKellyOriginFailure(dashboardGetProxyCircuit, reasonCode);
+      logOriginProxyResult(request, {
+        requestKind: "dashboard",
+        originMode: "local-fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+      });
+      return {
+        kind: "fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+      };
+    }
+
+    if (await isDashboardOriginMetarContractSkew(request, response)) {
+      const reasonCode = "origin_metar_contract_skew";
+      recordKellyOriginFailure(dashboardGetProxyCircuit, reasonCode);
+      logOriginProxyResult(request, {
+        requestKind: "dashboard",
+        originMode: "local-fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+      });
+      return {
+        kind: "fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+      };
+    }
+
+    if (await isDashboardOriginAviationContractSkew(request, response)) {
+      const reasonCode = "origin_aviation_contract_skew";
+      recordKellyOriginFailure(dashboardGetProxyCircuit, reasonCode);
+      logOriginProxyResult(request, {
+        requestKind: "dashboard",
+        originMode: "local-fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+      });
+      return {
+        kind: "fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+      };
+    }
+
+    if (response.ok) {
+      recordKellyOriginSuccess(dashboardGetProxyCircuit);
+      logOriginProxyResult(request, {
+        requestKind: "dashboard",
+        originMode: "remote",
+        reasonCode: "origin_ok",
+        circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+      });
+      return {
+        kind: "passthrough",
+        response,
+      };
+    }
+
+    if (response.status >= 400 && response.status < 500 && isKellyOriginJsonResponse(response)) {
+      recordKellyOriginSuccess(dashboardGetProxyCircuit);
+      logOriginProxyResult(request, {
+        requestKind: "dashboard",
+        originMode: "remote",
+        reasonCode: `origin_status_${response.status}`,
+        circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+      });
+      return {
+        kind: "passthrough",
+        response,
+      };
+    }
+
+    const reasonCode = `origin_status_${response.status}`;
+    recordKellyOriginFailure(dashboardGetProxyCircuit, reasonCode);
+    logOriginProxyResult(request, {
+      requestKind: "dashboard",
+      originMode: "local-fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+    });
+    return {
+      kind: "fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+    };
+  } catch (error) {
+    const reasonCode = error instanceof Error && error.name === "AbortError" ? "origin_timeout" : "origin_fetch_failed";
+    recordKellyOriginFailure(dashboardGetProxyCircuit, reasonCode);
+    logOriginProxyResult(request, {
+      requestKind: "dashboard",
+      originMode: "local-fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+    });
+    return {
+      kind: "fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+const isKellyOriginWebSocketUpgrade = (response: Response): response is CloudflareResponseWithWebSocket =>
+  response.status === 101 && Boolean((response as CloudflareResponseWithWebSocket).webSocket);
+
+const shouldAttemptKellyOriginStream = (request: Request, env: WorkerEnv) => {
+  const mode = resolveKellyStreamProxyMode(env);
+  if (mode === "local-only") {
+    return false;
+  }
+
+  if (mode === "remote-first") {
+    return true;
+  }
+
+  return request.headers.get("x-kelly-origin-canary") === "1";
+};
+
+const fetchKellyOriginStream = async (
+  request: Request,
+  env: WorkerEnv,
+): Promise<OriginProxyAttemptResult> => {
+  const proxyRequest = buildOriginProxyRequest(request, env);
+  if (!proxyRequest) {
+    return { kind: "unconfigured" };
+  }
+
+  if (shouldBypassKellyOrigin(kellyStreamProxyCircuit)) {
+    kellyStreamProxyCircuit.localFallbackActive = true;
+    const circuitState = resolveKellyProxyCircuitState(kellyStreamProxyCircuit);
+    logOriginProxyResult(request, {
+      requestKind: "stream",
+      originMode: "local-fallback",
+      reasonCode: "origin_circuit_open",
+      circuitState,
+    });
+    return {
+      kind: "fallback",
+      reasonCode: "origin_circuit_open",
+      circuitState,
+    };
+  }
+
+  const controller = new AbortController();
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const fetchTask = fetch(
+    new Request(proxyRequest, {
+      signal: controller.signal,
+    }),
+  )
+    .then((response) => ({ kind: "response" as const, response }))
+    .catch((error) => ({ kind: "error" as const, error }));
+  const timeoutTask = new Promise<{ kind: "timeout" }>((resolve) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      resolve({ kind: "timeout" });
+    }, KELLY_PROXY_STREAM_TIMEOUT_MS);
+  });
+
+  try {
+    const settled = await Promise.race([fetchTask, timeoutTask]);
+    if (settled.kind === "timeout") {
+      const reasonCode = "origin_timeout";
+      recordKellyOriginFailure(kellyStreamProxyCircuit, reasonCode);
+      logOriginProxyResult(request, {
+        requestKind: "stream",
+        originMode: "local-fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(kellyStreamProxyCircuit),
+      });
+      return {
+        kind: "fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(kellyStreamProxyCircuit),
+      };
+    }
+
+    if (settled.kind === "error") {
+      const reasonCode =
+        settled.error instanceof Error && settled.error.name === "AbortError" ? "origin_timeout" : "origin_fetch_failed";
+      recordKellyOriginFailure(kellyStreamProxyCircuit, reasonCode);
+      logOriginProxyResult(request, {
+        requestKind: "stream",
+        originMode: "local-fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(kellyStreamProxyCircuit),
+      });
+      return {
+        kind: "fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(kellyStreamProxyCircuit),
+      };
+    }
+
+    const response = settled.response;
+
+    if (isKellyOriginWebSocketUpgrade(response)) {
+      recordKellyOriginSuccess(kellyStreamProxyCircuit);
+      logOriginProxyResult(request, {
+        requestKind: "stream",
+        originMode: "remote",
+        reasonCode: "origin_ws_proxy",
+        circuitState: resolveKellyProxyCircuitState(kellyStreamProxyCircuit),
+      });
+      return {
+        kind: "passthrough",
+        response,
+      };
+    }
+
+    const reasonCode =
+      response.status === 101 ? "origin_missing_websocket" : `origin_status_${response.status}`;
+    recordKellyOriginFailure(kellyStreamProxyCircuit, reasonCode);
+    logOriginProxyResult(request, {
+      requestKind: "stream",
+      originMode: "local-fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(kellyStreamProxyCircuit),
+    });
+    return {
+      kind: "fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(kellyStreamProxyCircuit),
+    };
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+};
+
+const buildKellyProxyHealth = (env: WorkerEnv) => ({
+  configured: Boolean(resolveKellyServerBaseUrl(env)),
+  originBaseUrl: resolveKellyServerBaseUrl(env),
+  circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+  consecutiveFailures: kellyGetProxyCircuit.consecutiveFailures,
+  openUntil:
+    kellyGetProxyCircuit.openUntil === null ? null : new Date(kellyGetProxyCircuit.openUntil).toISOString(),
+  lastOriginSuccessAt: kellyGetProxyCircuit.lastOriginSuccessAt,
+  lastOriginFailureAt: kellyGetProxyCircuit.lastOriginFailureAt,
+  lastOriginFailureCode: kellyGetProxyCircuit.lastOriginFailureCode,
+  localFallbackActive: kellyGetProxyCircuit.localFallbackActive,
+  streamMode: resolveKellyStreamProxyMode(env),
+  streamLastOriginSuccessAt: kellyStreamProxyCircuit.lastOriginSuccessAt,
+  streamLastOriginFailureAt: kellyStreamProxyCircuit.lastOriginFailureAt,
+  streamLastOriginFailureCode: kellyStreamProxyCircuit.lastOriginFailureCode,
+  streamLocalFallbackActive: kellyStreamProxyCircuit.localFallbackActive,
+  dashboardCircuitState: resolveKellyProxyCircuitState(dashboardGetProxyCircuit),
+  dashboardLastOriginSuccessAt: dashboardGetProxyCircuit.lastOriginSuccessAt,
+  dashboardLastOriginFailureAt: dashboardGetProxyCircuit.lastOriginFailureAt,
+  dashboardLastOriginFailureCode: dashboardGetProxyCircuit.lastOriginFailureCode,
+  dashboardLocalFallbackActive: dashboardGetProxyCircuit.localFallbackActive,
+});
 
 const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerContext) => {
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
     return new Response("Expected Upgrade: websocket", { status: 426 });
   }
 
-  try {
-    const bridgedResponse = await proxyKellyRequest(request, env, { expectWebSocket: true });
-    if (bridgedResponse) {
-      return bridgedResponse;
-    }
-  } catch (error) {
-    if (!shouldFallbackToLocalKelly(error, env)) {
-      throw error;
+  let originAttempt: OriginProxyAttemptResult | null = null;
+  if (shouldAttemptKellyOriginStream(request, env)) {
+    originAttempt = await fetchKellyOriginStream(request, env);
+    if (originAttempt.kind === "passthrough") {
+      return originAttempt.response;
     }
   }
+
+  const url = new URL(request.url);
+  const locationId = parseQueryLocationId(url.searchParams.get("locationId"));
 
   const pair = new ((globalThis as unknown as { WebSocketPair: WebSocketPairCtor }).WebSocketPair)();
   const client = pair[0];
@@ -531,27 +1196,34 @@ const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerCo
   server.accept();
 
   const service = await getService(env);
-  const url = new URL(request.url);
-  const locationId = parseQueryLocationId(url.searchParams.get("locationId"));
 
   ctx.waitUntil(
     (async () => {
-      try {
-        const stream = await service.createKellyStream?.(locationId, parseKellyOptions(url), (message) =>
-          sendSocketMessage(server, message),
-        );
+      if (!service.createKellyStream) {
+        sendSocketMessage(server, {
+          type: "status",
+          generatedAt: new Date().toISOString(),
+          state: "unavailable",
+          reasonCode: "upstream_error",
+          message: "Kelly real-time stream is not configured.",
+        });
+        server.close(1011, "kelly-stream-unavailable");
+        return;
+      }
 
-        if (!stream) {
-          sendSocketMessage(server, {
-            type: "status",
-            generatedAt: new Date().toISOString(),
-            state: "unavailable",
-            reasonCode: "upstream_error",
-            message: "Kelly 实时流当前不可用。",
-          });
-          server.close(1011, "kelly-stream-unavailable");
-          return;
-        }
+      try {
+        const stream = await service.createKellyStream(locationId, parseKellyOptions(url), (message) =>
+          sendSocketMessage(
+            server,
+            originAttempt?.kind === "fallback"
+              ? {
+                  ...message,
+                  originMode: "local-fallback",
+                  circuitState: originAttempt.circuitState,
+                }
+              : message,
+          ),
+        );
 
         const closeStream = async () => {
           try {
@@ -573,20 +1245,17 @@ const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerCo
           generatedAt: new Date().toISOString(),
           state: "degraded",
           reasonCode: "upstream_error",
-          message: error instanceof Error ? error.message : "Kelly 实时流初始化失败。",
+          message: error instanceof Error ? error.message : "Kelly realtime stream initialization failed.",
         });
         server.close(1011, "kelly-stream-error");
       }
     })(),
   );
 
-  return new Response(null, {
-    status: 101,
-    ...( { webSocket: client } as ResponseInit ),
-  });
+  return createWebSocketUpgradeResponse(client);
 };
 
-const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Response> => {
+const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerContext): Promise<Response> => {
   const url = new URL(request.url);
   const runtimeMetadata = ensureRuntimeMetadata();
 
@@ -596,33 +1265,58 @@ const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Respo
       service: "weather-worker",
       buildId: runtimeMetadata.buildId,
       startedAt: runtimeMetadata.startedAt,
-      kellyBridge: {
-        configured: Boolean(resolveKellyBridgeBaseUrl(env)),
-        baseUrl: resolveKellyBridgeBaseUrl(env),
-        timeoutMs: KELLY_BRIDGE_TIMEOUT_MS,
-        cooldownMs: KELLY_BRIDGE_COOLDOWN_MS,
-        cooldownActive: kellyBridgeProxyState.cooldownUntil > Date.now(),
-        cooldownUntil:
-          kellyBridgeProxyState.cooldownUntil > 0 ? new Date(kellyBridgeProxyState.cooldownUntil).toISOString() : null,
-        consecutiveFailures: kellyBridgeProxyState.consecutiveFailures,
-        lastSuccessAt: kellyBridgeProxyState.lastSuccessAt,
-        lastFailureAt: kellyBridgeProxyState.lastFailureAt,
-        lastFailureCode: kellyBridgeProxyState.lastFailureCode,
-        lastFailureMessage: kellyBridgeProxyState.lastFailureMessage,
+      kellyProxy: buildKellyProxyHealth(env),
+    });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/system/status") {
+    return jsonResponse(
+      buildSystemStatusResponse({
+        service: "weather-worker",
+        buildId: runtimeMetadata.buildId,
+        startedAt: runtimeMetadata.startedAt,
+        runtime: servicePromise ? (await getService(env)).getSystemStatus?.() ?? null : null,
+        kellyProxy: buildKellyProxyHealth(env),
+      }),
+    );
+  }
+
+  if (request.method === "GET" && url.pathname === "/metrics") {
+    const status = buildSystemStatusResponse({
+      service: "weather-worker",
+      buildId: runtimeMetadata.buildId,
+      startedAt: runtimeMetadata.startedAt,
+      runtime: servicePromise ? (await getService(env)).getSystemStatus?.() ?? null : null,
+      kellyProxy: buildKellyProxyHealth(env),
+    });
+    return new Response(buildMetricsText(status), {
+      status: 200,
+      headers: {
+        "content-type": "text/plain; version=0.0.4; charset=utf-8",
       },
     });
   }
 
   if (request.method === "GET" && url.pathname === "/api/weather/kelly") {
-    try {
-      const bridgedResponse = await proxyKellyRequest(request, env);
-      if (bridgedResponse) {
-        return bridgedResponse;
-      }
-    } catch (error) {
-      if (!shouldFallbackToLocalKelly(error, env)) {
-        throw error;
-      }
+    const originAttempt = await fetchKellyOriginGet(request, env, KELLY_PROXY_GET_TIMEOUT_MS);
+    if (originAttempt.kind === "passthrough") {
+      return originAttempt.response;
+    }
+
+    const service = await getService(env);
+    const locationId = parseQueryLocationId(url.searchParams.get("locationId"));
+    if (!service.getKellyWorkbench) {
+      throw new AppError(503, "KELLY_UNAVAILABLE", "Kelly workbench is not configured.", {
+        retryable: false,
+      });
+    }
+    return jsonResponse(await service.getKellyWorkbench(locationId, parseKellyOptions(url)));
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/weather/dashboard") {
+    const originAttempt = await fetchDashboardOriginGet(request, env, DASHBOARD_PROXY_GET_TIMEOUT_MS);
+    if (originAttempt.kind === "passthrough") {
+      return originAttempt.response;
     }
   }
 
@@ -631,47 +1325,91 @@ const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Respo
 
   switch (`${request.method} ${url.pathname}`) {
     case "GET /api/weather/hourly":
-      return jsonResponse(
-        await service.getHourly(locationId, parseMode(url.searchParams.get("mode")), parseLimit(url.searchParams.get("limit"))),
+      return await withEdgeJsonCache(
+        request,
+        ctx,
+        EDGE_CACHE_TTL_SECONDS.hourly,
+        async () =>
+          await service.getHourly(
+            locationId,
+            parseMode(url.searchParams.get("mode")),
+            parseLimit(url.searchParams.get("limit")),
+          ),
+        {
+          shouldCache: hasFreshFreshness,
+        },
       );
 
     case "GET /api/weather/report":
-      return jsonResponse(await service.getWeatherReport(locationId));
+      return await withEdgeJsonCache(request, ctx, EDGE_CACHE_TTL_SECONDS.report, async () => await service.getWeatherReport(locationId), {
+        shouldCache: hasFreshFreshness,
+      });
 
     case "GET /api/weather/dashboard": {
       const mode = parseMode(url.searchParams.get("mode"));
       const limit = parseLimit(url.searchParams.get("limit"));
-      const [hourly, multimodel, report] = await Promise.all([
-        service.getHourly(locationId, mode, limit),
-        service.getMultiModelStatus(locationId),
-        service.getWeatherReport(locationId),
-      ]);
-      const syncState = hourly.stale || report.stale ? "stale" : "fresh";
+      return await withEdgeJsonCache(
+        request,
+        ctx,
+        EDGE_CACHE_TTL_SECONDS.dashboard,
+        async () => {
+        const [hourly, multimodel, report, metar, taf] = await Promise.all([
+          service.getHourly(locationId, mode, limit),
+          service.getMultiModelStatus(locationId),
+          service.getWeatherReport(locationId),
+          loadDashboardMetarSnapshot(service, locationId),
+          loadDashboardTafSnapshot(service, locationId),
+        ]);
+          const dashboardEnhancements = buildDashboardEnhancements({
+            locationId,
+            hourly,
+            report,
+            multimodel,
+          });
+          const syncState =
+            hourly.freshness === "fallback_error" || report.freshness === "fallback_error"
+              ? "fallback_error"
+              : "fresh";
 
-      return jsonResponse({
-        generatedAt: new Date().toISOString(),
-        sync: {
-          state: syncState,
-          label: syncState === "stale" ? "stale" : "synced",
-          updatedAt: hourly.fetchedAt,
+          return {
+            generatedAt: new Date().toISOString(),
+            displayUnit: LOCATION_REGISTRY[locationId].fallbackDisplayUnit,
+            sync: {
+              state: syncState,
+              freshness: syncState,
+              label:
+                syncState === "fallback_error"
+                  ? "fallback_error"
+                  : "synced",
+              updatedAt: hourly.fetchedAt,
+            },
+          locationDirectory: buildLocationDirectory(),
+          hourly,
+          report,
+          metar,
+          taf,
+          ...dashboardEnhancements,
+          multimodel: {
+              ...multimodel,
+              imageProxyUrl: `/api/weather/multimodel/image?allowStale=true&locationId=${encodeURIComponent(locationId)}`,
+              displayUpdatedAt: multimodel.imageFetchedAt ?? multimodel.lastSuccessAt,
+              sourceType: "official-relayed-image",
+              parity: "exact-image-relay",
+              statusLabel:
+                multimodel.imageStatus === "unavailable" && !multimodel.imageUrlFound
+                  ? "unavailable"
+                  : multimodel.freshness === "fallback_error"
+                    ? "fallback_error"
+                    : multimodel.freshness === "revalidating"
+                      ? "revalidating"
+                      : "ready",
+            },
+          };
         },
-        locationDirectory: buildLocationDirectory(),
-        hourly,
-        report,
-        multimodel: {
-          ...multimodel,
-          imageProxyUrl: `/api/weather/multimodel/image?allowStale=true&locationId=${encodeURIComponent(locationId)}`,
-          displayUpdatedAt: multimodel.imageFetchedAt ?? multimodel.lastSuccessAt,
-          sourceType: "official-relayed-image",
-          parity: "exact-image-relay",
-          statusLabel:
-            multimodel.imageFetchedAt ?? multimodel.lastSuccessAt
-              ? multimodel.stale
-                ? "stale"
-                : "fresh"
-              : "unavailable",
+        {
+          shouldCache: hasFreshDashboardSync,
         },
-      });
+      );
     }
 
     case "GET /api/weather/multimodel/image": {
@@ -685,15 +1423,30 @@ const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Respo
     }
 
     case "GET /api/weather/multimodel/status":
-      return jsonResponse(await service.getMultiModelStatus(locationId));
+      return await withEdgeJsonCache(
+        request,
+        ctx,
+        EDGE_CACHE_TTL_SECONDS.multimodelStatus,
+        async () => await service.getMultiModelStatus(locationId),
+        {
+          shouldCache: hasFreshFreshness,
+        },
+      );
 
     case "GET /api/weather/multimodel/distribution":
-      return jsonResponse(
-        await service.getMultiModelDistribution(
-          locationId,
-          parseTimestamp(url.searchParams.get("timestamp")),
-          parseBucketSize(url.searchParams.get("bucketSize")),
-        ),
+      return await withEdgeJsonCache(
+        request,
+        ctx,
+        EDGE_CACHE_TTL_SECONDS.multimodelDistribution,
+        async () =>
+          await service.getMultiModelDistribution(
+            locationId,
+            parseTimestamp(url.searchParams.get("timestamp")),
+            parseBucketSize(url.searchParams.get("bucketSize")),
+          ),
+        {
+          shouldCache: hasFreshFreshness,
+        },
       );
 
     case "GET /api/weather/multimodel/insights":
@@ -702,21 +1455,20 @@ const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Respo
           retryable: false,
         });
       }
-      return jsonResponse(
-        await service.getMultiModelInsight(
-          locationId,
-          parseTimestamp(url.searchParams.get("timestamp")),
-          parseActualTemperatureC(url.searchParams.get("actualTemperatureC")),
-        ),
+      return await withEdgeJsonCache(
+        request,
+        ctx,
+        EDGE_CACHE_TTL_SECONDS.multimodelInsight,
+        async () =>
+          await service.getMultiModelInsight(
+            locationId,
+            parseTimestamp(url.searchParams.get("timestamp")),
+            parseActualTemperatureC(url.searchParams.get("actualTemperatureC")),
+          ),
+        {
+          shouldCache: hasFreshFreshness,
+        },
       );
-
-    case "GET /api/weather/kelly":
-      if (!service.getKellyWorkbench) {
-        throw new AppError(503, "KELLY_UNAVAILABLE", "Kelly workbench is not configured.", {
-          retryable: false,
-        });
-      }
-      return jsonResponse(await service.getKellyWorkbench(locationId, parseKellyOptions(url)));
 
     case "GET /api/user/favorites":
       if (!service.getUserFavorites) {
@@ -749,7 +1501,8 @@ const handleApiRequest = async (request: Request, env: WorkerEnv): Promise<Respo
   throw new AppError(404, "NOT_FOUND", "Route not found.");
 };
 
-const isApiRequest = (pathname: string) => pathname === "/healthz" || pathname.startsWith("/api/");
+const isApiRequest = (pathname: string) =>
+  pathname === "/healthz" || pathname === "/metrics" || pathname.startsWith("/api/");
 
 export default {
   async fetch(request: Request, env: WorkerEnv, ctx: WorkerContext): Promise<Response> {
@@ -762,7 +1515,7 @@ export default {
       }
 
       if (isApiRequest(url.pathname)) {
-        return await handleApiRequest(request, env);
+        return await handleApiRequest(request, env, ctx);
       }
 
       return await env.ASSETS.fetch(request);
@@ -771,3 +1524,4 @@ export default {
     }
   },
 };
+

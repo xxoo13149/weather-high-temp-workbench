@@ -137,12 +137,18 @@ const resolveEntrySource = (book: InternalOrderBook | undefined): KellyEntrySour
   return "unavailable";
 };
 
-const resolveDisplayUnit = (markets: KellyMarketRow[]): KellyTemperatureUnit => {
+const resolveDisplayUnit = (
+  markets: KellyMarketRow[],
+  fallbackUnit: KellyTemperatureUnit = "C",
+): KellyTemperatureUnit => {
   const counts: Record<KellyTemperatureUnit, number> = { C: 0, F: 0 };
   for (const market of markets) {
     counts[market.unit] = (counts[market.unit] ?? 0) + 1;
   }
-  return counts.F > counts.C ? "F" : "C";
+  if (counts.C === 0 && counts.F === 0) {
+    return fallbackUnit;
+  }
+  return counts.F > counts.C ? "F" : counts.C > counts.F ? "C" : fallbackUnit;
 };
 
 const resolveMarketLifecycle = ({
@@ -250,18 +256,41 @@ const INITIAL_STREAM_HEALTH: KellyStreamHealth = {
   lastRepricedAt: null,
 };
 
-const parseTargetDateFromTimestamp = (timestamp: string, timeZone: string): string | null => {
+const formatDateKeyInTimeZone = (value: Date, timeZone: string): string => {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = formatter.formatToParts(value);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+
+  if (!year || !month || !day) {
+    throw new Error(`Could not resolve local date parts for time zone '${timeZone}'.`);
+  }
+
+  return `${year}-${month}-${day}`;
+};
+
+const buildInitialStreamHealth = ({
+  lastSignalAt,
+}: {
+  lastSignalAt: string | null;
+}): KellyStreamHealth => ({
+  ...INITIAL_STREAM_HEALTH,
+  lastSignalAt,
+});
+
+export const resolveKellyDateKeyFromTimestamp = (timestamp: string, timeZone: string): string | null => {
   const parsed = new Date(timestamp);
   if (Number.isNaN(parsed.getTime())) {
     return null;
   }
 
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(parsed);
+  return formatDateKeyInTimeZone(parsed, timeZone);
 };
 
 export const resolveKellyTargetDate = (timeZone: string, requestedTargetDate?: string): string => {
@@ -269,12 +298,7 @@ export const resolveKellyTargetDate = (timeZone: string, requestedTargetDate?: s
     return requestedTargetDate;
   }
 
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(new Date());
+  return formatDateKeyInTimeZone(new Date(), timeZone);
 };
 
 const DAY_MS = 86_400_000;
@@ -299,7 +323,7 @@ const resolveAvailableTargetDates = (timestamps: string[], timeZone: string): st
 
   const candidates = unique(
     timestamps
-      .map((timestamp) => parseTargetDateFromTimestamp(timestamp, timeZone))
+      .map((timestamp) => resolveKellyDateKeyFromTimestamp(timestamp, timeZone))
       .filter((value): value is string => Boolean(value))
       .filter((value) => {
         const key = parseIsoDateKey(value);
@@ -391,7 +415,7 @@ const resolveObservedHourlyHighCandidate = (
 
   const candidates = hourly.items
     .filter((item) => typeof item.temperatureC === "number" && Number.isFinite(item.temperatureC))
-    .filter((item) => parseTargetDateFromTimestamp(item.timestamp, timeZone) === targetDate)
+    .filter((item) => resolveKellyDateKeyFromTimestamp(item.timestamp, timeZone) === targetDate)
     .filter((item) => {
       const observedTime = new Date(item.timestamp).getTime();
       return Number.isFinite(observedTime) && observedTime <= nowTime;
@@ -416,8 +440,8 @@ const resolveObservationAnchorTargetDate = (
 ): string => {
   const anchorTimestamp = metarObservation?.observedAt ?? hourly.current?.timestamp;
   return (
-    (anchorTimestamp ? parseTargetDateFromTimestamp(anchorTimestamp, timeZone) : null) ??
-    parseTargetDateFromTimestamp(now.toISOString(), timeZone) ??
+    (anchorTimestamp ? resolveKellyDateKeyFromTimestamp(anchorTimestamp, timeZone) : null) ??
+    resolveKellyDateKeyFromTimestamp(now.toISOString(), timeZone) ??
     resolveKellyTargetDate(timeZone)
   );
 };
@@ -1759,6 +1783,7 @@ export const buildKellyWorkbench = ({
   hourly,
   report,
   metarObservation,
+  tafForecast = null,
   insight,
   distribution,
   discoveryCandidates,
@@ -1779,6 +1804,7 @@ export const buildKellyWorkbench = ({
   hourly: HourlyWeatherResponse;
   report: WeatherReportResponse;
   metarObservation: MetarObservation | null;
+  tafForecast?: KellyWeatherEvidence["tafForecast"];
   insight: MultiModelInsightResponse;
   distribution: MultiModelDistributionResponse;
   discoveryCandidates: PolymarketCandidate[];
@@ -1845,6 +1871,7 @@ export const buildKellyWorkbench = ({
       : inactiveMarkets.length > 0
         ? inactiveMarkets
         : pricedMarkets.filter((market) => market.parseStatus === "matched"),
+    location.fallbackDisplayUnit,
   );
   const recommendations = buildRecommendations(activeMarkets, riskMode);
   const bestObservation = buildReadableObservation(activeMarkets);
@@ -1915,11 +1942,12 @@ export const buildKellyWorkbench = ({
     observationFloorSource: observationFloor.source,
     observationFloorObservedAt: observationFloor.observedAt,
     metarObservation,
+    tafForecast,
     sourceSummaryZh: report.textZh,
     hourlyPageUrl: hourly.pageUrl,
     multimodelPageUrl: distribution.pageUrl,
     fetchedAt: generatedAt,
-    stale: hourly.stale || report.stale || distribution.stale || insight.stale,
+    stale: hourly.stale || report.stale || distribution.stale || insight.stale || (tafForecast?.stale ?? false),
     participatingModelCount: signalBundle.usableSignals.length,
     excludedModels: signalBundle.exposedSignals
       .filter((signal) => !signal.included)
@@ -1941,7 +1969,9 @@ export const buildKellyWorkbench = ({
     frameSeries,
     repricedAt,
   });
-  const streamHealth = INITIAL_STREAM_HEALTH;
+  const streamHealth = buildInitialStreamHealth({
+    lastSignalAt: freshness.lastStreamEventAt,
+  });
 
   return {
     location: {

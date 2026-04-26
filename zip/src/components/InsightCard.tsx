@@ -5,24 +5,21 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { UI_TEXT } from "../display-text";
 import type { InsightViewModel } from "../mappers";
-import { formatDateTime, formatNumber, formatTime } from "../utils";
+import type { KellyTemperatureUnit } from "../types";
+import { formatDateTime, formatTemperature, formatTemperatureDelta, formatTime } from "../utils";
 
 const DEBOUNCE_MS = 420;
-
-const formatDelta = (value: number | null | undefined) => {
-  if (value === null || value === undefined || Number.isNaN(value)) {
-    return "--";
-  }
-
-  return `${value > 0 ? "+" : ""}${formatNumber(value)}°C`;
-};
+const WEATHER_TIMESTAMP_LABEL = "天气时刻";
+const WEATHER_TIMESTAMP_HINT = "参考温度当前对应的天气时刻";
 
 export const InsightCard = ({
   insight,
   loading,
   error,
+  displayUnit,
   locationTimezone,
-  selectedInsightTimestamp,
+  selectedWeatherTimestamp,
+  selectedModelTimestamp,
   actualTemperatureC,
   manualTemperatureText,
   referenceMode,
@@ -34,8 +31,10 @@ export const InsightCard = ({
   insight: InsightViewModel | null;
   loading: boolean;
   error: string | null;
+  displayUnit: KellyTemperatureUnit;
   locationTimezone?: string;
-  selectedInsightTimestamp: string | null;
+  selectedWeatherTimestamp: string | null;
+  selectedModelTimestamp: string | null;
   actualTemperatureC: number | null;
   manualTemperatureText: string;
   referenceMode: "default" | "manual";
@@ -89,6 +88,12 @@ export const InsightCard = ({
     : updatedPulse
       ? UI_TEXT.insight.updated
       : UI_TEXT.insight.idle;
+  const weatherTimestampCaption = selectedWeatherTimestamp
+    ? formatDateTime(selectedWeatherTimestamp, locationTimezone)
+    : WEATHER_TIMESTAMP_HINT;
+  const modelTimestampCaption = selectedModelTimestamp
+    ? formatDateTime(selectedModelTimestamp, locationTimezone)
+    : UI_TEXT.insight.autoNearest;
 
   return (
     <section className="terminal-panel flex h-full flex-col px-5 py-5">
@@ -127,7 +132,7 @@ export const InsightCard = ({
             <Input
               value={draftValue}
               onChange={(event) => setDraftValue(event.target.value)}
-              placeholder={UI_TEXT.insight.temperatureInputPlaceholder}
+              placeholder={`${UI_TEXT.insight.temperatureInputPlaceholder} (°${displayUnit})`}
               inputMode="decimal"
             />
             <Button
@@ -139,30 +144,36 @@ export const InsightCard = ({
             </Button>
           </div>
 
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
             <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3">
               <div className="eyebrow">{UI_TEXT.insight.currentReference}</div>
               <div className="data-mono mt-2 text-2xl font-semibold text-white">
-                {actualTemperatureC !== null ? `${formatNumber(actualTemperatureC)}°C` : "--"}
+                {formatTemperature(actualTemperatureC, displayUnit)}
               </div>
               <div className="mt-2 text-xs text-white/54">{UI_TEXT.insight.source} {referenceLabel}</div>
             </div>
 
             <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3">
+              <div className="eyebrow">{WEATHER_TIMESTAMP_LABEL}</div>
+              <div className="data-mono mt-2 text-2xl font-semibold text-white">
+                {selectedWeatherTimestamp ? formatTime(selectedWeatherTimestamp, locationTimezone) : "--"}
+              </div>
+              <div className="mt-2 text-xs text-white/54">{weatherTimestampCaption}</div>
+            </div>
+
+            <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3">
               <div className="eyebrow">{UI_TEXT.insight.modelTimestamp}</div>
               <div className="data-mono mt-2 text-2xl font-semibold text-white">
-                {selectedInsightTimestamp ? formatTime(selectedInsightTimestamp, locationTimezone) : "--"}
+                {selectedModelTimestamp ? formatTime(selectedModelTimestamp, locationTimezone) : "--"}
               </div>
-              <div className="mt-2 text-xs text-white/54">
-                {selectedInsightTimestamp ? formatDateTime(selectedInsightTimestamp, locationTimezone) : UI_TEXT.insight.autoNearest}
-              </div>
+              <div className="mt-2 text-xs text-white/54">{modelTimestampCaption}</div>
             </div>
           </div>
 
           {timestamps.length > 0 ? (
             <div className="mt-4 flex flex-wrap gap-2">
               {timestamps.slice(0, 6).map((timestamp) => {
-                const active = timestamp === selectedInsightTimestamp;
+                const active = timestamp === selectedModelTimestamp;
                 return (
                   <button
                     key={timestamp}
@@ -200,7 +211,7 @@ export const InsightCard = ({
                   </div>
 
                   <div className="rounded-full border border-white/10 bg-black/20 px-3 py-1 text-xs text-white/58">
-                    {UI_TEXT.analysis.deviation} {formatDelta(model.deltaToActualTemperatureC)}
+                    {UI_TEXT.analysis.deviation} {formatTemperatureDelta(model.deltaToActualTemperatureC, displayUnit, 1, true)}
                   </div>
                 </div>
 
@@ -208,14 +219,14 @@ export const InsightCard = ({
                   <div className="rounded-[18px] border border-white/8 bg-black/20 px-3 py-3">
                     <div className="eyebrow">{UI_TEXT.insight.currentPrediction}</div>
                     <div className="data-mono mt-2 text-2xl font-semibold text-white">
-                      {formatNumber(model.currentTemperatureC)}°C
+                      {formatTemperature(model.currentTemperatureC, displayUnit)}
                     </div>
                   </div>
 
                   <div className="rounded-[18px] border border-white/8 bg-black/20 px-3 py-3">
                     <div className="eyebrow">{UI_TEXT.insight.peakTemperature}</div>
                     <div className="data-mono mt-2 text-2xl font-semibold text-white">
-                      {formatNumber(model.dayPeakTemperatureC)}°C
+                      {formatTemperature(model.dayPeakTemperatureC, displayUnit)}
                     </div>
                   </div>
 

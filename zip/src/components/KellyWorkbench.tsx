@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { Orbit, ShieldCheck } from "lucide-react";
 
 import { KellyWorkbench as KellyWorkbenchShell } from "./kelly";
 import type {
@@ -7,16 +8,29 @@ import type {
   KellyFieldErrors,
   KellyMarketStatus,
   KellyOpportunity,
-  KellyProbabilityPanelData,
   KellyRiskMode,
   KellySummaryMetric,
   KellySyncMetric,
   KellyWorkbenchData,
 } from "@/lib/kelly";
-import type { KellyRecommendation, KellyWorkbenchResponse, LocationDirectoryEntry } from "../types";
-import { formatDateTime, formatTime } from "../utils";
+import type {
+  DashboardSourceMetadata,
+  IntradaySignalsSummary,
+  KellyRecommendation,
+  KellyWorkbenchResponse,
+  LocationDirectoryEntry,
+  MarketReferenceSummary,
+} from "../types";
+import {
+  buildMetarDetail,
+  buildMetarHeadline,
+  buildTafDetail,
+  buildTafHeadline,
+} from "../lib/aviation-display";
+import { formatDateTime, formatShortMonthDay, formatTime } from "../utils";
 import type { KellyTemperatureUnit } from "@/types";
 import { convertAbsoluteTemperature, convertDeltaTemperature } from "@/components/kelly/temperature";
+import { shouldHideKellyFloorMarket } from "../kelly";
 
 type SnapshotMarket = KellyWorkbenchResponse["markets"][number] | KellyWorkbenchResponse["inactiveMarkets"][number];
 
@@ -24,7 +38,7 @@ const OBSERVATION_FLOOR_LABEL = "实况温度已超过该档位";
 
 const SOURCE_LABELS: Partial<Record<KellyWorkbenchResponse["weatherEvidence"]["currentReferenceSource"], string>> = {
   manual: "手动输入",
-  metar: "METAR 实况",
+  metar: "机场实况",
   "hourly-current": "当前实况",
   "hourly-selected": "选中小时",
   "model-mean": "模型均值",
@@ -32,6 +46,11 @@ const SOURCE_LABELS: Partial<Record<KellyWorkbenchResponse["weatherEvidence"]["c
 
 const getSourceLabel = (source: KellyWorkbenchResponse["weatherEvidence"]["currentReferenceSource"]) =>
   SOURCE_LABELS[source] ?? "--";
+
+const resolvePrimaryKellyWarning = (warnings: string[]) =>
+  warnings.find((warning) => warning.includes("市场") || warning.includes("档位") || warning.includes("盘口")) ??
+  warnings[0] ??
+  null;
 
 const RISK_MODE_LABELS: Record<KellyRiskMode, string> = {
   conservative: "保守",
@@ -58,6 +77,108 @@ const CONTRACT_TYPE_LABELS: Record<SnapshotMarket["contractType"], string> = {
 };
 
 const DATE_RELATIVE_LABELS = ["今天", "明天", "后天"];
+const KELLY_LOADING_PHASES = [
+  { label: "盘口目录", detail: "识别温度档位与当前可交易状态" },
+  { label: "天气参考", detail: "同步实况、小时页与模型时刻" },
+  { label: "仓位参数", detail: "按 Kelly 风控口径生成执行建议" },
+];
+
+const KELLY_SOURCE_STATUS_LABEL: Record<string, string> = {
+  production: "已接入",
+  planned: "计划接入",
+  candidate: "待确认",
+  unavailable: "暂不可用",
+};
+
+const describeKellyReferenceStation = (sourceMetadata: DashboardSourceMetadata) =>
+  sourceMetadata.contract.settlementReference.stationCode ?? sourceMetadata.contract.settlementReference.label;
+
+const KellySourceContractPanel = ({
+  sourceMetadata,
+  intradaySignals,
+  marketReference,
+  timezone,
+}: {
+  sourceMetadata?: DashboardSourceMetadata | null;
+  intradaySignals?: IntradaySignalsSummary | null;
+  marketReference?: MarketReferenceSummary | null;
+  timezone?: string;
+}) => {
+  if (!sourceMetadata || !intradaySignals || !marketReference) {
+    return null;
+  }
+
+  const officialEnhancement = sourceMetadata.contract.targetUpgrades.officialEnhancements[0] ?? null;
+  const referenceStation = describeKellyReferenceStation(sourceMetadata);
+
+  return (
+    <section className="terminal-panel kelly-source-contract-panel">
+      <div className="panel-section kelly-shell__inner">
+        <div className="kelly-shell__header">
+          <div className="kelly-shell__hero">
+            <div className="eyebrow flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-[var(--accent)]" />
+              Kelly 参考数据
+            </div>
+            <h2 className="kelly-shell__title text-[clamp(1.35rem,2vw,1.85rem)]">先确认天气，再看市场</h2>
+            <p className="kelly-shell__subtitle">这里展示这次 Kelly 分析使用的天气参考，避免只盯盘口价格。</p>
+          </div>
+
+          <div className="kelly-shell__signal">
+            <span className="kelly-shell__signal-dot" />
+            先看天气
+          </div>
+        </div>
+
+        <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(260px,0.7fr)]">
+          <div className="grid gap-3 md:grid-cols-3">
+            <div className="kelly-sync-card">
+              <div className="kelly-sync-card__label">参考站点</div>
+              <div className="kelly-sync-card__value">{referenceStation}</div>
+              <div className="kelly-sync-card__detail">{sourceMetadata.contract.settlementReference.detail}</div>
+            </div>
+
+            <div className="kelly-sync-card">
+              <div className="kelly-sync-card__label">小时预报</div>
+              <div className="kelly-sync-card__value">
+                {sourceMetadata.contract.currentSources.baselineForecast.label}
+              </div>
+              <div className="kelly-sync-card__detail">
+                {KELLY_SOURCE_STATUS_LABEL[sourceMetadata.contract.currentSources.baselineForecast.status] ??
+                  sourceMetadata.contract.currentSources.baselineForecast.status}
+              </div>
+            </div>
+
+            <div className="kelly-sync-card">
+              <div className="kelly-sync-card__label">补充参考</div>
+              <div className="kelly-sync-card__value">
+                {officialEnhancement?.label ?? sourceMetadata.contract.targetUpgrades.taf.label}
+              </div>
+              <div className="kelly-sync-card__detail">
+                {KELLY_SOURCE_STATUS_LABEL[sourceMetadata.contract.targetUpgrades.taf.status] ??
+                  sourceMetadata.contract.targetUpgrades.taf.status}
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-[20px] border border-white/8 bg-black/20 px-4 py-3">
+            <div className="eyebrow">今天判断</div>
+            <div className="mt-2 text-sm font-medium text-white">{intradaySignals.headline}</div>
+            <div className="mt-2 text-xs leading-5 text-white/52">
+              下一观察点：
+              {intradaySignals.nextObservationAt
+                ? formatDateTime(intradaySignals.nextObservationAt, timezone)
+                : "等待下一轮小时刷新"}
+            </div>
+            <div className="mt-3 text-xs leading-5 text-white/52">
+              先确认天气判断，再看下方市场表和仓位建议。
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+};
 
 const toPercentValue = (value: number | null | undefined) =>
   typeof value === "number" && Number.isFinite(value) ? value * 100 : null;
@@ -122,20 +243,6 @@ const formatUsd = (value: number | null | undefined) =>
       }).format(value)
     : "--";
 
-const formatShortMonthDay = (value: string, timeZone?: string) => {
-  const iso = value.includes("T") ? value : `${value}T00:00:00Z`;
-  const parsed = new Date(iso);
-  if (Number.isNaN(parsed.getTime())) {
-    return value;
-  }
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "2-digit",
-    day: "2-digit",
-    timeZone: timeZone ?? "UTC",
-  }).format(parsed);
-};
-
 const convertInlineTemperatureLabel = (label: string, unit: KellyTemperatureUnit): string =>
   label.replace(/(-?\d+(?:\.\d+)?)\s*°?\s*([CF])?/gi, (_match, rawValue, rawUnit) => {
     const parsed = Number.parseFloat(rawValue);
@@ -186,6 +293,9 @@ const sortMarkets = (markets: SnapshotMarket[]) =>
     return left.title.localeCompare(right.title);
   });
 
+const filterVisibleMarkets = (markets: SnapshotMarket[]) =>
+  markets.filter((market) => !shouldHideKellyFloorMarket(market));
+
 const buildDateChips = (dates: string[], selectedDate: string, timeZone?: string): KellyDateChip[] =>
   dates.slice(0, 3).map((date, index) => {
     const shortLabel = formatShortMonthDay(date, timeZone);
@@ -199,7 +309,7 @@ const buildDateChips = (dates: string[], selectedDate: string, timeZone?: string
   });
 
 const buildShortMarketLabel = (market: SnapshotMarket, targetDate: string, timeZone?: string) =>
-  `${market.bucketLabel} ${formatShortMonthDay(targetDate, timeZone)}`;
+  `${market.bucketLabel} · ${formatShortMonthDay(targetDate, timeZone)}`;
 
 const getContractTypeLabel = (contractType: SnapshotMarket["contractType"] | null | undefined) =>
   contractType ? CONTRACT_TYPE_LABELS[contractType] ?? contractType : null;
@@ -320,42 +430,44 @@ const resolveStreamLabel = (snapshot: KellyWorkbenchResponse, streamState: strin
 };
 
 const resolveStreamDetail = (snapshot: KellyWorkbenchResponse, timeZone?: string) => {
+  const effectiveLastRepricedAt = snapshot.streamHealth.lastRepricedAt ?? snapshot.freshness.repricedAt;
   const lastSignal = snapshot.streamHealth.lastSignalAt
     ? `最后流事件 ${formatDateTime(snapshot.streamHealth.lastSignalAt, timeZone)}`
     : "最近还没有流事件";
-  const lastRepriced = snapshot.streamHealth.lastRepricedAt
-    ? `最后重定价 ${formatDateTime(snapshot.streamHealth.lastRepricedAt, timeZone)}`
+  const lastRepriced = effectiveLastRepricedAt
+    ? `最后重定价 ${formatDateTime(effectiveLastRepricedAt, timeZone)}`
     : "最近还没有实时重定价";
   return `${lastSignal} / ${lastRepriced}`;
 };
 
-const buildProbability = (
-  snapshot: KellyWorkbenchResponse,
-  displayUnit: KellyTemperatureUnit,
-): KellyProbabilityPanelData => ({
-  title: "概率依据（辅助）",
-  subtitle: "用来解释温度分布和档位落点，不替代上面的仓位建议与主表。",
-  summary: `最可能高温区间 ${convertInlineTemperatureLabel(snapshot.distributionSummary.mostLikelyRangeLabel, displayUnit)}，当前收缩 ${formatPercent(
-    snapshot.methodology.shrink * 100,
-  )}。`,
-  samples: snapshot.probabilityCurve.map((point) => ({
-    temperatureC: point.temperatureC,
-    probabilityPct: point.density * 100,
-  })),
-  thresholds: snapshot.bucketProbabilities.slice(0, 8).map((bucket) => ({
-    id: bucket.marketId,
-    marketId: bucket.marketId,
-    label: convertInlineTemperatureLabel(bucket.label, displayUnit),
-    temperatureC: bucket.bucketStartC ?? bucket.bucketEndC ?? snapshot.distributionSummary.modeTemperatureC,
-    detail: `Yes 公允价 ${formatPercent(bucket.probabilityYes * 100)}`,
-    tone: "neutral",
-  })),
-  notes: [
-    "先看仓位建议和主表，再回到这里核对落点。",
-    "当前版本的收缩系数是启发式口径，不是假装成历史回测拟合。",
-  ],
-  displayUnit,
-});
+const resolveReadableStreamLabel = (snapshot: KellyWorkbenchResponse, streamState: string) => {
+  if (streamState === "connecting") {
+    return "正在建立订阅";
+  }
+
+  switch (snapshot.streamHealth.reasonCode) {
+    case "no_recent_market_motion":
+      return "已连接，最近无新盘口";
+    case "polling_fallback":
+      return "已回退到轮询";
+    case "no_matched_markets":
+      return "当前没有可订阅市场";
+    case "missing_tokens":
+      return "缺少可订阅 token";
+    case "reprice_failed":
+      return (snapshot.streamHealth.lastRepricedAt ?? snapshot.freshness.repricedAt)
+        ? "收到信号，本轮未能重定价，沿用上一轮结果"
+        : "收到信号，但重定价失败";
+    case "ws_error":
+      return snapshot.streamHealth.state === "disconnected" ? "实时流已断开" : "实时流异常";
+    case "upstream_error":
+      return "上游实时流异常";
+    case "ws_connected":
+      return "实时流已连接";
+    default:
+      return snapshot.streamHealth.message || "实时状态暂不可用";
+  }
+};
 
 const buildEvidenceSections = (
   snapshot: KellyWorkbenchResponse,
@@ -363,6 +475,7 @@ const buildEvidenceSections = (
   timeZone: string | undefined,
   displayUnit: KellyTemperatureUnit,
 ): KellyEvidenceSection[] => {
+  const resolvedTimeZone = snapshot.location.timezone ?? timeZone;
   const formatEvidenceTemp = (value: number | null | undefined, digits = 1) =>
     formatTemp(value, displayUnit, digits);
   const formatEvidenceDelta = (value: number | null | undefined, digits = 1, signed = false) =>
@@ -370,8 +483,6 @@ const buildEvidenceSections = (
   const allMarkets = sortMarkets([...snapshot.markets, ...snapshot.inactiveMarkets]);
   const market = allMarkets.find((item) => item.marketId === selectedMarketId) ?? allMarkets[0] ?? null;
   const evidence = snapshot.marketEvidence.find((item) => item.marketId === market?.marketId) ?? null;
-  const probabilityStep =
-    snapshot.methodology.probabilitySteps.details?.find((item) => item.marketId === market?.marketId) ?? null;
   const selectedSide = resolveSelectedSide(market);
   const entryPrice = toPercentValue(
     selectedSide === "yes"
@@ -387,6 +498,8 @@ const buildEvidenceSections = (
   const kelly = toPercentValue(
     selectedSide === "yes" ? market?.kellyYes : selectedSide === "no" ? market?.kellyNo : null,
   );
+  const metarObservation = snapshot.weatherEvidence.metarObservation;
+  const tafForecast = snapshot.weatherEvidence.tafForecast;
 
   return [
     {
@@ -397,7 +510,7 @@ const buildEvidenceSections = (
         {
           id: "contract",
           label: "当前档位",
-          value: market ? buildShortMarketLabel(market, snapshot.targetDate, timeZone) : "--",
+          value: market ? buildShortMarketLabel(market, snapshot.targetDate, resolvedTimeZone) : "--",
           detail: market?.bucketLabel ?? "当前还没有选中档位。",
           tone: "accent",
         },
@@ -424,26 +537,44 @@ const buildEvidenceSections = (
     {
       id: "weather",
       title: "天气证据",
-      description: "核对参考温度、天气时刻、模型时刻和抓取时间。",
+      description: "核对参考温度、天气时刻和抓取时间，确认天气口径没有漂移。",
       items: [
-          {
-            id: "reference",
-            label: "参考温度",
-            value: formatEvidenceTemp(snapshot.weatherEvidence.currentReferenceTemperatureC),
-            detail: `来源：${getSourceLabel(snapshot.weatherEvidence.currentReferenceSource)}`,
-            tone: "accent",
-          },
+        {
+          id: "reference",
+          label: "参考温度",
+          value: formatEvidenceTemp(snapshot.weatherEvidence.currentReferenceTemperatureC),
+          detail: `来源：${getSourceLabel(snapshot.weatherEvidence.currentReferenceSource)}`,
+          tone: "accent",
+        },
+        {
+          id: "metar",
+          label: "机场实况",
+          value: buildMetarHeadline(metarObservation, displayUnit),
+          detail: buildMetarDetail(metarObservation, resolvedTimeZone, { includeStationName: true }),
+          sourceLabel: metarObservation ? "查看机场实况原文" : undefined,
+          sourceUrl: metarObservation?.sourceUrl ?? undefined,
+          tone: metarObservation?.stale ? "warning" : "success",
+        },
+        {
+          id: "taf",
+          label: "机场预报",
+          value: buildTafHeadline(tafForecast, displayUnit),
+          detail: buildTafDetail(tafForecast, resolvedTimeZone, displayUnit),
+          sourceLabel: tafForecast ? "查看机场预报原文" : undefined,
+          sourceUrl: tafForecast?.sourceUrl ?? tafForecast?.officialSourceUrl ?? undefined,
+          tone: tafForecast ? (tafForecast.stale ? "warning" : "success") : "neutral",
+        },
         {
           id: "timestamps",
           label: "天气 / 模型时刻",
-          value: formatTime(snapshot.weatherEvidence.currentWeatherTimestamp, timeZone),
-          detail: `分析使用模型时刻 ${formatTime(snapshot.weatherEvidence.targetModelTimestamp, timeZone)}`,
+          value: formatTime(snapshot.weatherEvidence.currentWeatherTimestamp, resolvedTimeZone),
+          detail: `分析使用模型时刻 ${formatTime(snapshot.weatherEvidence.targetModelTimestamp, resolvedTimeZone)}`,
         },
         {
           id: "summary",
           label: "中文摘要",
           value: snapshot.weatherEvidence.sourceSummaryZh ?? "暂无摘要",
-          detail: `天气快照抓取于 ${formatDateTime(snapshot.weatherEvidence.fetchedAt, timeZone)}`,
+          detail: `天气快照抓取于 ${formatDateTime(snapshot.weatherEvidence.fetchedAt, resolvedTimeZone)}`,
           sourceLabel: "回查 meteoblue 小时页",
           sourceUrl: snapshot.weatherEvidence.hourlyPageUrl,
         },
@@ -475,42 +606,6 @@ const buildEvidenceSections = (
           detail: market ? resolveInactiveReason(market) : "当前没有选中市场。",
           sourceLabel: evidence?.eventUrl ? "事件页" : undefined,
           sourceUrl: evidence?.eventUrl ?? undefined,
-        },
-      ],
-    },
-    {
-      id: "formula",
-      title: "公式口径",
-      description: "这不是官方公式，是我们当前版本的启发式定价口径。",
-      items: [
-        {
-          id: "shrink",
-          label: "收缩系数",
-          value: formatPercent(snapshot.methodology.shrink * 100),
-          detail: `分歧 ${formatEvidenceDelta(snapshot.methodology.shrinkInputs.disagreement, 2)} / 偏差离散 ${formatEvidenceDelta(
-            snapshot.methodology.shrinkInputs.biasDispersion,
-            2,
-          )} / 缺失 ${(snapshot.methodology.shrinkInputs.missingRatio * 100).toFixed(1)}%`,
-        },
-        {
-          id: "probability",
-          label: "p_raw → p_final",
-          value:
-            probabilityStep !== null
-              ? `${formatPercent(probabilityStep.pRaw * 100)} → ${formatPercent(probabilityStep.pFinal * 100)}`
-              : "--",
-          detail: probabilityStep
-            ? `边界 ${formatEvidenceTemp(probabilityStep.lowerBoundC, 0)} ~ ${formatEvidenceTemp(
-                probabilityStep.upperBoundC,
-                0,
-              )}`
-            : "当前档位没有概率积分明细。",
-        },
-        {
-          id: "pricing",
-          label: "fair / edge / Kelly",
-          value: `${formatPercent(fairPrice)} / ${formatSignedPercent(edge)} / ${formatPercent(kelly)}`,
-          detail: snapshot.methodology.probabilitySteps.kellyRule,
         },
       ],
     },
@@ -557,6 +652,7 @@ const buildData = ({
   timeZone?: string;
 }): KellyWorkbenchData => {
   const displayUnit: KellyTemperatureUnit = snapshot.displayUnit ?? "C";
+  const resolvedTimeZone = snapshot.location.timezone ?? timeZone;
   const formatTempWithUnit = (value: number | null | undefined, digits = 1) =>
     formatTemp(value, displayUnit, digits);
   const formatDeltaWithUnit = (
@@ -565,22 +661,46 @@ const buildData = ({
     signed = false,
   ) => formatDeltaTemp(value, displayUnit, digits, signed);
 
-  const matchedMarkets = sortMarkets(snapshot.markets);
-  const inactiveMarkets = sortMarkets(snapshot.inactiveMarkets);
+  const visibleMatchedMarkets = filterVisibleMarkets(snapshot.markets);
+  const visibleInactiveMarkets = filterVisibleMarkets(snapshot.inactiveMarkets);
+  const visibleMarketIds = new Set(
+    [...visibleMatchedMarkets, ...visibleInactiveMarkets]
+      .map((market) => market.marketId)
+      .filter((marketId): marketId is string => Boolean(marketId)),
+  );
+  const visibleSnapshot: KellyWorkbenchResponse = {
+    ...snapshot,
+    markets: visibleMatchedMarkets,
+    inactiveMarkets: visibleInactiveMarkets,
+    recommendations: snapshot.recommendations.filter(
+      (recommendation) => !recommendation.marketId || visibleMarketIds.has(recommendation.marketId),
+    ),
+    bestObservation:
+      snapshot.bestObservation && snapshot.bestObservation.marketId && visibleMarketIds.has(snapshot.bestObservation.marketId)
+        ? snapshot.bestObservation
+        : null,
+  };
+  const matchedMarkets = sortMarkets(visibleSnapshot.markets);
+  const inactiveMarkets = sortMarkets(visibleSnapshot.inactiveMarkets);
   const selectedMarket =
     matchedMarkets.find((item) => item.marketId === selectedMarketId) ??
     inactiveMarkets.find((item) => item.marketId === selectedMarketId) ??
     matchedMarkets[0] ??
     inactiveMarkets[0] ??
     null;
-  const bestHighlighted = snapshot.recommendations[0] ?? snapshot.bestObservation ?? null;
-  const targetDateLabel = formatShortMonthDay(snapshot.targetDate, timeZone);
+  const bestHighlighted = visibleSnapshot.recommendations[0] ?? visibleSnapshot.bestObservation ?? null;
+  const metarObservation = snapshot.weatherEvidence.metarObservation;
+  const tafForecast = snapshot.weatherEvidence.tafForecast;
+  const targetDateLabel = formatShortMonthDay(visibleSnapshot.targetDate, resolvedTimeZone);
 
-  const opportunities: KellyOpportunity[] = [
+  const rawOpportunities: KellyOpportunity[] = [
     ...(snapshot.recommendations[0] ? [toOpportunity(snapshot, snapshot.recommendations[0], "primary", "主仓建议")] : []),
     ...(snapshot.recommendations[1] ? [toOpportunity(snapshot, snapshot.recommendations[1], "secondary", "副仓建议")] : []),
     ...(snapshot.bestObservation ? [toOpportunity(snapshot, snapshot.bestObservation, "watch", "观察位")] : []),
   ];
+  const opportunities = rawOpportunities.filter(
+    (opportunity) => !opportunity.marketId || visibleMarketIds.has(opportunity.marketId),
+  );
 
   const markets = matchedMarkets.map((market) => {
     const dominantSide =
@@ -601,8 +721,11 @@ const buildData = ({
     return {
       id: market.marketId,
       marketId: market.marketId,
-      label: buildShortMarketLabel(market, snapshot.targetDate, timeZone),
-      rangeLabel: getContractTypeLabel(market.contractType) ?? market.bucketLabel,
+      label: buildShortMarketLabel(market, snapshot.targetDate, resolvedTimeZone),
+      shortLabel: market.bucketLabel,
+      dateLabel: targetDateLabel,
+      contractTypeLabel: getContractTypeLabel(market.contractType) ?? undefined,
+      rangeLabel: market.bucketLabel,
       yesPricePct: toPercentValue(market.yesBestAsk ?? market.yesPrice),
       noPricePct: toPercentValue(market.noBestAsk ?? market.noPrice),
       fairYesPct: toPercentValue(market.fairYes),
@@ -621,7 +744,7 @@ const buildData = ({
           ? `当前最佳优势 ${formatSignedPercent(toPercentValue(dominantSide === "yes" ? market.edgeYes : market.edgeNo))}，先保留观察。`
           : `${resolveActionLabel(market.recommendedSide)}，建议金额 ${formatUsd(market.suggestedStake)}。`,
       spreadLabel: formatPercent(toPercentValue(market.spreadPct)),
-      updatedAtLabel: formatTime(market.updatedAt, timeZone),
+      updatedAtLabel: formatTime(market.updatedAt, resolvedTimeZone),
       note: `Yes ${resolveEntrySourceLabel(market.entrySourceYes)} / No ${resolveEntrySourceLabel(market.entrySourceNo)}`,
     };
   });
@@ -629,8 +752,11 @@ const buildData = ({
   const inactiveRows = inactiveMarkets.map((market) => ({
     id: market.marketId,
     marketId: market.marketId,
-    label: buildShortMarketLabel(market, snapshot.targetDate, timeZone),
-    rangeLabel: getContractTypeLabel(market.contractType) ?? market.bucketLabel,
+    label: buildShortMarketLabel(market, snapshot.targetDate, resolvedTimeZone),
+    shortLabel: market.bucketLabel,
+    dateLabel: targetDateLabel,
+    contractTypeLabel: getContractTypeLabel(market.contractType) ?? undefined,
+    rangeLabel: market.bucketLabel,
     yesPricePct: toPercentValue(market.yesBestAsk ?? market.yesPrice),
     noPricePct: toPercentValue(market.noBestAsk ?? market.noPrice),
     fairYesPct: toPercentValue(market.fairYes),
@@ -646,19 +772,33 @@ const buildData = ({
     status: "locked" as const,
     detail: resolveInactiveReason(market),
     spreadLabel: formatPercent(toPercentValue(market.spreadPct)),
-    updatedAtLabel: formatTime(market.updatedAt, timeZone),
+    updatedAtLabel: formatTime(market.updatedAt, resolvedTimeZone),
     note: "已移出主表，仅保留回查。",
     isInactive: true,
     inactiveReason: resolveInactiveReason(market),
   }));
 
-const summaryMetrics: KellySummaryMetric[] = [
+  const summaryMetrics: KellySummaryMetric[] = [
     {
       id: "reference",
       label: "参考温度",
       value: formatTempWithUnit(snapshot.weatherEvidence.currentReferenceTemperatureC),
       detail: `来源：${getSourceLabel(snapshot.weatherEvidence.currentReferenceSource)}`,
       tone: "accent",
+    },
+    {
+      id: "metar",
+      label: "机场实况",
+      value: buildMetarHeadline(metarObservation, displayUnit),
+      detail: buildMetarDetail(metarObservation, resolvedTimeZone),
+      tone: metarObservation ? (metarObservation.stale ? "warning" : "success") : "neutral",
+    },
+    {
+      id: "taf",
+      label: "机场预报",
+      value: buildTafHeadline(tafForecast, displayUnit),
+      detail: buildTafDetail(tafForecast, resolvedTimeZone, displayUnit),
+      tone: tafForecast ? (tafForecast.stale ? "warning" : "success") : "neutral",
     },
     {
       id: "range",
@@ -680,36 +820,39 @@ const summaryMetrics: KellySummaryMetric[] = [
     {
       id: "weather",
       label: "天气分析时间",
-      value: formatDateTime(snapshot.freshness.weatherGeneratedAt, timeZone),
+      value: formatDateTime(snapshot.freshness.weatherGeneratedAt, resolvedTimeZone),
       detail: `参考口径：${getSourceLabel(snapshot.weatherEvidence.currentReferenceSource)}`,
       tone: snapshot.weatherEvidence.stale ? "warning" : "success",
     },
     {
       id: "discovery",
       label: "市场目录时间",
-      value: formatDateTime(snapshot.freshness.marketDiscoveredAt, timeZone),
+      value: formatDateTime(snapshot.freshness.marketDiscoveredAt, resolvedTimeZone),
       detail: "Polymarket 市场发现快照时间",
       tone: snapshot.freshness.marketDiscoveredAt ? "accent" : "warning",
     },
     {
       id: "orderbook",
       label: "盘口快照时间",
-      value: formatDateTime(snapshot.freshness.orderbookFetchedAt, timeZone),
-      detail: selectedMarket ? `当前选中档位更新时间 ${formatDateTime(selectedMarket.updatedAt, timeZone)}` : "当前还没有盘口快照。",
+      value: formatDateTime(snapshot.freshness.orderbookFetchedAt, resolvedTimeZone),
+      detail:
+        selectedMarket
+          ? `当前选中档位更新时间 ${formatDateTime(selectedMarket.updatedAt, resolvedTimeZone)}`
+          : "当前还没有盘口快照。",
       tone: snapshot.freshness.orderbookFetchedAt ? "success" : "warning",
     },
     {
       id: "stream",
       label: "实时状态",
-      value: resolveStreamLabel(snapshot, streamState),
-      detail: resolveStreamDetail(snapshot, timeZone),
+      value: resolveReadableStreamLabel(snapshot, streamState),
+      detail: resolveStreamDetail(snapshot, resolvedTimeZone),
       tone: resolveStreamTone(snapshot, streamState),
     },
   ];
 
   return {
-    title: "Kelly 实验台",
-    subtitle: "先选日期，再看仓位建议和主表；完整题干退到右侧证据区。",
+    title: "Kelly 决策台",
+    subtitle: "先看日期和仓位建议，再看主表；完整题干放到右侧证据区。",
     displayUnit,
     locationId: activeLocationId,
     locationOptions: locations.map((location) => ({
@@ -726,7 +869,7 @@ const summaryMetrics: KellySummaryMetric[] = [
     dateChips: buildDateChips(
       snapshot.availableTargetDates.length ? snapshot.availableTargetDates : [snapshot.targetDate],
       snapshot.targetDate,
-      timeZone,
+      resolvedTimeZone,
     ),
     bankrollInput: draftControls.bankrollInput,
     minEdgeInput: draftControls.minEdgeInput,
@@ -739,21 +882,20 @@ const summaryMetrics: KellySummaryMetric[] = [
     ],
     refreshDisabled,
     draftDirty,
-    statusNote: draftDirty ? "参数已修改，点击“刷新分析”后应用。" : snapshot.warnings[0] ?? snapshot.streamHealth.message ?? null,
+    statusNote: draftDirty ? "参数已修改，点击“刷新分析”后应用。" : resolvePrimaryKellyWarning(snapshot.warnings) ?? snapshot.streamHealth.message ?? null,
     fieldErrors,
     marketUrl: selectedMarket?.marketUrl ?? snapshot.sourceLinks.marketUrls[0] ?? snapshot.sourceLinks.polymarketSearchUrl,
     syncMetrics,
     summaryMetrics,
     opportunities,
-    opportunityEmptyState: markets.length === 0 ? snapshot.warnings[0] ?? "当前没有可交易档位。" : "当前没有过线机会，先保留观察位。",
-    probability: buildProbability(snapshot, displayUnit),
+    opportunityEmptyState: markets.length === 0 ? resolvePrimaryKellyWarning(snapshot.warnings) ?? "当前没有可交易档位。" : "当前没有过线机会，先保留观察位。",
     markets,
     inactiveMarkets: inactiveRows,
-    marketEmptyState: snapshot.warnings[0] ?? "当前没有可展示的温度档位。",
+    marketEmptyState: resolvePrimaryKellyWarning(snapshot.warnings) ?? "当前没有可展示的温度档位。",
     unresolvedMarkets: [],
-    evidenceSections: buildEvidenceSections(snapshot, selectedMarketId, timeZone, displayUnit),
-    methodologyNotes: buildMethodologyNotes(snapshot, displayUnit),
-    methodologyModels: snapshot.methodology.models.map((model) => ({
+    evidenceSections: buildEvidenceSections(visibleSnapshot, selectedMarketId, resolvedTimeZone, displayUnit),
+    methodologyNotes: buildMethodologyNotes(visibleSnapshot, displayUnit),
+    methodologyModels: visibleSnapshot.methodology.models.map((model) => ({
       id: model.modelCode ?? model.modelName,
       modelLabel: model.modelCode ?? model.modelName,
       currentPredictionLabel: formatTempWithUnit(model.currentPredictionC),
@@ -774,6 +916,9 @@ const summaryMetrics: KellySummaryMetric[] = [
 
 export const KellyWorkbench = ({
   snapshot,
+  sourceMetadata,
+  intradaySignals,
+  marketReference,
   locations,
   activeLocationId,
   timezone,
@@ -797,6 +942,9 @@ export const KellyWorkbench = ({
   onRefresh,
 }: {
   snapshot: KellyWorkbenchResponse | null;
+  sourceMetadata?: DashboardSourceMetadata | null;
+  intradaySignals?: IntradaySignalsSummary | null;
+  marketReference?: MarketReferenceSummary | null;
   locations: LocationDirectoryEntry[];
   activeLocationId: string;
   timezone?: string;
@@ -823,6 +971,7 @@ export const KellyWorkbench = ({
   const [selectedOpportunityId, setSelectedOpportunityId] = useState<string | null>(null);
   const [stableSnapshot, setStableSnapshot] = useState<KellyWorkbenchResponse | null>(snapshot);
   const effectiveSnapshot = snapshot ?? stableSnapshot;
+  const resolvedTimeZone = effectiveSnapshot?.location.timezone ?? timezone;
   const hasSuccessfulSnapshot = stableSnapshot !== null;
   const showingFallbackSnapshot = !snapshot && hasSuccessfulSnapshot;
 
@@ -876,7 +1025,7 @@ export const KellyWorkbench = ({
             refreshDisabled,
             selectedMarketId,
             streamState,
-            timeZone: timezone,
+            timeZone: resolvedTimeZone,
           })
         : null,
     [
@@ -891,8 +1040,8 @@ export const KellyWorkbench = ({
       riskMode,
       selectedMarketId,
       effectiveSnapshot,
+      resolvedTimeZone,
       streamState,
-      timezone,
     ],
   );
   const renderErrorBanner = error
@@ -914,33 +1063,136 @@ export const KellyWorkbench = ({
   }, [data, renderErrorBanner]);
 
   if (!effectiveSnapshot || !renderData) {
+    const surfaceTitle = loading ? "正在准备 Kelly 决策台" : "Kelly 决策台暂不可用";
+    const surfaceDetail = loading
+      ? "同步盘口、天气参考与仓位参数，随后进入温度档位主表。"
+      : (error ?? "当前还没有可展示的 Kelly 快照。");
+
     return (
-      <section className="terminal-panel">
-        <div className="panel-section">
-          <div className="eyebrow">Kelly 实验台</div>
-          <h2 className="mt-3 text-xl font-semibold text-white">{loading ? "正在加载 Kelly 分析..." : "Kelly 实验台暂不可用"}</h2>
-          <p className="mt-3 text-sm text-white/64">{error ?? "当前还没有可展示的 Kelly 快照。"}</p>
+      <section className="terminal-panel kelly-shell kelly-shell--loading" aria-busy={loading}>
+        <div className="panel-section kelly-shell__inner kelly-loading-surface">
+          <header className="kelly-shell__header">
+            <div className="kelly-shell__hero">
+              <div className="eyebrow flex items-center gap-2">
+                <Orbit className={`h-4 w-4 kelly-shell__orbit${loading ? " is-loading" : ""}`} />
+                Kelly 决策台
+              </div>
+              <h2 className="kelly-shell__title">{surfaceTitle}</h2>
+              <p className="kelly-loading-copy">{surfaceDetail}</p>
+            </div>
+
+            <div className={`kelly-shell__signal${loading ? " is-refreshing" : " is-error"}`}>
+              <span className="kelly-shell__signal-dot" />
+              {loading ? "终端预热中" : "等待链路恢复"}
+            </div>
+          </header>
+
+          <div className="kelly-loading-steps" role="list" aria-label="Kelly 预热阶段">
+            {KELLY_LOADING_PHASES.map((phase) => (
+              <div key={phase.label} className="kelly-loading-step" role="listitem">
+                <span className="kelly-loading-step__dot" />
+                <div className="kelly-loading-step__copy">
+                  <strong>{phase.label}</strong>
+                  <span>{phase.detail}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="kelly-loading-layout">
+            <div className="kelly-loading-column">
+              <article className="kelly-loading-panel">
+                <div className="kelly-loading-panel__scan" />
+                <div className="kelly-loading-chip-row">
+                  <span className="kelly-skeleton kelly-loading-chip" />
+                  <span className="kelly-skeleton kelly-loading-chip" />
+                  <span className="kelly-skeleton kelly-loading-chip" />
+                </div>
+                <div className="kelly-loading-control-grid">
+                  <span className="kelly-skeleton kelly-loading-control" />
+                  <span className="kelly-skeleton kelly-loading-control" />
+                  <span className="kelly-skeleton kelly-loading-control" />
+                  <span className="kelly-skeleton kelly-loading-control is-wide" />
+                </div>
+              </article>
+
+              <article className="kelly-loading-panel">
+                <div className="kelly-loading-panel__eyebrow">温度档位主表</div>
+                <div className="kelly-loading-market-list">
+                  {Array.from({ length: 2 }).map((_, index) => (
+                    <div key={index} className="kelly-loading-market-card">
+                      <div className="kelly-loading-market-card__top">
+                        <div className="kelly-loading-market-card__hero">
+                          <span className="kelly-skeleton kelly-loading-line is-short" />
+                          <span className="kelly-skeleton kelly-loading-line is-wide" />
+                          <span className="kelly-skeleton kelly-loading-line is-mid" />
+                        </div>
+                        <div className="kelly-skeleton kelly-loading-market-card__decision" />
+                      </div>
+
+                      <div className="kelly-loading-market-card__book">
+                        <span className="kelly-skeleton kelly-loading-book" />
+                        <span className="kelly-skeleton kelly-loading-book" />
+                      </div>
+
+                      <div className="kelly-loading-market-card__meta">
+                        <span className="kelly-skeleton kelly-loading-metric" />
+                        <span className="kelly-skeleton kelly-loading-metric" />
+                        <span className="kelly-skeleton kelly-loading-metric" />
+                        <span className="kelly-skeleton kelly-loading-metric" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </article>
+            </div>
+
+            <aside className="kelly-loading-side">
+              <article className="kelly-loading-panel">
+                <div className="kelly-loading-panel__eyebrow">右侧核对区</div>
+                <div className="kelly-loading-side-grid">
+                  <span className="kelly-skeleton kelly-loading-side-card" />
+                  <span className="kelly-skeleton kelly-loading-side-card" />
+                  <span className="kelly-skeleton kelly-loading-side-card" />
+                </div>
+                <div className="kelly-loading-note-list">
+                  <span className="kelly-skeleton kelly-loading-line is-wide" />
+                  <span className="kelly-skeleton kelly-loading-line is-mid" />
+                  <span className="kelly-skeleton kelly-loading-line is-wide" />
+                  <span className="kelly-skeleton kelly-loading-line is-short" />
+                </div>
+              </article>
+            </aside>
+          </div>
         </div>
       </section>
     );
   }
 
   return (
-    <KellyWorkbenchShell
-      data={renderData}
-      disabled={refreshing}
-      refreshing={refreshing || (loading && showingFallbackSnapshot)}
-      selectedMarketId={selectedMarketId}
-      selectedOpportunityId={selectedOpportunityId}
-      onLocationChange={onLocationChange}
-      onTargetDateChange={onTargetDateChange}
-      onBankrollChange={onBankrollChange}
-      onMinEdgeChange={onMinEdgeChange}
-      onActualTemperatureChange={onActualTemperatureChange}
-      onRiskModeChange={onRiskModeChange}
-      onRefresh={onRefresh}
-      onSelectOpportunity={setSelectedOpportunityId}
-      onSelectMarket={setSelectedMarketId}
-    />
+    <div className="kelly-workbench-shell">
+      <KellySourceContractPanel
+        sourceMetadata={sourceMetadata}
+        intradaySignals={intradaySignals}
+        marketReference={marketReference}
+        timezone={resolvedTimeZone}
+      />
+      <KellyWorkbenchShell
+        data={renderData}
+        disabled={refreshing}
+        refreshing={refreshing || (loading && showingFallbackSnapshot)}
+        selectedMarketId={selectedMarketId}
+        selectedOpportunityId={selectedOpportunityId}
+        onLocationChange={onLocationChange}
+        onTargetDateChange={onTargetDateChange}
+        onBankrollChange={onBankrollChange}
+        onMinEdgeChange={onMinEdgeChange}
+        onActualTemperatureChange={onActualTemperatureChange}
+        onRiskModeChange={onRiskModeChange}
+        onRefresh={onRefresh}
+        onSelectOpportunity={setSelectedOpportunityId}
+        onSelectMarket={setSelectedMarketId}
+      />
+    </div>
   );
 };

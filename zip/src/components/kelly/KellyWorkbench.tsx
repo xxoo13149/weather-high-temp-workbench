@@ -7,7 +7,6 @@ import { KellyControlBar } from "./KellyControlBar";
 import { KellyEvidenceInspector } from "./KellyEvidenceInspector";
 import { KellyMarketTable } from "./KellyMarketTable";
 import { KellyOpportunityPanel } from "./KellyOpportunityPanel";
-import { KellyProbabilityStage } from "./KellyProbabilityStage";
 import "./kelly-workbench.css";
 
 export const KellyWorkbench = ({
@@ -61,11 +60,16 @@ export const KellyWorkbench = ({
         <header className="kelly-shell__header">
           <div className="kelly-shell__hero">
             <div className="eyebrow flex items-center gap-2">
-              <Orbit className="h-4 w-4 text-[var(--accent)]" />
+              <Orbit className={cn("h-4 w-4 text-[var(--accent)] kelly-shell__orbit", refreshing && "is-loading")} />
               Kelly 决策台
             </div>
             <h2 className="kelly-shell__title">{data.title}</h2>
             <p className="kelly-shell__subtitle">{data.subtitle}</p>
+          </div>
+
+          <div className={cn("kelly-shell__signal", refreshing && "is-refreshing")}>
+            <span className="kelly-shell__signal-dot" />
+            {refreshing ? "保持上一份快照并刷新盘口" : "盘口与证据已就绪"}
           </div>
         </header>
 
@@ -117,16 +121,12 @@ export const KellyWorkbench = ({
               selectedMarketId={resolvedSelectedMarketId}
               onSelectMarket={onSelectMarket}
             />
-
-            <KellyProbabilityStage probability={data.probability} selectedMarketId={resolvedSelectedMarketId} />
           </div>
 
           <aside className="kelly-side-column">
             <KellyEvidenceInspector
               syncMetrics={data.syncMetrics}
               sections={data.evidenceSections}
-              methodologyNotes={data.methodologyNotes}
-              methodologyModels={data.methodologyModels}
             />
           </aside>
         </div>

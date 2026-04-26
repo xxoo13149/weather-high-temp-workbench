@@ -6,7 +6,16 @@ import Fastify from "fastify";
 
 import { DEFAULT_LOCATION, LOCATION_DIRECTORY, LOCATION_REGISTRY } from "./config.js";
 import { AppError, isAppError } from "./domain/errors.js";
-import type { HourlyMode, LocationDirectoryEntry, LocationInfo, WeatherService } from "./domain/weather.js";
+import type {
+  DashboardMetarSnapshot,
+  DashboardTafSnapshot,
+  HourlyMode,
+  LocationDirectoryEntry,
+  LocationInfo,
+  WeatherService,
+} from "./domain/weather.js";
+import { normalizeDashboardMetarSnapshot } from "./domain/weather.js";
+import { buildDashboardEnhancements, buildLocationDirectory, buildMetricsText, buildSystemStatusResponse } from "./operational-metadata.js";
 import { MeteoblueWeatherService } from "./providers/meteoblue/service.js";
 import { registerKellyRoutes } from "./server/kelly-routes.js";
 
@@ -136,6 +145,11 @@ const parseLocationId = (raw: unknown): LocationInfo["id"] => {
 };
 
 const defaultFrontendDistDir = resolve(process.cwd(), "zip", "dist");
+const EMPTY_DASHBOARD_METAR_SNAPSHOT: DashboardMetarSnapshot = normalizeDashboardMetarSnapshot();
+const EMPTY_DASHBOARD_TAF_SNAPSHOT: DashboardTafSnapshot = {
+  forecast: null,
+  forecasts: [],
+};
 
 const staticContentTypes: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
@@ -175,22 +189,35 @@ const readFrontendAsset = async (frontendDistDir: string, requestedPath: string,
   }
 };
 
-const buildLocationDirectory = (): LocationDirectoryEntry[] =>
-  LOCATION_DIRECTORY.map((location) => ({
-    id: location.id,
-    code: location.code,
-    displayName: location.displayName,
-    displayNameZh: location.displayNameZh,
-    shortLabel: location.shortLabel,
-    cityName: location.cityName,
-    countryName: location.countryName,
-    timezone: location.timezone,
-    timezoneGroup: location.timezoneGroup,
-    enabled: location.enabled,
-    sortOrder: location.sortOrder,
-    weekPageUrl: location.weekPageUrl,
-    multimodelPageUrl: location.multimodelPageUrl,
-  }));
+const loadDashboardMetarSnapshot = async (
+  service: WeatherService,
+  locationId: LocationInfo["id"],
+): Promise<DashboardMetarSnapshot> => {
+  if (!service.getMetarSnapshot) {
+    return EMPTY_DASHBOARD_METAR_SNAPSHOT;
+  }
+
+  try {
+    return normalizeDashboardMetarSnapshot(await service.getMetarSnapshot(locationId));
+  } catch {
+    return EMPTY_DASHBOARD_METAR_SNAPSHOT;
+  }
+};
+
+const loadDashboardTafSnapshot = async (
+  service: WeatherService,
+  locationId: LocationInfo["id"],
+): Promise<DashboardTafSnapshot> => {
+  if (!service.getTafSnapshot) {
+    return EMPTY_DASHBOARD_TAF_SNAPSHOT;
+  }
+
+  try {
+    return await service.getTafSnapshot(locationId);
+  } catch {
+    return EMPTY_DASHBOARD_TAF_SNAPSHOT;
+  }
+};
 
 export const createApp = (
   service: WeatherService = new MeteoblueWeatherService(),
@@ -208,8 +235,59 @@ export const createApp = (
   const frontendDistDir = options.frontendDistDir ?? defaultFrontendDistDir;
   const buildId = process.env.BUILD_ID ?? `local-${Date.now().toString(36)}`;
   const startedAt = new Date().toISOString();
+  const serviceName = process.env.SERVICE_NAME?.trim() || "weather-service";
+  const watchdogStatusFile = process.env.KELLY_WATCHDOG_STATUS_FILE?.trim() || "";
 
-  app.get("/healthz", async () => ({ ok: true, buildId, startedAt }));
+  const readWatchdogStatus = async () => {
+    if (!watchdogStatusFile) {
+      return null;
+    }
+
+    try {
+      const raw = await readFile(watchdogStatusFile, "utf-8");
+      return JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  };
+
+  app.get("/healthz", async () => {
+    const runtime = service.getKellyRuntimeHealth?.();
+    const watchdog = await readWatchdogStatus();
+
+    return {
+      ok: true,
+      service: serviceName,
+      buildId,
+      startedAt,
+      ...(runtime ? { runtime } : {}),
+      ...(watchdog ? { watchdog } : {}),
+    };
+  });
+
+  app.get("/api/system/status", async () => {
+    const watchdog = await readWatchdogStatus();
+    return buildSystemStatusResponse({
+      service: serviceName,
+      buildId,
+      startedAt,
+      runtime: service.getSystemStatus?.() ?? null,
+      watchdog,
+    });
+  });
+
+  app.get("/metrics", async (request, reply) => {
+    const watchdog = await readWatchdogStatus();
+    const status = buildSystemStatusResponse({
+      service: serviceName,
+      buildId,
+      startedAt,
+      runtime: service.getSystemStatus?.() ?? null,
+      watchdog,
+    });
+    reply.code(200).header("content-type", "text/plain; version=0.0.4; charset=utf-8");
+    return reply.send(buildMetricsText(status));
+  });
 
   app.get("/api/weather/hourly", async (request) => {
     const query = (request.query as Record<string, unknown> | undefined) ?? {};
@@ -231,24 +309,44 @@ export const createApp = (
     const mode = parseMode(query.mode);
     const limit = parseLimit(query.limit);
 
-    const [hourly, multimodel, report] = await Promise.all([
+    const [hourly, multimodel, report, metar, taf] = await Promise.all([
       service.getHourly(locationId, mode, limit),
       service.getMultiModelStatus(locationId),
       service.getWeatherReport(locationId),
+      loadDashboardMetarSnapshot(service, locationId),
+      loadDashboardTafSnapshot(service, locationId),
     ]);
+    const dashboardEnhancements = buildDashboardEnhancements({
+      locationId,
+      hourly,
+      report,
+      multimodel,
+    });
 
-    const syncState = hourly.stale || report.stale ? "stale" : "fresh";
+    const syncState =
+      hourly.freshness === "fallback_error" || report.freshness === "fallback_error"
+        ? "fallback_error"
+        : "fresh";
+    const displayUnit = LOCATION_REGISTRY[locationId].fallbackDisplayUnit;
 
     return {
       generatedAt: new Date().toISOString(),
+      displayUnit,
       sync: {
         state: syncState,
-        label: syncState === "stale" ? "stale" : "synced",
+        freshness: syncState,
+        label:
+          syncState === "fallback_error"
+            ? "fallback_error"
+            : "synced",
         updatedAt: hourly.fetchedAt,
       },
       locationDirectory: buildLocationDirectory(),
       hourly,
       report,
+      metar,
+      taf,
+      ...dashboardEnhancements,
       multimodel: {
         ...multimodel,
         imageProxyUrl: `/api/weather/multimodel/image?allowStale=true&locationId=${encodeURIComponent(locationId)}`,
@@ -256,11 +354,13 @@ export const createApp = (
         sourceType: "official-relayed-image",
         parity: "exact-image-relay",
         statusLabel:
-          multimodel.imageFetchedAt ?? multimodel.lastSuccessAt
-            ? multimodel.stale
-              ? "stale"
-              : "fresh"
-            : "unavailable",
+          multimodel.imageStatus === "unavailable" && !multimodel.imageUrlFound
+            ? "unavailable"
+            : multimodel.freshness === "fallback_error"
+              ? "fallback_error"
+              : multimodel.freshness === "revalidating"
+                ? "revalidating"
+                : "ready",
       },
     };
   });

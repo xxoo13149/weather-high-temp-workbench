@@ -402,7 +402,7 @@ describe("kelly api regression", () => {
     await app.close();
   });
 
-  test("forwards Kelly stream messages over websocket without crashing the route handler", async () => {
+  test("emits an initialization status as the first websocket message", async () => {
     const closeMock = vi.fn();
     const service = createService();
     service.createKellyStream = vi.fn(async (_locationId, _options, onMessage) => {
@@ -441,7 +441,8 @@ describe("kelly api regression", () => {
     expect(payload).toMatchObject({
       type: "status",
       state: "connected",
-      reasonCode: "no_recent_market_motion",
+      reasonCode: "snapshot_loaded",
+      message: "实时流握手成功，正在初始化首轮快照。",
     });
     expect(service.createKellyStream).toHaveBeenCalledWith(
       "miami_mia",
@@ -454,6 +455,296 @@ describe("kelly api regression", () => {
     await vi.waitFor(() => {
       expect(closeMock).toHaveBeenCalledTimes(1);
     });
+    await app.close();
+  });
+
+  test("continues forwarding downstream Kelly messages after the initialization status", async () => {
+    const closeMock = vi.fn();
+    let releaseBootstrap: (() => void) | null = null;
+    const bootstrapGate = new Promise<void>((resolve) => {
+      releaseBootstrap = resolve;
+    });
+    const service = createService();
+    service.createKellyStream = vi.fn(async (_locationId, _options, onMessage) => {
+      await bootstrapGate;
+      onMessage({
+        type: "status",
+        generatedAt: "2026-03-27T15:32:00.000Z",
+        state: "connected",
+        reasonCode: "no_recent_market_motion",
+        message: "实时流已连接，最近还没有新的盘口变动。",
+        lastSignalAt: null,
+        lastRepricedAt: "2026-03-27T15:32:00.000Z",
+      });
+
+      return {
+        close: closeMock,
+      };
+    });
+
+    const app = createApp(service, { frontendDistDir });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}/api/weather/kelly/stream?locationId=miami_mia&targetDate=2026-03-28`,
+    );
+    const received: Array<Record<string, unknown>> = [];
+
+    const awaitOpen = new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+    const awaitMessages = new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+      socket.on("message", (buffer) => {
+        received.push(JSON.parse(buffer.toString()) as Record<string, unknown>);
+        if (received.length >= 2) {
+          resolve(received);
+        }
+      });
+      socket.once("error", reject);
+    });
+
+    await awaitOpen;
+    const releaseAfterOpen =
+      releaseBootstrap ??
+      (() => {
+        throw new Error("Expected bootstrap gate to be captured.");
+      });
+    releaseAfterOpen();
+
+    const [initialPayload, forwardedPayload] = await awaitMessages;
+    expect(initialPayload).toMatchObject({
+      type: "status",
+      state: "connected",
+      reasonCode: "snapshot_loaded",
+    });
+
+    expect(forwardedPayload).toMatchObject({
+      type: "status",
+      state: "connected",
+      reasonCode: "no_recent_market_motion",
+      lastRepricedAt: "2026-03-27T15:32:00.000Z",
+    });
+    expect(service.createKellyStream).toHaveBeenCalledWith(
+      "miami_mia",
+      expect.objectContaining({
+        targetDate: "2026-03-28",
+      }),
+      expect.any(Function),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const awaitClose = new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+    });
+    socket.close();
+    await awaitClose;
+    await app.close();
+  });
+
+  test("closes a late bootstrap handle when the client disconnects before initialization finishes", async () => {
+    const closeMock = vi.fn();
+    let releaseBootstrap: (() => void) | null = null;
+    const bootstrapGate = new Promise<void>((resolve) => {
+      releaseBootstrap = resolve;
+    });
+    const service = createService();
+    service.createKellyStream = vi.fn(async () => {
+      await bootstrapGate;
+      return {
+        close: closeMock,
+      };
+    });
+
+    const app = createApp(service, { frontendDistDir });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}/api/weather/kelly/stream?locationId=miami_mia&targetDate=2026-03-28`,
+    );
+
+    const awaitOpen = new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+    const awaitFirstMessage = new Promise<Record<string, unknown>>((resolve, reject) => {
+      socket.once("message", (buffer) => {
+        resolve(JSON.parse(buffer.toString()) as Record<string, unknown>);
+      });
+      socket.once("error", reject);
+    });
+
+    await awaitOpen;
+    const initialPayload = await awaitFirstMessage;
+    expect(initialPayload).toMatchObject({
+      type: "status",
+      reasonCode: "snapshot_loaded",
+    });
+
+    const awaitClose = new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+    });
+    socket.close();
+    await awaitClose;
+
+    const releaseAfterClose =
+      releaseBootstrap ??
+      (() => {
+        throw new Error("Expected bootstrap gate to be captured.");
+      });
+    releaseAfterClose();
+    await vi.waitFor(() => {
+      expect(closeMock).toHaveBeenCalledTimes(1);
+    });
+
+    await app.close();
+  });
+
+  test("preserves the service context when bootstrapping websocket streams", async () => {
+    const closeMock = vi.fn();
+    const service = createService() as WeatherService & { streamBootstrapped?: boolean };
+    service.createKellyStream = vi.fn(function (this: typeof service, _locationId, _options, onMessage) {
+      this.streamBootstrapped = true;
+      onMessage({
+        type: "status",
+        generatedAt: "2026-03-27T15:32:00.000Z",
+        state: "connected",
+        reasonCode: "ws_connected",
+        message: "connected",
+        lastSignalAt: null,
+        lastRepricedAt: "2026-03-27T15:32:00.000Z",
+      });
+
+      return Promise.resolve({
+        close: closeMock,
+      });
+    });
+
+    const app = createApp(service, { frontendDistDir });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}/api/weather/kelly/stream?locationId=miami_mia&targetDate=2026-03-28`,
+    );
+    const received: Array<Record<string, unknown>> = [];
+
+    const awaitOpen = new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+    const awaitMessages = new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+      socket.on("message", (buffer) => {
+        received.push(JSON.parse(buffer.toString()) as Record<string, unknown>);
+        if (received.length >= 2) {
+          resolve(received);
+        }
+      });
+      socket.once("error", reject);
+    });
+
+    await awaitOpen;
+
+    const [initialPayload, connectedPayload] = await awaitMessages;
+    expect(initialPayload).toMatchObject({
+      type: "status",
+      reasonCode: "snapshot_loaded",
+    });
+    expect(connectedPayload).toMatchObject({
+      type: "status",
+      reasonCode: "ws_connected",
+    });
+    expect(service.streamBootstrapped).toBe(true);
+
+    const awaitClose = new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+    });
+    socket.close();
+    await awaitClose;
+    await vi.waitFor(() => {
+      expect(closeMock).toHaveBeenCalledTimes(1);
+    });
+    await app.close();
+  });
+
+  test("retries websocket bootstrap once after a transient initialization failure", async () => {
+    let attempt = 0;
+    const service = createService();
+    service.createKellyStream = vi.fn(async (_locationId, _options, onMessage) => {
+      attempt += 1;
+      if (attempt === 1) {
+        throw new Error("bootstrap failed");
+      }
+
+      onMessage({
+        type: "status",
+        generatedAt: "2026-03-27T15:32:00.000Z",
+        state: "connected",
+        reasonCode: "ws_connected",
+        message: "connected",
+        lastSignalAt: null,
+        lastRepricedAt: "2026-03-27T15:32:00.000Z",
+      });
+
+      return {
+        close: vi.fn(),
+      };
+    });
+
+    const app = createApp(service, { frontendDistDir });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}/api/weather/kelly/stream?locationId=miami_mia&targetDate=2026-03-28`,
+    );
+    const received: Array<Record<string, unknown>> = [];
+
+    const awaitOpen = new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve());
+      socket.once("error", reject);
+    });
+    const awaitMessages = new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+      socket.on("message", (buffer) => {
+        received.push(JSON.parse(buffer.toString()) as Record<string, unknown>);
+        if (received.length >= 3) {
+          resolve(received);
+        }
+      });
+      socket.once("error", reject);
+    });
+
+    await awaitOpen;
+
+    const [firstPayload, secondPayload, thirdPayload] = await awaitMessages;
+    expect(firstPayload).toMatchObject({
+      type: "status",
+      reasonCode: "snapshot_loaded",
+    });
+
+    expect(secondPayload).toMatchObject({
+      type: "status",
+      state: "degraded",
+      reasonCode: "upstream_error",
+      message: "Kelly stream bootstrap hit a transient error, retrying once.",
+    });
+
+    expect(thirdPayload).toMatchObject({
+      type: "status",
+      state: "connected",
+      reasonCode: "ws_connected",
+      lastRepricedAt: "2026-03-27T15:32:00.000Z",
+    });
+
+    expect(service.createKellyStream).toHaveBeenCalledTimes(2);
+
+    const awaitClose = new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+    });
+    socket.close();
+    await awaitClose;
     await app.close();
   });
 });

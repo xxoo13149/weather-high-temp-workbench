@@ -66,6 +66,7 @@ const createBuildArgs = ({
     periodHours: 1,
     sourceType: "week-table-1h" as const,
     stale: false,
+    freshness: "fresh",
     pageUrl: location.weekPageUrl,
     parserVersion: "test",
     items: [
@@ -134,6 +135,7 @@ const createBuildArgs = ({
     fetchedAt: "2026-03-28T10:00:00.000Z",
     sourceObservedAt: "2026-03-28T10:00:00.000Z",
     stale: false,
+    freshness: "fresh",
     cacheHit: true,
     pageUrl: location.weekPageUrl,
     parserVersion: "test",
@@ -158,13 +160,21 @@ const createBuildArgs = ({
     warnings: [],
   },
   metarObservation: null,
+  tafForecast: null,
   insight: {
     location: { id: location.id, name: location.name, timezone: location.timezone },
     fetchedAt: "2026-03-28T10:00:00.000Z",
     stale: false,
+    freshness: "fresh",
     cacheHit: true,
     pageUrl: location.multimodelPageUrl,
     sourceType: "meteoblue-page-highcharts" as const,
+    displayUnit: location.fallbackDisplayUnit,
+    fallbackDisplayUnit: location.fallbackDisplayUnit,
+    requestedTimestamp: "2026-03-28T16:00:00-04:00",
+    requestedTimestampValid: true,
+    resolvedTimestamp: "2026-03-28T16:00:00-04:00",
+    resolvedTimestampReason: "requested" as const,
     selectedTimestamp: "2026-03-28T16:00:00-04:00",
     selectedTimestampReason: "requested" as const,
     availableTimestamps: ["2026-03-28T16:00:00-04:00"],
@@ -192,11 +202,18 @@ const createBuildArgs = ({
     location: { id: location.id, name: location.name, timezone: location.timezone },
     fetchedAt: "2026-03-28T10:00:00.000Z",
     stale: false,
+    freshness: "fresh",
     cacheHit: true,
     pageUrl: location.multimodelPageUrl,
     sourceType: "meteoblue-page-highcharts" as const,
+    displayUnit: location.fallbackDisplayUnit,
+    fallbackDisplayUnit: location.fallbackDisplayUnit,
     requestedTimestamp: "2026-03-28T16:00:00-04:00",
+    requestedTimestampValid: true,
+    resolvedTimestamp: "2026-03-28T16:00:00-04:00",
+    resolvedTimestampReason: "requested" as const,
     selectedTimestamp: "2026-03-28T16:00:00-04:00",
+    selectedTimestampReason: "requested" as const,
     availableTimestamps: ["2026-03-28T16:00:00-04:00"],
     bucketSizeC: 1,
     modelCount: 3,
@@ -428,6 +445,50 @@ describe("buildKellyWorkbench", () => {
       selectedSide: "yes",
       note: "测试帧：主仓行情。",
     });
+  });
+
+  test("includes TAF evidence when an airport forecast is available", () => {
+    const args = createBuildArgs();
+    args.tafForecast = {
+      location: { id: location.id, name: location.name, timezone: location.timezone },
+      stationId: "KMIA",
+      stationName: "Miami Intl",
+      issuedAt: "2026-03-28T18:00:00.000Z",
+      validFrom: "2026-03-28T18:00:00.000Z",
+      validTo: "2026-03-29T06:00:00.000Z",
+      rawTaf: "TAF KMIA 281720Z 2818/2924 11010KT P6SM SCT025",
+      sourceUrl: "https://metarcentral.com/airport/KMIA/taf",
+      officialSourceUrl: "https://aviationweather.gov/api/data/taf?format=json&ids=KMIA",
+      activeForecast: {
+        changeLabel: "base",
+        plainEnglish: "Visibility will be good at 10 km.",
+        timeFrom: "2026-03-28T18:00:00.000Z",
+        timeTo: "2026-03-29T00:00:00.000Z",
+        visibilityKm: 10,
+        clouds: ["SCT025"],
+        windDirectionDegrees: 110,
+        windSpeedKts: 10,
+        windGustKts: null,
+        flightCategory: "VFR",
+      },
+      fetchedAt: "2026-03-28T18:01:00.000Z",
+      stale: false,
+      freshness: "fresh",
+      cacheHit: true,
+    };
+
+    const result = buildKellyWorkbench(args);
+
+    expect(result.weatherEvidence.tafForecast).toMatchObject({
+      stationId: "KMIA",
+      activeForecast: {
+        visibilityKm: 10,
+        flightCategory: "VFR",
+        clouds: ["SCT025"],
+      },
+      sourceUrl: "https://metarcentral.com/airport/KMIA/taf",
+    });
+    expect(result.weatherEvidence.stale).toBe(false);
   });
 
   test("falls back to an observation when no market clears the execution threshold", () => {
@@ -697,6 +758,7 @@ describe("buildKellyWorkbench", () => {
       sourceUrl: "https://aviationweather.gov/api/data/metar?format=json&ids=KMIA",
       fetchedAt: "2026-03-28T19:50:00.000Z",
       stale: false,
+      freshness: "fresh",
       cacheHit: true,
     };
     args.discoveryCandidates = [
@@ -792,6 +854,7 @@ describe("buildKellyWorkbench", () => {
         sourceUrl: "https://aviationweather.gov/api/data/metar?format=json&ids=KMIA",
         fetchedAt: "2026-03-28T20:05:00.000Z",
         stale: false,
+        freshness: "fresh",
         cacheHit: true,
       };
       args.discoveryCandidates = [
@@ -856,6 +919,7 @@ describe("buildKellyWorkbench", () => {
       sourceUrl: "https://aviationweather.gov/api/data/metar?format=json&ids=KMIA&hours=24",
       fetchedAt: "2026-03-28T20:00:00.000Z",
       stale: false,
+      freshness: "fresh",
       cacheHit: true,
     };
 
@@ -947,6 +1011,7 @@ describe("buildKellyWorkbench", () => {
         sourceUrl: "https://aviationweather.gov/api/data/metar?format=json&ids=KMIA",
         fetchedAt: "2026-03-28T20:05:00.000Z",
         stale: false,
+        freshness: "fresh",
         cacheHit: true,
       };
 
@@ -970,13 +1035,13 @@ describe("buildKellyWorkbench", () => {
     }
   });
 
-  test("defaults display unit to Celsius when no markets exist", () => {
+  test("defaults display unit to the location fallback when no markets exist", () => {
     const args = createBuildArgs();
     args.discoveryCandidates = [];
     args.orderBooks = new Map();
 
     const result = buildKellyWorkbench(args);
     expect(result.markets).toHaveLength(0);
-    expect(result.displayUnit).toBe("C");
+    expect(result.displayUnit).toBe(args.location.fallbackDisplayUnit);
   });
 });

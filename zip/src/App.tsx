@@ -2,6 +2,7 @@ import { lazy, startTransition, Suspense, useEffect, useMemo, useRef, useState }
 
 import { getErrorMessage, weatherApi } from "./api";
 import { CommandHeader } from "./components/CommandHeader";
+import { HomeReferenceCard } from "./components/HomeReferenceCard";
 import { InsightCard } from "./components/InsightCard";
 import { LocationRail } from "./components/LocationRail";
 import { TerminalBackdrop } from "./components/terminal/TerminalBackdrop";
@@ -33,7 +34,13 @@ import {
   type InsightViewModel,
 } from "./mappers";
 import { mergeKellyStreamPatches } from "./kelly";
-import type { DockTimezoneGroup, KellyRiskMode, KellyStreamMessage, KellyWorkbenchResponse } from "./types";
+import type {
+  DockTimezoneGroup,
+  KellyRiskMode,
+  KellyStreamMessage,
+  KellyWorkbenchResponse,
+} from "./types";
+import { convertTemperatureToC, formatTemperatureInputValue } from "./utils";
 
 type AppPath = "/" | "/analysis" | "/kelly";
 type RefreshState = "idle" | "pending" | "success" | "error";
@@ -45,13 +52,23 @@ type AnalysisDataEnvelope<T> = {
   generatedAt: string;
   data: T;
 };
+type AnalysisSnapshot = {
+  key: string;
+  locationId: string;
+  insight: InsightViewModel;
+  distribution: DistributionViewModel;
+};
 type WarmCacheEntry<T> = {
   cachedAt: number;
   data: T;
 };
+type InFlightEntry<T> = {
+  startedAt: number;
+  promise: Promise<T>;
+};
 type LocationTransitionState = {
   pendingLocationId: string | null;
-  stage: "idle" | "dashboard" | "warming";
+  stage: "idle" | "dashboard";
 };
 type WarmLocationTargets = {
   home: boolean;
@@ -66,6 +83,7 @@ interface RouteState extends AnalysisWorkspaceState {
   bankroll: number;
   riskMode: KellyRiskMode;
   minEdge: number;
+  kellyActualTemperatureC: number | null;
 }
 
 type KellyDraftControls = {
@@ -91,11 +109,20 @@ type ParsedKellyDraftControls = {
 const KELLY_DEFAULT_BANKROLL = 1000;
 const KELLY_DEFAULT_MIN_EDGE = 0.02;
 const SILENT_REFRESH_STALE_MS = 10 * 60 * 1000;
+const MOBILE_LAYOUT_MEDIA_QUERY = "(max-width: 900px)";
+const DASHBOARD_WARM_CACHE_TTL_MS = SILENT_REFRESH_STALE_MS;
+const DASHBOARD_PREWARM_CONCURRENCY = 2;
 const LOCATION_PREWARM_DELAY_MS = 180;
 const KELLY_DATE_WARM_DELAY_MS = 220;
+// Cross-date warm issues two extra Kelly snapshots right after bootstrap.
+const ENABLE_KELLY_DATE_WARM = false;
 const KELLY_STREAM_RECONNECT_BASE_MS = 1_500;
 const KELLY_STREAM_RECONNECT_MAX_MS = 12_000;
-
+const SHARED_IN_FLIGHT_STALE_MS = 15_000;
+const DASHBOARD_SNAPSHOT_CLIENT_TIMEOUT_MS = 20_000;
+const KELLY_SNAPSHOT_CLIENT_TIMEOUT_MS = 20_000;
+const KELLY_FOCUS_RECOVERY_STALE_MS = 20_000;
+const KELLY_FOCUS_RECOVERY_COOLDOWN_MS = 1_500;
 const parseNumber = (value: string | null) => {
   if (!value) {
     return null;
@@ -107,12 +134,88 @@ const parseNumber = (value: string | null) => {
 
 const formatKellyMinEdgeInput = (minEdge: number) => (minEdge * 100).toFixed(1);
 
-const buildKellyDraftFromRoute = (state: Pick<RouteState, "bankroll" | "minEdge" | "riskMode" | "actualTemperatureC">): KellyDraftControls => ({
+const detectMobileLayout = () =>
+  typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia(MOBILE_LAYOUT_MEDIA_QUERY).matches
+    : false;
+
+const buildKellyDraftFromRoute = (
+  state: Pick<RouteState, "bankroll" | "minEdge" | "riskMode" | "kellyActualTemperatureC">,
+): KellyDraftControls => ({
   bankrollInput: String(state.bankroll),
   minEdgeInput: formatKellyMinEdgeInput(state.minEdge),
   riskMode: state.riskMode,
-  actualTemperatureText: state.actualTemperatureC !== null ? String(state.actualTemperatureC) : "",
+  actualTemperatureText: state.kellyActualTemperatureC !== null ? String(state.kellyActualTemperatureC) : "",
 });
+
+const createAbortError = () => new DOMException("The operation was aborted.", "AbortError");
+
+const awaitAbortable = <T,>(promise: Promise<T>, signal: AbortSignal) => {
+  if (signal.aborted) {
+    return Promise.reject(createAbortError());
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(createAbortError());
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+};
+
+const withClientTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> => {
+  let timerId: number | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timerId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timerId !== null) {
+      window.clearTimeout(timerId);
+    }
+  }
+};
+
+const canReuseKellyWarmSnapshot = (snapshot: KellyWorkbenchResponse) =>
+  snapshot.markets.length > 0 || snapshot.inactiveMarkets.length > 0 || snapshot.streamHealth.state !== "unavailable";
+
+const readReusableInFlight = <T,>(cache: Map<string, InFlightEntry<T>>, key: string) => {
+  const entry = cache.get(key);
+  if (!entry) {
+    return null;
+  }
+
+  if (Date.now() - entry.startedAt > SHARED_IN_FLIGHT_STALE_MS) {
+    cache.delete(key);
+    return null;
+  }
+
+  return entry;
+};
+
+const parseIsoTime = (value: string | null | undefined) => {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
 
 const parseKellyDraftControls = (draft: KellyDraftControls): {
   parsed: ParsedKellyDraftControls | null;
@@ -166,14 +269,17 @@ const parseKellyDraftControls = (draft: KellyDraftControls): {
 const parseRouteState = (): RouteState => {
   const url = new URL(window.location.href);
   const pathname = url.pathname === "/analysis" ? "/analysis" : url.pathname === "/kelly" ? "/kelly" : "/";
+  const legacyActualTemperature = parseNumber(url.searchParams.get("actualTemperatureC"));
+  const kellyActualTemperature = parseNumber(url.searchParams.get("kellyActualTemperatureC"));
+  const selectedHourlyTimestamp = url.searchParams.get("selectedHour");
 
   return {
     path: pathname,
     tab: url.searchParams.get("tab") === "image" ? "image" : "models",
     locationId: url.searchParams.get("locationId") ?? CONFIG.location.DEFAULT_ID,
-    selectedInsightTimestamp: url.searchParams.get("timestamp"),
-    actualTemperatureC: parseNumber(url.searchParams.get("actualTemperatureC")),
-    selectedHourlyTimestamp: url.searchParams.get("selectedHour"),
+    selectedInsightTimestamp: url.searchParams.get("timestamp") ?? (pathname === "/kelly" ? null : selectedHourlyTimestamp),
+    actualTemperatureC: pathname === "/kelly" ? null : legacyActualTemperature,
+    selectedHourlyTimestamp,
     targetDate: url.searchParams.get("targetDate"),
     bankroll: parseNumber(url.searchParams.get("bankroll")) ?? KELLY_DEFAULT_BANKROLL,
     riskMode:
@@ -183,6 +289,7 @@ const parseRouteState = (): RouteState => {
         ? (url.searchParams.get("riskMode") as KellyRiskMode)
         : "balanced",
     minEdge: parseNumber(url.searchParams.get("minEdge")) ?? KELLY_DEFAULT_MIN_EDGE,
+    kellyActualTemperatureC: kellyActualTemperature ?? (pathname === "/kelly" ? legacyActualTemperature : null),
   };
 };
 
@@ -207,7 +314,7 @@ const buildRouteUrl = (state: RouteState) => {
     url.searchParams.set("timestamp", state.selectedInsightTimestamp);
   }
 
-  if (state.actualTemperatureC !== null) {
+  if (state.path !== "/kelly" && state.actualTemperatureC !== null) {
     url.searchParams.set("actualTemperatureC", String(state.actualTemperatureC));
   }
 
@@ -216,6 +323,9 @@ const buildRouteUrl = (state: RouteState) => {
   }
 
   if (state.path === "/kelly") {
+    if (state.kellyActualTemperatureC !== null) {
+      url.searchParams.set("kellyActualTemperatureC", String(state.kellyActualTemperatureC));
+    }
     if (state.bankroll !== KELLY_DEFAULT_BANKROLL) {
       url.searchParams.set("bankroll", String(state.bankroll));
     }
@@ -244,12 +354,12 @@ const commitRouteState = (state: RouteState, mode: "replace" | "push" = "replace
 
 const resolveDefaultReferenceTemperature = (
   dashboard: DashboardViewModel | null,
-  insightTimestamp: string | null,
+  weatherTimestamp: string | null,
 ) => {
   const items = dashboard?.hourly.items ?? [];
 
-  if (insightTimestamp) {
-    const exact = items.find((item) => item.timestamp === insightTimestamp && typeof item.temperatureC === "number");
+  if (weatherTimestamp) {
+    const exact = items.find((item) => item.timestamp === weatherTimestamp && typeof item.temperatureC === "number");
     if (exact && typeof exact.temperatureC === "number") {
       return exact.temperatureC;
     }
@@ -263,35 +373,60 @@ const resolveDefaultReferenceTemperature = (
   return items.find((item) => typeof item.temperatureC === "number")?.temperatureC ?? null;
 };
 
-const resolveTodayForTimezone = (timeZone: string) =>
-  new Intl.DateTimeFormat("en-CA", {
+const resolveDateKeyForTimezone = (value: Date, timeZone: string) => {
+  const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(new Date());
+  });
+  const parts = formatter.formatToParts(value);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+
+  if (!year || !month || !day) {
+    throw new Error(`Could not resolve local date parts for time zone '${timeZone}'.`);
+  }
+
+  return `${year}-${month}-${day}`;
+};
+
+const resolveTodayForTimezone = (timeZone: string) => resolveDateKeyForTimezone(new Date(), timeZone);
+const resolveKellyTargetDateForSelection = (timeZone: string, selectedTimestamp: string | null) =>
+  (selectedTimestamp ? resolveDateKeyForTimezone(new Date(selectedTimestamp), timeZone) : null) ??
+  resolveTodayForTimezone(timeZone);
 
 const DEFAULT_ACTIVE_TIMEZONE_GROUP: TimezoneGroup = "asia";
 
 const buildAnalysisBatchKey = (
   locationId: string | null | undefined,
   selectedTimestamp: string | null | undefined,
-  generatedAt: string | null | undefined,
 ) => {
-  if (!locationId || !selectedTimestamp || !generatedAt) {
+  if (!locationId || !selectedTimestamp) {
     return null;
   }
 
-  return `${locationId}::${selectedTimestamp}::${generatedAt}`;
+  return `${locationId}::${selectedTimestamp}`;
 };
 
 const WARM_CACHE_TTL_MS = 60_000;
 const KELLY_WARM_CACHE_TTL_MS = 60_000;
 const LOCATION_TEMPERATURE_TTL_MS = 15 * 60_000;
-const LOCATION_TEMPERATURE_CONCURRENCY = 3;
 
 const normalizeNumberKeyPart = (value: number | null | undefined) =>
   typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "auto";
+
+const pickAlignedAnalysisEnvelope = <T,>(
+  envelope: AnalysisDataEnvelope<T> | null,
+  locationId: string,
+) => {
+  if (!envelope) {
+    return null;
+  }
+
+  return envelope.locationId === locationId ? envelope : null;
+};
 
 const buildInsightWarmKey = (
   locationId: string,
@@ -299,8 +434,10 @@ const buildInsightWarmKey = (
   actualTemperatureC: number | null,
 ) => `${locationId}::${selectedTimestamp ?? "latest"}::${normalizeNumberKeyPart(actualTemperatureC)}`;
 
-const buildDistributionWarmKey = (locationId: string, selectedTimestamp: string | null) =>
-  `${locationId}::${selectedTimestamp ?? "latest"}`;
+const buildDistributionWarmKey = (
+  locationId: string,
+  selectedTimestamp: string | null,
+) => `${locationId}::${selectedTimestamp ?? "latest"}`;
 
 const buildKellyWarmKey = ({
   locationId,
@@ -347,15 +484,6 @@ const readWarmCacheEntry = <T,>(
   return entry.data;
 };
 
-const readWarmCacheAge = <T,>(cache: Map<string, WarmCacheEntry<T>>, key: string) => {
-  const entry = cache.get(key);
-  if (!entry) {
-    return Number.POSITIVE_INFINITY;
-  }
-
-  return Date.now() - entry.cachedAt;
-};
-
 const writeWarmCacheEntry = <T,>(cache: Map<string, WarmCacheEntry<T>>, key: string, data: T) => {
   cache.set(key, {
     cachedAt: Date.now(),
@@ -365,36 +493,50 @@ const writeWarmCacheEntry = <T,>(cache: Map<string, WarmCacheEntry<T>>, key: str
   return data;
 };
 
+const invalidateWarmCacheByLocation = <T,>(cache: Map<string, WarmCacheEntry<T>>, locationId: string) => {
+  const prefix = `${locationId}::`;
+  for (const key of cache.keys()) {
+    if (key.startsWith(prefix)) {
+      cache.delete(key);
+    }
+  }
+};
+
 const resolveTimezoneGroupForLocation = (
   locationDirectory: DashboardViewModel["locationDirectory"] | undefined,
   locationId: string,
 ): TimezoneGroup | null =>
   (locationDirectory?.find((location) => location.id === locationId)?.timezoneGroup as TimezoneGroup | undefined) ?? null;
 
+const resolveDisplayUnitForLocation = (
+  locationDirectory: DashboardViewModel["locationDirectory"] | undefined,
+  locationId: string,
+) => locationDirectory?.find((location) => location.id === locationId)?.displayUnit ?? null;
+
 const buildWarmLocationTargets = (path: AppPath, tab: AnalysisWorkspaceState["tab"]): WarmLocationTargets => {
   if (path === "/kelly") {
     return {
-      home: true,
-      analysis: true,
-      kelly: false,
-      image: true,
+      home: false,
+      analysis: false,
+      kelly: true,
+      image: false,
     };
   }
 
   if (path === "/analysis") {
     return {
-      home: true,
-      analysis: tab === "image",
-      kelly: true,
-      image: tab === "models",
+      home: false,
+      analysis: tab === "models",
+      kelly: false,
+      image: tab === "image",
     };
   }
 
   return {
-    home: false,
-    analysis: true,
-    kelly: true,
-    image: true,
+    home: true,
+    analysis: false,
+    kelly: false,
+    image: false,
   };
 };
 
@@ -460,6 +602,7 @@ const compactKellySnapshotForClient = (snapshot: KellyWorkbenchResponse): KellyW
 
 export default function App() {
   const [routeState, setRouteState] = useState<RouteState>(() => parseRouteState());
+  const [analysisTab, setAnalysisTab] = useState<RouteState["tab"]>(routeState.tab);
   const initialManualTemperatureText = routeState.actualTemperatureC !== null ? String(routeState.actualTemperatureC) : "";
   const [dashboard, setDashboard] = useState<DashboardViewModel | null>(null);
   const [insight, setInsight] = useState<InsightViewModel | null>(null);
@@ -476,11 +619,12 @@ export default function App() {
     bankroll: routeState.bankroll,
     riskMode: routeState.riskMode,
     minEdge: routeState.minEdge,
-    actualTemperatureC: routeState.actualTemperatureC,
+    kellyActualTemperatureC: routeState.kellyActualTemperatureC,
   }));
   const [kellyDraftControls, setKellyDraftControls] = useState(() => buildKellyDraftFromRoute(routeState));
 
   const [railExpanded, setRailExpanded] = useState(false);
+  const [isMobileLayout, setIsMobileLayout] = useState(detectMobileLayout);
   const [browsingTimezoneGroup, setBrowsingTimezoneGroup] = useState<TimezoneGroup | null>(null);
   const [manualTemperatureText, setManualTemperatureText] = useState(initialManualTemperatureText);
   const [referenceTemperatureMode, setReferenceTemperatureMode] = useState<"default" | "manual">(
@@ -495,13 +639,10 @@ export default function App() {
     stage: "idle",
   });
   const [refreshState, setRefreshState] = useState<RefreshState>("idle");
+  const [manualAnalysisRefreshPending, setManualAnalysisRefreshPending] = useState(false);
+  const [analysisReloadNonce, setAnalysisReloadNonce] = useState(0);
   const [lastConsistentAnalysisKey, setLastConsistentAnalysisKey] = useState<string | null>(null);
-  const [analysisSnapshot, setAnalysisSnapshot] = useState<{
-    key: string;
-    locationId: string;
-    insight: InsightViewModel;
-    distribution: DistributionViewModel;
-  } | null>(null);
+  const [analysisSnapshot, setAnalysisSnapshot] = useState<AnalysisSnapshot | null>(null);
   const [latestInsightEnvelope, setLatestInsightEnvelope] = useState<AnalysisDataEnvelope<InsightViewModel> | null>(null);
   const [latestDistributionEnvelope, setLatestDistributionEnvelope] = useState<AnalysisDataEnvelope<DistributionViewModel> | null>(null);
 
@@ -515,23 +656,33 @@ export default function App() {
   const refreshResetTimerRef = useRef<number | null>(null);
   const refreshInFlightRef = useRef(false);
   const refreshInFlightLocationRef = useRef<string | null>(null);
+  const refreshInFlightManualRef = useRef(false);
   const lastDashboardRefreshAtRef = useRef(0);
+  const dashboardRequestStartedAtRef = useRef(0);
   const locationTransitionInFlightRef = useRef(false);
   const locationTransitionSeqRef = useRef(0);
   const dashboardRequestSeqRef = useRef(0);
   const railScrollLockYRef = useRef(0);
-  const dashboardAbortRef = useRef<AbortController | null>(null);
+  const transitionDashboardAbortRef = useRef<AbortController | null>(null);
+  const refreshDashboardAbortRef = useRef<AbortController | null>(null);
   const insightAbortRef = useRef<AbortController | null>(null);
   const distributionAbortRef = useRef<AbortController | null>(null);
+  const analysisRequestEpochRef = useRef(0);
   const kellyAbortRef = useRef<AbortController | null>(null);
   const warmAbortRef = useRef<AbortController | null>(null);
   const kellyDateWarmAbortRef = useRef<AbortController | null>(null);
   const kellyRequestSeqRef = useRef(0);
+  const kellyRequestStartedAtRef = useRef(0);
+  const kellyFocusRecoveryAtRef = useRef(0);
   const kellySocketRef = useRef<WebSocket | null>(null);
+  const kellySocketSuppressedRef = useRef<WebSocket | null>(null);
   const kellySocketReconnectTimerRef = useRef<number | null>(null);
   const kellySocketRetryCountRef = useRef(0);
   const dashboardWarmCacheRef = useRef<Map<string, WarmCacheEntry<DashboardViewModel>>>(
     new Map<string, WarmCacheEntry<DashboardViewModel>>(),
+  );
+  const dashboardWarmInFlightRef = useRef<Map<string, InFlightEntry<DashboardViewModel>>>(
+    new Map<string, InFlightEntry<DashboardViewModel>>(),
   );
   const insightWarmCacheRef = useRef<Map<string, WarmCacheEntry<InsightViewModel>>>(
     new Map<string, WarmCacheEntry<InsightViewModel>>(),
@@ -539,19 +690,55 @@ export default function App() {
   const distributionWarmCacheRef = useRef<Map<string, WarmCacheEntry<DistributionViewModel>>>(
     new Map<string, WarmCacheEntry<DistributionViewModel>>(),
   );
-  const insightInFlightRef = useRef<Map<string, Promise<InsightViewModel>>>(new Map<string, Promise<InsightViewModel>>());
-  const distributionInFlightRef = useRef<Map<string, Promise<DistributionViewModel | null>>>(
-    new Map<string, Promise<DistributionViewModel | null>>(),
+  const insightInFlightRef = useRef<Map<string, InFlightEntry<InsightViewModel>>>(
+    new Map<string, InFlightEntry<InsightViewModel>>(),
+  );
+  const distributionInFlightRef = useRef<Map<string, InFlightEntry<DistributionViewModel | null>>>(
+    new Map<string, InFlightEntry<DistributionViewModel | null>>(),
   );
   const kellyWarmCacheRef = useRef<Map<string, WarmCacheEntry<KellyWorkbenchResponse>>>(
     new Map<string, WarmCacheEntry<KellyWorkbenchResponse>>(),
   );
-  const kellyInFlightRef = useRef<Map<string, Promise<KellyWorkbenchResponse>>>(
-    new Map<string, Promise<KellyWorkbenchResponse>>(),
+  const kellyInFlightRef = useRef<Map<string, InFlightEntry<KellyWorkbenchResponse>>>(
+    new Map<string, InFlightEntry<KellyWorkbenchResponse>>(),
   );
   const locationTemperatureWarmCacheRef = useRef<Map<string, WarmCacheEntry<number | null>>>(
     new Map<string, WarmCacheEntry<number | null>>(),
   );
+  const analysisRuntimeRef = useRef({
+    routeLocationId: routeState.locationId,
+    routePath: routeState.path,
+    routeTab: routeState.tab,
+    selectedInsightTimestamp: routeState.selectedInsightTimestamp ?? null,
+    actualTemperatureC: routeState.actualTemperatureC ?? null,
+    loadingInsight,
+    loadingDistribution,
+    insightError,
+    distributionError,
+    latestInsightEnvelope: null as AnalysisDataEnvelope<InsightViewModel> | null,
+    latestDistributionEnvelope: null as AnalysisDataEnvelope<DistributionViewModel> | null,
+  });
+  const routeStateRef = useRef(routeState);
+  routeStateRef.current = routeState;
+  const dashboardRef = useRef<DashboardViewModel | null>(dashboard);
+  dashboardRef.current = dashboard;
+  analysisRuntimeRef.current = {
+    routeLocationId: routeState.locationId,
+    routePath: routeState.path,
+    routeTab: routeState.tab,
+    selectedInsightTimestamp: routeState.selectedInsightTimestamp ?? null,
+    actualTemperatureC: routeState.actualTemperatureC ?? null,
+    loadingInsight,
+    loadingDistribution,
+    insightError,
+    distributionError,
+    latestInsightEnvelope,
+    latestDistributionEnvelope,
+  };
+  useEffect(() => {
+    setAnalysisTab(routeState.tab);
+  }, [routeState.tab]);
+
   const displayedLocationId = routeState.locationId;
   const currentLocationTimezoneGroup =
     resolveTimezoneGroupForLocation(dashboard?.locationDirectory, displayedLocationId) ??
@@ -559,6 +746,15 @@ export default function App() {
       dashboardWarmCacheRef.current.get(displayedLocationId)?.data.locationDirectory,
       displayedLocationId,
     );
+  const activeDisplayUnit =
+    (kellySnapshot?.location.id === displayedLocationId ? kellySnapshot.displayUnit : null) ??
+    resolveDisplayUnitForLocation(dashboard?.locationDirectory, displayedLocationId) ??
+    resolveDisplayUnitForLocation(
+      dashboardWarmCacheRef.current.get(displayedLocationId)?.data.locationDirectory,
+      displayedLocationId,
+    ) ??
+    dashboard?.displayUnit ??
+    "C";
   const activeTimezoneGroup = browsingTimezoneGroup ?? currentLocationTimezoneGroup ?? DEFAULT_ACTIVE_TIMEZONE_GROUP;
 
   const clearKellySocketReconnectTimer = () => {
@@ -568,9 +764,67 @@ export default function App() {
     }
   };
 
+  const cancelOrdinaryWeatherRequests = () => {
+    transitionDashboardAbortRef.current?.abort();
+    transitionDashboardAbortRef.current = null;
+    refreshDashboardAbortRef.current?.abort();
+    refreshDashboardAbortRef.current = null;
+    insightAbortRef.current?.abort();
+    insightAbortRef.current = null;
+    distributionAbortRef.current?.abort();
+    distributionAbortRef.current = null;
+    warmAbortRef.current?.abort();
+    warmAbortRef.current = null;
+    refreshInFlightRef.current = false;
+    refreshInFlightLocationRef.current = null;
+    refreshInFlightManualRef.current = false;
+    dashboardRequestStartedAtRef.current = 0;
+    locationTransitionInFlightRef.current = false;
+  };
+
+  const resetOrdinaryWeatherLoadingStates = () => {
+    setLoadingDashboard(false);
+    setLoadingInsight(false);
+    setLoadingDistribution(false);
+  };
+
   const resetKellySocketRuntime = () => {
     clearKellySocketReconnectTimer();
     kellySocketRetryCountRef.current = 0;
+    kellySocketSuppressedRef.current = null;
+  };
+
+  const detachKellySocketHandlers = (socket: WebSocket | null) => {
+    if (!socket) {
+      return;
+    }
+
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onclose = null;
+    socket.onerror = null;
+  };
+
+  const closeKellySocket = () => {
+    clearKellySocketReconnectTimer();
+    const socket = kellySocketRef.current;
+    if (!socket) {
+      return;
+    }
+
+    kellySocketSuppressedRef.current = socket;
+    kellySocketRef.current = null;
+    detachKellySocketHandlers(socket);
+    try {
+      socket.close();
+    } catch {
+      if (kellySocketSuppressedRef.current === socket) {
+        kellySocketSuppressedRef.current = null;
+      }
+    }
+    if (kellySocketSuppressedRef.current === socket) {
+      kellySocketSuppressedRef.current = null;
+    }
   };
 
   useEffect(() => {
@@ -588,12 +842,19 @@ export default function App() {
         bankroll: next.bankroll,
         riskMode: next.riskMode,
         minEdge: next.minEdge,
-        actualTemperatureC: next.actualTemperatureC,
+        kellyActualTemperatureC: next.kellyActualTemperatureC,
       });
       setKellyDraftControls(buildKellyDraftFromRoute(next));
       setKellyFieldErrors({});
       setReferenceTemperatureMode(next.actualTemperatureC !== null ? "manual" : "default");
-      setManualTemperatureText(next.actualTemperatureC !== null ? String(next.actualTemperatureC) : "");
+      const nextDisplayUnit =
+        resolveDisplayUnitForLocation(dashboard?.locationDirectory, next.locationId) ??
+        resolveDisplayUnitForLocation(
+          dashboardWarmCacheRef.current.get(next.locationId)?.data.locationDirectory,
+          next.locationId,
+        ) ??
+        "C";
+      setManualTemperatureText(formatTemperatureInputValue(next.actualTemperatureC, nextDisplayUnit));
     };
 
     window.addEventListener("popstate", onPopState);
@@ -601,7 +862,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!railExpanded) {
+    if (railExpanded) {
+      return;
+    }
+
+    setBrowsingTimezoneGroup(null);
+  }, [railExpanded]);
+
+  useEffect(() => {
+    if (!railExpanded || isMobileLayout) {
       return;
     }
 
@@ -632,7 +901,27 @@ export default function App() {
       body.style.width = previousWidth;
       window.scrollTo({ top: railScrollLockYRef.current, behavior: "auto" });
     };
-  }, [railExpanded]);
+  }, [isMobileLayout, railExpanded]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return;
+    }
+
+    const mediaQueryList = window.matchMedia(MOBILE_LAYOUT_MEDIA_QUERY);
+    const handleChange = (event: MediaQueryListEvent) => {
+      setIsMobileLayout(event.matches);
+    };
+
+    setIsMobileLayout(mediaQueryList.matches);
+    if (typeof mediaQueryList.addEventListener === "function") {
+      mediaQueryList.addEventListener("change", handleChange);
+      return () => mediaQueryList.removeEventListener("change", handleChange);
+    }
+
+    mediaQueryList.addListener(handleChange);
+    return () => mediaQueryList.removeListener(handleChange);
+  }, []);
 
   const updateRouteState = (updater: (current: RouteState) => RouteState, mode: "replace" | "push" = "replace") => {
     setRouteState((current) => {
@@ -647,11 +936,11 @@ export default function App() {
       bankroll: routeState.bankroll,
       riskMode: routeState.riskMode,
       minEdge: routeState.minEdge,
-      actualTemperatureC: routeState.actualTemperatureC,
+      kellyActualTemperatureC: routeState.kellyActualTemperatureC,
     });
     setKellyDraftControls(buildKellyDraftFromRoute(routeState));
     setKellyFieldErrors({});
-  }, [routeState.actualTemperatureC, routeState.bankroll, routeState.minEdge, routeState.riskMode]);
+  }, [routeState.bankroll, routeState.kellyActualTemperatureC, routeState.minEdge, routeState.riskMode]);
 
   const cacheDashboardSnapshot = (locationId: string, nextDashboard: DashboardViewModel) => {
     lastDashboardRefreshAtRef.current = Date.now();
@@ -667,7 +956,11 @@ export default function App() {
   };
 
   const fetchDashboardSnapshot = async (locationId: string, signal: AbortSignal) => {
-    const response = await weatherApi.fetchDashboard("1h", 24, locationId, { signal });
+    const response = await withClientTimeout(
+      weatherApi.fetchDashboard("1h", 24, locationId, { signal }),
+      DASHBOARD_SNAPSHOT_CLIENT_TIMEOUT_MS,
+      `Dashboard refresh timed out after ${Math.round(DASHBOARD_SNAPSHOT_CLIENT_TIMEOUT_MS / 1_000)}s.`,
+    );
     return mapDashboardResponse(response);
   };
 
@@ -676,21 +969,30 @@ export default function App() {
     selectedTimestamp,
     actualTemperatureC,
     signal,
+    bypassCache = false,
+    allowInFlightReuse = true,
   }: {
     locationId: string;
     selectedTimestamp: string | null;
     actualTemperatureC: number | null;
     signal: AbortSignal;
-  }) => {
+    bypassCache?: boolean;
+    allowInFlightReuse?: boolean;
+  }): Promise<InsightViewModel> => {
     const insightKey = buildInsightWarmKey(locationId, selectedTimestamp, actualTemperatureC);
-    const cachedInsight = readWarmCacheEntry<InsightViewModel>(insightWarmCacheRef.current, insightKey);
-    if (cachedInsight) {
-      return cachedInsight;
-    }
+    const useSharedInFlight = !bypassCache && allowInFlightReuse;
+    if (!bypassCache) {
+      const cachedInsight = readWarmCacheEntry<InsightViewModel>(insightWarmCacheRef.current, insightKey);
+      if (cachedInsight) {
+        return cachedInsight;
+      }
 
-    const inFlight = insightInFlightRef.current.get(insightKey);
-    if (inFlight) {
-      return await inFlight;
+      if (useSharedInFlight) {
+        const inFlight = readReusableInFlight<InsightViewModel>(insightInFlightRef.current, insightKey);
+        if (inFlight) {
+          return await awaitAbortable(inFlight.promise, signal);
+        }
+      }
     }
 
     const request = weatherApi
@@ -698,13 +1000,19 @@ export default function App() {
         signal,
       })
       .then((response) => writeWarmCacheEntry(insightWarmCacheRef.current, insightKey, mapInsightResponse(response)));
+    const entry = {
+      startedAt: Date.now(),
+      promise: request,
+    };
 
-    insightInFlightRef.current.set(insightKey, request);
+    if (useSharedInFlight) {
+      insightInFlightRef.current.set(insightKey, entry);
+    }
 
     try {
-      return await request;
+      return await awaitAbortable(request, signal);
     } finally {
-      if (insightInFlightRef.current.get(insightKey) === request) {
+      if (useSharedInFlight && insightInFlightRef.current.get(insightKey) === entry) {
         insightInFlightRef.current.delete(insightKey);
       }
     }
@@ -714,24 +1022,39 @@ export default function App() {
     locationId,
     selectedTimestamp,
     signal,
+    bypassCache = false,
+    allowInFlightReuse = true,
   }: {
     locationId: string;
     selectedTimestamp: string | null;
     signal: AbortSignal;
-  }) => {
+    bypassCache?: boolean;
+    allowInFlightReuse?: boolean;
+  }): Promise<DistributionViewModel | null> => {
     if (!selectedTimestamp) {
       return null;
     }
 
     const distributionKey = buildDistributionWarmKey(locationId, selectedTimestamp);
-    const cachedDistribution = readWarmCacheEntry<DistributionViewModel>(distributionWarmCacheRef.current, distributionKey);
-    if (cachedDistribution) {
-      return cachedDistribution;
-    }
+    const useSharedInFlight = !bypassCache && allowInFlightReuse;
+    if (!bypassCache) {
+      const cachedDistribution = readWarmCacheEntry<DistributionViewModel>(
+        distributionWarmCacheRef.current,
+        distributionKey,
+      );
+      if (cachedDistribution) {
+        return cachedDistribution;
+      }
 
-    const inFlight = distributionInFlightRef.current.get(distributionKey);
-    if (inFlight) {
-      return await inFlight;
+      if (useSharedInFlight) {
+        const inFlight = readReusableInFlight<DistributionViewModel | null>(
+          distributionInFlightRef.current,
+          distributionKey,
+        );
+        if (inFlight) {
+          return await awaitAbortable(inFlight.promise, signal);
+        }
+      }
     }
 
     const request = weatherApi
@@ -739,13 +1062,19 @@ export default function App() {
       .then((response) =>
         writeWarmCacheEntry(distributionWarmCacheRef.current, distributionKey, mapDistributionResponse(response)),
       );
+    const entry = {
+      startedAt: Date.now(),
+      promise: request,
+    };
 
-    distributionInFlightRef.current.set(distributionKey, request);
+    if (useSharedInFlight) {
+      distributionInFlightRef.current.set(distributionKey, entry);
+    }
 
     try {
-      return await request;
+      return await awaitAbortable(request, signal);
     } finally {
-      if (distributionInFlightRef.current.get(distributionKey) === request) {
+      if (useSharedInFlight && distributionInFlightRef.current.get(distributionKey) === entry) {
         distributionInFlightRef.current.delete(distributionKey);
       }
     }
@@ -761,6 +1090,7 @@ export default function App() {
     selectedHour,
     signal,
     bypassCache = false,
+    allowInFlightReuse = true,
   }: {
     locationId: string;
     targetDate: string;
@@ -771,7 +1101,8 @@ export default function App() {
     selectedHour: string | null;
     signal: AbortSignal;
     bypassCache?: boolean;
-  }) => {
+    allowInFlightReuse?: boolean;
+  }): Promise<KellyWorkbenchResponse> => {
     const kellyKey = buildKellyWarmKey({
       locationId,
       targetDate,
@@ -781,6 +1112,7 @@ export default function App() {
       actualTemperatureC,
       selectedHour,
     });
+    const useSharedInFlight = !bypassCache && allowInFlightReuse;
     if (!bypassCache) {
       const cachedKelly = readWarmCacheEntry<KellyWorkbenchResponse>(
         kellyWarmCacheRef.current,
@@ -791,14 +1123,16 @@ export default function App() {
         return cachedKelly;
       }
 
-      const inFlight = kellyInFlightRef.current.get(kellyKey);
-      if (inFlight) {
-        return await inFlight;
+      if (useSharedInFlight) {
+        const inFlight = readReusableInFlight<KellyWorkbenchResponse>(kellyInFlightRef.current, kellyKey);
+        if (inFlight) {
+          return await awaitAbortable(inFlight.promise, signal);
+        }
       }
     }
 
-    const request = weatherApi
-      .fetchKellyWorkbench(
+    const request = withClientTimeout(
+      weatherApi.fetchKellyWorkbench(
         locationId,
         targetDate,
         bankroll,
@@ -806,20 +1140,29 @@ export default function App() {
         minEdge,
         actualTemperatureC ?? undefined,
         selectedHour ?? undefined,
+        bypassCache,
         { signal },
-      )
-      .then((response) =>
-        writeWarmCacheEntry(kellyWarmCacheRef.current, kellyKey, compactKellySnapshotForClient(response)),
-      );
+      ),
+      KELLY_SNAPSHOT_CLIENT_TIMEOUT_MS,
+      `Kelly refresh timed out after ${Math.round(KELLY_SNAPSHOT_CLIENT_TIMEOUT_MS / 1_000)}s.`,
+    )
+      .then((response) => {
+        const compacted = compactKellySnapshotForClient(response);
+        return writeWarmCacheEntry(kellyWarmCacheRef.current, kellyKey, compacted);
+      });
+    const entry = {
+      startedAt: Date.now(),
+      promise: request,
+    };
 
-    if (!bypassCache) {
-      kellyInFlightRef.current.set(kellyKey, request);
+    if (useSharedInFlight) {
+      kellyInFlightRef.current.set(kellyKey, entry);
     }
 
     try {
-      return await request;
+      return await awaitAbortable(request, signal);
     } finally {
-      if (!bypassCache && kellyInFlightRef.current.get(kellyKey) === request) {
+      if (useSharedInFlight && kellyInFlightRef.current.get(kellyKey) === entry) {
         kellyInFlightRef.current.delete(kellyKey);
       }
     }
@@ -854,6 +1197,20 @@ export default function App() {
     kellyWarmCacheRef.current.delete(kellyKey);
   };
 
+  const clearAnalysisSurfaceState = () => {
+    analysisRequestEpochRef.current += 1;
+    setInsight(null);
+    setDistribution(null);
+    setLatestInsightEnvelope(null);
+    setLatestDistributionEnvelope(null);
+    setLastConsistentAnalysisKey(null);
+  };
+
+  const invalidateAnalysisWarmCaches = (locationId: string) => {
+    invalidateWarmCacheByLocation(insightWarmCacheRef.current, locationId);
+    invalidateWarmCacheByLocation(distributionWarmCacheRef.current, locationId);
+  };
+
   const seedAnalysisSnapshot = ({
     locationId,
     generatedAt,
@@ -868,10 +1225,10 @@ export default function App() {
     setInsight(nextInsight);
     setDistribution(nextDistribution);
 
-    const insightKey =
-      nextInsight ? buildAnalysisBatchKey(locationId, nextInsight.selectedTimestamp, generatedAt) : null;
-    const distributionKey =
-      nextDistribution ? buildAnalysisBatchKey(locationId, nextDistribution.selectedTimestamp, generatedAt) : null;
+    const insightKey = nextInsight ? buildAnalysisBatchKey(locationId, nextInsight.selectedTimestamp) : null;
+    const distributionKey = nextDistribution
+      ? buildAnalysisBatchKey(locationId, nextDistribution.selectedTimestamp)
+      : null;
 
     setLatestInsightEnvelope(
       nextInsight && insightKey
@@ -897,18 +1254,16 @@ export default function App() {
     );
 
     if (nextInsight && nextDistribution && insightKey && distributionKey && insightKey === distributionKey) {
-      setAnalysisSnapshot({
+      const snapshot = {
         key: insightKey,
         locationId,
         insight: nextInsight,
         distribution: nextDistribution,
-      });
+      } satisfies AnalysisSnapshot;
+      setAnalysisSnapshot(snapshot);
       setLastConsistentAnalysisKey(insightKey);
       return;
     }
-
-    setAnalysisSnapshot(null);
-    setLastConsistentAnalysisKey(null);
   };
 
   const warmLocationSurfaces = async ({
@@ -920,6 +1275,7 @@ export default function App() {
     riskMode,
     minEdge,
     targets,
+    bypassCache = false,
   }: {
     locationId: string;
     selectedTimestamp: string | null;
@@ -929,6 +1285,7 @@ export default function App() {
     riskMode: KellyRiskMode;
     minEdge: number;
     targets: WarmLocationTargets;
+    bypassCache?: boolean;
   }) => {
     warmAbortRef.current?.abort();
     const warmTasks: Array<() => Promise<unknown>> = [];
@@ -943,6 +1300,7 @@ export default function App() {
           selectedTimestamp,
           actualTemperatureC,
           signal: controller.signal,
+          bypassCache,
         }),
       );
     }
@@ -953,6 +1311,7 @@ export default function App() {
           locationId,
           selectedTimestamp,
           signal: controller.signal,
+          bypassCache,
         }),
       );
     }
@@ -968,6 +1327,7 @@ export default function App() {
           actualTemperatureC,
           selectedHour: selectedTimestamp,
           signal: controller.signal,
+          bypassCache,
         }),
       );
     }
@@ -983,21 +1343,8 @@ export default function App() {
       if (warmAbortRef.current === controller) {
         warmAbortRef.current = null;
       }
-      setLocationTransitionState((current) =>
-        current.pendingLocationId === locationId
-          ? {
-              pendingLocationId: null,
-              stage: "idle",
-            }
-          : current,
-      );
       return;
     }
-
-    setLocationTransitionState({
-      pendingLocationId: locationId,
-      stage: "warming",
-    });
 
     try {
       await new Promise((resolve) => window.setTimeout(resolve, LOCATION_PREWARM_DELAY_MS));
@@ -1027,38 +1374,103 @@ export default function App() {
       if (warmAbortRef.current === controller) {
         warmAbortRef.current = null;
       }
-
-      setLocationTransitionState((current) =>
-        current.pendingLocationId === locationId
-          ? {
-              pendingLocationId: null,
-              stage: "idle",
-            }
-          : current,
-      );
     }
   };
 
-  const transitionToLocation = async (locationId: string, historyMode: "replace" | "push" = "push") => {
-    if (locationId === routeState.locationId && dashboard?.hourly.location.id === locationId) {
+  const performLocationTransition = async (
+    locationId: string,
+    historyMode: "replace" | "push" = "push",
+    requestSeq = locationTransitionSeqRef.current + 1,
+  ) => {
+    const liveRouteState = routeStateRef.current;
+    const liveDashboard = dashboardRef.current;
+
+    if (locationId === liveRouteState.locationId && liveDashboard?.hourly.location.id === locationId) {
+      if (requestSeq === locationTransitionSeqRef.current) {
+        setLocationTransitionState({
+          pendingLocationId: null,
+          stage: "idle",
+        });
+        locationTransitionInFlightRef.current = false;
+      }
       setRailExpanded(false);
       return;
     }
 
-    if (locationTransitionState.pendingLocationId === locationId) {
-      setRailExpanded(false);
-      return;
-    }
-
-    const requestSeq = locationTransitionSeqRef.current + 1;
     locationTransitionSeqRef.current = requestSeq;
-    dashboardAbortRef.current?.abort();
+    cancelOrdinaryWeatherRequests();
     const controller = new AbortController();
-    dashboardAbortRef.current = controller;
-    const currentPath = routeState.path;
-    const currentTab = routeState.tab;
+    transitionDashboardAbortRef.current = controller;
+    const currentPath = liveRouteState.path;
+    const currentTab = liveRouteState.tab;
+    const isAbortError = (error: unknown) => error instanceof DOMException && error.name === "AbortError";
+    const shouldRetryFreshAfterAbort = (error: unknown) => isAbortError(error) && !controller.signal.aborted;
 
-    const hydrateCurrentSurface = ({
+    console.info("[location-transition:start]", {
+      locationId,
+      requestSeq,
+      currentLocationId: liveRouteState.locationId,
+      path: currentPath,
+      tab: currentTab,
+    });
+
+    const fetchTransitionInsightSnapshot = async ({
+      selectedTimestamp,
+      actualTemperatureC,
+    }: {
+      selectedTimestamp: string | null;
+      actualTemperatureC: number | null;
+    }) => {
+      try {
+        return await fetchInsightSnapshot({
+          locationId,
+          selectedTimestamp,
+          actualTemperatureC,
+          signal: controller.signal,
+          allowInFlightReuse: false,
+        });
+      } catch (error) {
+        if (shouldRetryFreshAfterAbort(error)) {
+          return await fetchInsightSnapshot({
+            locationId,
+            selectedTimestamp,
+            actualTemperatureC,
+            signal: controller.signal,
+            bypassCache: true,
+            allowInFlightReuse: false,
+          });
+        }
+        throw error;
+      }
+    };
+
+    const fetchTransitionDistributionSnapshot = async ({
+      selectedTimestamp,
+    }: {
+      selectedTimestamp: string | null;
+    }) => {
+      try {
+        return await fetchDistributionSnapshot({
+          locationId,
+          selectedTimestamp,
+          signal: controller.signal,
+          allowInFlightReuse: false,
+        });
+      } catch (error) {
+        if (shouldRetryFreshAfterAbort(error)) {
+          return await fetchDistributionSnapshot({
+            locationId,
+            selectedTimestamp,
+            signal: controller.signal,
+            bypassCache: true,
+            allowInFlightReuse: false,
+          });
+        }
+        throw error;
+      }
+    };
+
+    const hydrateCurrentSurface = async ({
       selectedTimestamp,
       actualTemperatureC,
       targetDate,
@@ -1067,56 +1479,79 @@ export default function App() {
       actualTemperatureC: number | null;
       targetDate: string;
     }) => {
-      const nextInsight = readWarmCacheEntry<InsightViewModel>(
-        insightWarmCacheRef.current,
-        buildInsightWarmKey(locationId, selectedTimestamp, actualTemperatureC),
-      );
-      const nextDistribution =
-        selectedTimestamp === null
-          ? null
-          : readWarmCacheEntry<DistributionViewModel>(
-              distributionWarmCacheRef.current,
-              buildDistributionWarmKey(locationId, selectedTimestamp),
-            );
-      const nextKelly = readWarmCacheEntry<KellyWorkbenchResponse>(
-        kellyWarmCacheRef.current,
-        buildKellyWarmKey({
-          locationId,
-          targetDate,
-          bankroll: routeState.bankroll,
-          riskMode: routeState.riskMode,
-          minEdge: routeState.minEdge,
-          actualTemperatureC,
-          selectedHour: selectedTimestamp,
-        }),
-        KELLY_WARM_CACHE_TTL_MS,
-      );
-
       if (currentPath === "/analysis" && currentTab === "models") {
-        return {
-          nextInsight,
-          nextDistribution,
-          nextKelly: null,
-        };
+        try {
+          const [nextInsight, nextDistribution] = await Promise.all([
+            fetchTransitionInsightSnapshot({
+              selectedTimestamp,
+              actualTemperatureC,
+            }),
+            fetchTransitionDistributionSnapshot({
+              selectedTimestamp,
+            }),
+          ]);
+
+          return {
+            nextModelTimestamp: nextInsight.selectedTimestamp,
+            nextInsight,
+            nextDistribution,
+            nextKelly: null,
+          };
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") {
+            throw error;
+          }
+
+          return {
+            nextModelTimestamp: selectedTimestamp,
+            nextInsight: null,
+            nextDistribution: null,
+            nextKelly: null,
+          };
+        }
       }
 
       if (currentPath === "/kelly") {
+        // Do not block location commit on Kelly payload hydration. Route/URL
+        // should switch immediately, then Kelly page loader fetches snapshot
+        // for the new location independently.
         return {
+          nextModelTimestamp: selectedTimestamp,
           nextInsight: null,
           nextDistribution: null,
-          nextKelly,
+          nextKelly: null,
         };
       }
 
       if (currentPath === "/") {
-        return {
-          nextInsight,
-          nextDistribution: null,
-          nextKelly: null,
-        };
+        try {
+          const nextInsight = await fetchTransitionInsightSnapshot({
+            selectedTimestamp,
+            actualTemperatureC,
+          });
+
+          return {
+            nextModelTimestamp: nextInsight.selectedTimestamp,
+            nextInsight,
+            nextDistribution: null,
+            nextKelly: null,
+          };
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") {
+            throw error;
+          }
+
+          return {
+            nextModelTimestamp: selectedTimestamp,
+            nextInsight: null,
+            nextDistribution: null,
+            nextKelly: null,
+          };
+        }
       }
 
       return {
+        nextModelTimestamp: selectedTimestamp,
         nextInsight: null,
         nextDistribution: null,
         nextKelly: null,
@@ -1126,6 +1561,7 @@ export default function App() {
     const commitLocationTransition = ({
       nextDashboard,
       selectedTimestamp,
+      nextModelTimestamp,
       nextTargetDate,
       nextActualTemperature,
       nextInsight,
@@ -1134,6 +1570,7 @@ export default function App() {
     }: {
       nextDashboard: DashboardViewModel;
       selectedTimestamp: string | null;
+      nextModelTimestamp: string | null;
       nextTargetDate: string;
       nextActualTemperature: number | null;
       nextInsight: InsightViewModel | null;
@@ -1155,7 +1592,7 @@ export default function App() {
         setLoadingDistribution(!nextDistribution);
         setLoadingKelly(false);
       } else if (currentPath === "/kelly") {
-        setKellySnapshot((current) => nextKelly ?? current);
+        setKellySnapshot(nextKelly ?? null);
         setLoadingKelly(!nextKelly);
         setLoadingInsight(false);
         setLoadingDistribution(false);
@@ -1178,7 +1615,8 @@ export default function App() {
           ...current,
           locationId,
           actualTemperatureC: nextActualTemperature,
-          selectedInsightTimestamp: selectedTimestamp,
+          kellyActualTemperatureC: nextActualTemperature,
+          selectedInsightTimestamp: nextModelTimestamp,
           selectedHourlyTimestamp: selectedTimestamp,
           targetDate: nextTargetDate,
         }),
@@ -1190,25 +1628,23 @@ export default function App() {
         selectedTimestamp,
         actualTemperatureC: nextActualTemperature,
         targetDate: nextTargetDate,
-        bankroll: routeState.bankroll,
-        riskMode: routeState.riskMode,
-        minEdge: routeState.minEdge,
+        bankroll: liveRouteState.bankroll,
+        riskMode: liveRouteState.riskMode,
+        minEdge: liveRouteState.minEdge,
         targets: buildWarmLocationTargets(currentPath, currentTab),
       });
     };
 
     setRailExpanded(false);
     locationTransitionInFlightRef.current = true;
-    warmAbortRef.current?.abort();
     kellyDateWarmAbortRef.current?.abort();
     kellyAbortRef.current?.abort();
-    kellySocketRef.current?.close();
-    kellySocketRef.current = null;
+    closeKellySocket();
     resetKellySocketRuntime();
     setReferenceTemperatureMode("default");
     setManualTemperatureText("");
-    setKellyError(null);
-    setKellyStreamState("idle");
+      setKellyError(null);
+      setKellyStreamState("idle");
     setManualRefreshingKelly(false);
     setDashboardError(null);
     setInsightError(null);
@@ -1217,7 +1653,7 @@ export default function App() {
       pendingLocationId: locationId,
       stage: "dashboard",
     });
-    setLoadingDashboard(!dashboard);
+    setLoadingDashboard(!liveDashboard);
     if (currentPath === "/") {
       setLoadingInsight(true);
     }
@@ -1229,38 +1665,55 @@ export default function App() {
       setLoadingKelly(true);
     }
 
-    const cachedDashboard = readWarmCacheEntry<DashboardViewModel>(dashboardWarmCacheRef.current, locationId);
-    if (cachedDashboard) {
-      const cachedSelectedHour = pickSelectedTimestamp(cachedDashboard.hourly.items, null);
-      const cachedTargetDate = resolveTodayForTimezone(cachedDashboard.hourly.locationTimezone);
-      const cachedActualTemperature = resolveDefaultReferenceTemperature(cachedDashboard, cachedSelectedHour);
-      const primed = hydrateCurrentSurface({
-        selectedTimestamp: cachedSelectedHour,
-        actualTemperatureC: cachedActualTemperature,
-        targetDate: cachedTargetDate,
-      });
-      if (requestSeq !== locationTransitionSeqRef.current) {
+    let shouldPostTransitionRefresh = false;
+
+    try {
+      const cachedDashboard = readWarmCacheEntry<DashboardViewModel>(dashboardWarmCacheRef.current, locationId);
+      if (cachedDashboard) {
+        const cachedSelectedHour = pickSelectedTimestamp(cachedDashboard.hourly.items, null);
+        const cachedTargetDate = resolveKellyTargetDateForSelection(
+          cachedDashboard.hourly.locationTimezone,
+          cachedSelectedHour,
+        );
+        const cachedActualTemperature = resolveDefaultReferenceTemperature(cachedDashboard, cachedSelectedHour);
+        const primed = await hydrateCurrentSurface({
+          selectedTimestamp: cachedSelectedHour,
+          actualTemperatureC: cachedActualTemperature,
+          targetDate: cachedTargetDate,
+        });
+        if (requestSeq !== locationTransitionSeqRef.current) {
+          return;
+        }
+
+        commitLocationTransition({
+          nextDashboard: cachedDashboard,
+          selectedTimestamp: cachedSelectedHour,
+          nextModelTimestamp: primed.nextModelTimestamp,
+          nextTargetDate: cachedTargetDate,
+          nextActualTemperature: cachedActualTemperature,
+          nextInsight: primed.nextInsight,
+          nextDistribution: primed.nextDistribution,
+          nextKelly: primed.nextKelly,
+        });
+
+        if (currentPath !== "/kelly") {
+          void warmLocationSurfaces({
+            locationId,
+            selectedTimestamp: cachedSelectedHour,
+            actualTemperatureC: cachedActualTemperature,
+            targetDate: cachedTargetDate,
+            bankroll: liveRouteState.bankroll,
+            riskMode: liveRouteState.riskMode,
+            minEdge: liveRouteState.minEdge,
+            targets: buildWarmLocationTargets(currentPath, currentTab),
+            bypassCache: true,
+          });
+        }
+
+        shouldPostTransitionRefresh = true;
         return;
       }
 
-      commitLocationTransition({
-        nextDashboard: cachedDashboard,
-        selectedTimestamp: cachedSelectedHour,
-        nextTargetDate: cachedTargetDate,
-        nextActualTemperature: cachedActualTemperature,
-        nextInsight: primed.nextInsight,
-        nextDistribution: primed.nextDistribution,
-        nextKelly: primed.nextKelly,
-      });
-      if (dashboardAbortRef.current === controller) {
-        dashboardAbortRef.current = null;
-      }
-      locationTransitionInFlightRef.current = false;
-      setLoadingDashboard(false);
-      return;
-    }
-
-    try {
       const nextDashboard = await fetchDashboardSnapshot(locationId, controller.signal);
 
       if (requestSeq !== locationTransitionSeqRef.current) {
@@ -1268,9 +1721,12 @@ export default function App() {
       }
 
       const selectedTimestamp = pickSelectedTimestamp(nextDashboard.hourly.items, null);
-      const nextTargetDate = resolveTodayForTimezone(nextDashboard.hourly.locationTimezone);
+      const nextTargetDate = resolveKellyTargetDateForSelection(
+        nextDashboard.hourly.locationTimezone,
+        selectedTimestamp,
+      );
       const nextActualTemperature = resolveDefaultReferenceTemperature(nextDashboard, selectedTimestamp);
-      const primed = hydrateCurrentSurface({
+      const primed = await hydrateCurrentSurface({
         selectedTimestamp,
         actualTemperatureC: nextActualTemperature,
         targetDate: nextTargetDate,
@@ -1283,6 +1739,7 @@ export default function App() {
       commitLocationTransition({
         nextDashboard,
         selectedTimestamp,
+        nextModelTimestamp: primed.nextModelTimestamp,
         nextTargetDate,
         nextActualTemperature,
         nextInsight: primed.nextInsight,
@@ -1290,29 +1747,72 @@ export default function App() {
         nextKelly: primed.nextKelly,
       });
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
+      if (isAbortError(error)) {
+        if (requestSeq === locationTransitionSeqRef.current) {
+          console.info("[location-transition:aborted]", {
+            locationId,
+            requestSeq,
+            stage: locationTransitionState.stage,
+          });
+        }
         return;
       }
 
       if (requestSeq === locationTransitionSeqRef.current) {
-        setDashboardError(getErrorMessage(error, UI_TEXT.errors.dashboard));
-        setLocationTransitionState({
-          pendingLocationId: null,
-          stage: "idle",
+        console.warn("[location-transition:error]", {
+          locationId,
+          requestSeq,
+          error: getErrorMessage(error, UI_TEXT.errors.dashboard),
         });
+        setDashboardError(getErrorMessage(error, UI_TEXT.errors.dashboard));
       }
     } finally {
       if (requestSeq === locationTransitionSeqRef.current) {
         setLoadingDashboard(false);
+        setLocationTransitionState({
+          pendingLocationId: null,
+          stage: "idle",
+        });
+        locationTransitionInFlightRef.current = false;
+        console.info("[location-transition:finalized]", {
+          locationId,
+          requestSeq,
+          stage: "idle",
+        });
+        if (shouldPostTransitionRefresh) {
+          void refreshDashboard(false, locationId);
+        }
       }
 
-      if (dashboardAbortRef.current === controller) {
-        dashboardAbortRef.current = null;
-      }
-      if (requestSeq === locationTransitionSeqRef.current) {
-        locationTransitionInFlightRef.current = false;
+      if (transitionDashboardAbortRef.current === controller) {
+        transitionDashboardAbortRef.current = null;
       }
     }
+  };
+
+  const transitionToLocation = (locationId: string, historyMode: "replace" | "push" = "push") => {
+    const liveRouteState = routeStateRef.current;
+    const liveDashboard = dashboardRef.current;
+
+    if (locationId === liveRouteState.locationId && liveDashboard?.hourly.location.id === locationId) {
+      locationTransitionSeqRef.current += 1;
+      cancelOrdinaryWeatherRequests();
+      resetOrdinaryWeatherLoadingStates();
+      setLoadingKelly(false);
+      setLocationTransitionState({
+        pendingLocationId: null,
+        stage: "idle",
+      });
+      setRailExpanded(false);
+      return;
+    }
+
+    if (locationTransitionInFlightRef.current) {
+      cancelOrdinaryWeatherRequests();
+    }
+
+    clearAnalysisSurfaceState();
+    void performLocationTransition(locationId, historyMode);
   };
 
   const clearRefreshResetTimer = () => {
@@ -1352,7 +1852,12 @@ export default function App() {
     setKellyFieldErrors({});
     setKellyError(null);
     setManualRefreshingKelly(true);
-    setKellyAppliedControls(parsed);
+    setKellyAppliedControls({
+      bankroll: parsed.bankroll,
+      riskMode: parsed.riskMode,
+      minEdge: parsed.minEdge,
+      kellyActualTemperatureC: parsed.actualTemperatureC,
+    });
     invalidateKellyWarmCache({
       locationId: routeState.locationId,
       targetDate: routeState.targetDate,
@@ -1367,7 +1872,7 @@ export default function App() {
       bankroll: parsed.bankroll,
       riskMode: parsed.riskMode,
       minEdge: parsed.minEdge,
-      actualTemperatureC: parsed.actualTemperatureC,
+      kellyActualTemperatureC: parsed.actualTemperatureC,
     }));
     setKellyRefreshNonce((current) => current + 1);
   };
@@ -1376,13 +1881,19 @@ export default function App() {
     () => () => {
       clearRefreshResetTimer();
       resetKellySocketRuntime();
-      warmAbortRef.current?.abort();
+      cancelOrdinaryWeatherRequests();
       kellyDateWarmAbortRef.current?.abort();
       kellyAbortRef.current?.abort();
-      kellySocketRef.current?.close();
+      closeKellySocket();
     },
     [],
   );
+
+  useEffect(() => {
+    if (routeState.path !== "/analysis" || routeState.tab !== "models") {
+      setManualAnalysisRefreshPending(false);
+    }
+  }, [routeState.path, routeState.tab]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1438,23 +1949,57 @@ export default function App() {
       return;
     }
 
+    const shouldRefreshAnalysisSurface =
+      manual &&
+      locationId === routeState.locationId &&
+      routeState.path === "/analysis" &&
+      routeState.tab === "models";
+
     if (refreshInFlightRef.current && refreshInFlightLocationRef.current === locationId) {
-      return;
+      if (manual && refreshInFlightManualRef.current) {
+        clearRefreshResetTimer();
+        setRefreshState("pending");
+        return;
+      }
+
+      if (!manual && Date.now() - dashboardRequestStartedAtRef.current <= SHARED_IN_FLIGHT_STALE_MS) {
+        return;
+      }
+
+      refreshDashboardAbortRef.current?.abort();
+      refreshInFlightRef.current = false;
+      refreshInFlightLocationRef.current = null;
+      refreshInFlightManualRef.current = false;
     }
 
     const requestSeq = dashboardRequestSeqRef.current + 1;
     dashboardRequestSeqRef.current = requestSeq;
     refreshInFlightRef.current = true;
     refreshInFlightLocationRef.current = locationId;
-    dashboardAbortRef.current?.abort();
+    refreshInFlightManualRef.current = manual;
+    refreshDashboardAbortRef.current?.abort();
     const controller = new AbortController();
-    dashboardAbortRef.current = controller;
+    refreshDashboardAbortRef.current = controller;
     setLoadingDashboard(true);
     if (manual) {
       clearRefreshResetTimer();
       setRefreshState("pending");
+      if (shouldRefreshAnalysisSurface) {
+        setManualAnalysisRefreshPending(true);
+        setAnalysisReloadNonce((current) => current + 1);
+        analysisRequestEpochRef.current += 1;
+        insightAbortRef.current?.abort();
+        insightAbortRef.current = null;
+        distributionAbortRef.current?.abort();
+        distributionAbortRef.current = null;
+        setInsightError(null);
+        setDistributionError(null);
+        setLoadingInsight(true);
+        setLoadingDistribution(true);
+      }
     }
     const startedAt = Date.now();
+    dashboardRequestStartedAtRef.current = startedAt;
 
     try {
       const mappedDashboard = await fetchDashboardSnapshot(locationId, controller.signal);
@@ -1467,6 +2012,9 @@ export default function App() {
 
       if (manual) {
         setCacheBust(Date.now());
+        if (shouldRefreshAnalysisSurface) {
+          invalidateAnalysisWarmCaches(locationId);
+        }
       }
 
       const elapsedMs = Date.now() - startedAt;
@@ -1500,15 +2048,23 @@ export default function App() {
       }
 
       setLoadingDashboard(false);
-      if (dashboardAbortRef.current === controller) {
-        dashboardAbortRef.current = null;
+      if (refreshDashboardAbortRef.current === controller) {
+        refreshDashboardAbortRef.current = null;
+      }
+      if (requestSeq === dashboardRequestSeqRef.current) {
+        dashboardRequestStartedAtRef.current = 0;
       }
       refreshInFlightRef.current = false;
       refreshInFlightLocationRef.current = null;
+      refreshInFlightManualRef.current = false;
     }
   };
 
   useEffect(() => {
+    if (locationTransitionState.stage !== "idle" || locationTransitionInFlightRef.current) {
+      return;
+    }
+
     if (dashboard?.hourly.location.id !== routeState.locationId) {
       void refreshDashboard(false, routeState.locationId);
     }
@@ -1522,7 +2078,22 @@ export default function App() {
         return;
       }
 
-      if (locationTransitionInFlightRef.current || refreshInFlightRef.current) {
+      if (
+        refreshInFlightRef.current &&
+        Date.now() - dashboardRequestStartedAtRef.current > SHARED_IN_FLIGHT_STALE_MS
+      ) {
+        refreshDashboardAbortRef.current?.abort();
+        setLoadingDashboard(false);
+        refreshInFlightRef.current = false;
+        refreshInFlightLocationRef.current = null;
+        refreshInFlightManualRef.current = false;
+      }
+
+      if (
+        locationTransitionInFlightRef.current ||
+        refreshInFlightRef.current ||
+        locationTransitionState.stage !== "idle"
+      ) {
         return;
       }
 
@@ -1540,7 +2111,108 @@ export default function App() {
       window.removeEventListener("focus", maybeRefreshOnFocus);
       document.removeEventListener("visibilitychange", maybeRefreshOnFocus);
     };
-  }, [dashboard?.hourly.location.id, routeState.locationId, routeState.path]);
+  }, [
+    dashboard?.hourly.location.id,
+    locationTransitionState.stage,
+    routeState.locationId,
+    routeState.path,
+  ]);
+
+  useEffect(() => {
+    if (routeState.path !== "/kelly" || !routeState.targetDate) {
+      return;
+    }
+
+    const maybeRecoverKellyOnFocus = () => {
+      if (document.visibilityState === "hidden" || locationTransitionInFlightRef.current) {
+        return;
+      }
+
+      const now = Date.now();
+      if (now - kellyFocusRecoveryAtRef.current < KELLY_FOCUS_RECOVERY_COOLDOWN_MS) {
+        return;
+      }
+
+      if (kellyAbortRef.current && now - kellyRequestStartedAtRef.current > SHARED_IN_FLIGHT_STALE_MS) {
+        kellyAbortRef.current.abort();
+        kellyAbortRef.current = null;
+        kellyRequestStartedAtRef.current = 0;
+      }
+
+      if (kellyAbortRef.current) {
+        return;
+      }
+
+      const kellySnapshotAligned =
+        kellySnapshot?.location.id === routeState.locationId && kellySnapshot?.targetDate === routeState.targetDate;
+      const lastKellySignalAt = parseIsoTime(
+        kellySnapshotAligned
+          ? (kellySnapshot?.freshness.lastStreamEventAt ??
+            kellySnapshot?.streamHealth.lastSignalAt ??
+            kellySnapshot?.freshness.repricedAt)
+          : null,
+      );
+      const streamStale = lastKellySignalAt === null || now - lastKellySignalAt > KELLY_FOCUS_RECOVERY_STALE_MS;
+      const dashboardNeedsRefresh =
+        dashboard?.hourly.location.id !== routeState.locationId ||
+        now - lastDashboardRefreshAtRef.current > SILENT_REFRESH_STALE_MS;
+      const kellyNeedsSnapshotReload = !kellySnapshotAligned || !kellySnapshot || kellyError !== null;
+      const kellyNeedsSocketRecovery =
+        kellyStreamState === "idle" ||
+        kellyStreamState === "degraded" ||
+        kellyStreamState === "disconnected" ||
+        streamStale;
+      const kellyNeedsRecovery = kellyNeedsSnapshotReload || kellyNeedsSocketRecovery;
+      const shouldRefreshDashboard = dashboardNeedsRefresh && !kellyNeedsRecovery;
+
+      if (!shouldRefreshDashboard && !kellyNeedsRecovery) {
+        return;
+      }
+
+      kellyFocusRecoveryAtRef.current = now;
+
+      if (shouldRefreshDashboard) {
+        void refreshDashboard(false, routeState.locationId);
+      }
+
+      if (kellyNeedsRecovery) {
+        setKellySocketReconnectNonce((current) => current + 1);
+        if (kellyNeedsSnapshotReload) {
+          invalidateKellyWarmCache({
+            locationId: routeState.locationId,
+            targetDate: routeState.targetDate,
+            bankroll: routeState.bankroll,
+            riskMode: routeState.riskMode,
+            minEdge: routeState.minEdge,
+            actualTemperatureC: routeState.kellyActualTemperatureC,
+            selectedHour: routeState.selectedHourlyTimestamp,
+          });
+          setKellyRefreshNonce((current) => current + 1);
+        }
+      }
+    };
+
+    window.addEventListener("focus", maybeRecoverKellyOnFocus);
+    document.addEventListener("visibilitychange", maybeRecoverKellyOnFocus);
+
+    return () => {
+      window.removeEventListener("focus", maybeRecoverKellyOnFocus);
+      document.removeEventListener("visibilitychange", maybeRecoverKellyOnFocus);
+    };
+  }, [
+    dashboard?.hourly.location.id,
+    kellyError,
+    kellySnapshot,
+    kellyStreamState,
+    routeState.kellyActualTemperatureC,
+    routeState.bankroll,
+    routeState.locationId,
+    routeState.minEdge,
+    routeState.path,
+    routeState.riskMode,
+    routeState.selectedHourlyTimestamp,
+    routeState.targetDate,
+  ]);
 
   useEffect(() => {
     if (!dashboard) {
@@ -1554,18 +2226,30 @@ export default function App() {
         dashboard.hourly.items.some((item) => item.timestamp === current.selectedInsightTimestamp)
           ? current.selectedInsightTimestamp
           : nextSelectedHour;
+      const nextKellyTargetDate =
+        current.path === "/kelly"
+          ? resolveKellyTargetDateForSelection(dashboard.hourly.locationTimezone, nextSelectedHour)
+          : current.targetDate;
+      const isAutoKellyTargetDate =
+        current.path === "/kelly" &&
+        (current.targetDate === null ||
+          current.targetDate === resolveTodayForTimezone(dashboard.hourly.locationTimezone) ||
+          current.targetDate === resolveKellyTargetDateForSelection(dashboard.hourly.locationTimezone, current.selectedHourlyTimestamp));
 
-      if (
-        nextSelectedHour === current.selectedHourlyTimestamp &&
-        nextInsightTimestamp === current.selectedInsightTimestamp
-      ) {
-        return current;
+      if (nextSelectedHour === current.selectedHourlyTimestamp) {
+        if (
+          nextInsightTimestamp === current.selectedInsightTimestamp &&
+          (!isAutoKellyTargetDate || nextKellyTargetDate === current.targetDate)
+        ) {
+          return current;
+        }
       }
 
       return {
         ...current,
         selectedHourlyTimestamp: nextSelectedHour,
         selectedInsightTimestamp: nextInsightTimestamp,
+        targetDate: isAutoKellyTargetDate ? nextKellyTargetDate : current.targetDate,
       };
     });
   }, [dashboard]);
@@ -1589,9 +2273,16 @@ export default function App() {
 
     updateRouteState((current) => ({
       ...current,
-      targetDate: resolveTodayForTimezone(locationTimezone),
+      targetDate: resolveKellyTargetDateForSelection(locationTimezone, current.selectedHourlyTimestamp),
     }));
-  }, [dashboard?.hourly.locationTimezone, dashboard?.locationDirectory, routeState.locationId, routeState.path, routeState.targetDate]);
+  }, [
+    dashboard?.hourly.locationTimezone,
+    dashboard?.locationDirectory,
+    routeState.locationId,
+    routeState.path,
+    routeState.selectedHourlyTimestamp,
+    routeState.targetDate,
+  ]);
 
   useEffect(() => {
     if (routeState.path !== "/kelly" || !kellySnapshot) {
@@ -1625,6 +2316,7 @@ export default function App() {
     const availableTargetDates = kellySnapshot?.availableTargetDates ?? [];
 
     if (
+      !ENABLE_KELLY_DATE_WARM ||
       routeState.path !== "/kelly" ||
       !routeState.targetDate ||
       availableTargetDates.length === 0 ||
@@ -1669,7 +2361,7 @@ export default function App() {
             bankroll: routeState.bankroll,
             riskMode: routeState.riskMode,
             minEdge: routeState.minEdge,
-            actualTemperatureC: routeState.actualTemperatureC,
+            actualTemperatureC: routeState.kellyActualTemperatureC,
             selectedHour: routeState.selectedHourlyTimestamp,
             signal: controller.signal,
           });
@@ -1691,7 +2383,7 @@ export default function App() {
     };
   }, [
     kellySnapshot?.availableTargetDates?.join("|"),
-    routeState.actualTemperatureC,
+    routeState.kellyActualTemperatureC,
     routeState.bankroll,
     routeState.locationId,
     routeState.minEdge,
@@ -1712,15 +2404,15 @@ export default function App() {
       ? items[dashboard.hourly.current.index] ?? null
       : selectedItem;
 
-  const effectiveInsightTimestamp = routeState.selectedInsightTimestamp ?? insight?.selectedTimestamp ?? null;
-  const defaultReferenceTemperature = resolveDefaultReferenceTemperature(dashboard, effectiveInsightTimestamp);
+  const insightDisplayUnit = insight?.displayUnit ?? activeDisplayUnit;
+  const defaultReferenceTemperature = resolveDefaultReferenceTemperature(dashboard, routeState.selectedHourlyTimestamp);
 
   useEffect(() => {
     if (routeState.path === "/kelly" || referenceTemperatureMode !== "default") {
       return;
     }
 
-    const nextText = defaultReferenceTemperature !== null ? String(defaultReferenceTemperature) : "";
+    const nextText = formatTemperatureInputValue(defaultReferenceTemperature, insightDisplayUnit);
     if (manualTemperatureText !== nextText) {
       setManualTemperatureText(nextText);
     }
@@ -1733,10 +2425,32 @@ export default function App() {
       ...current,
       actualTemperatureC: defaultReferenceTemperature,
     }));
-  }, [defaultReferenceTemperature, manualTemperatureText, referenceTemperatureMode, routeState.actualTemperatureC, routeState.path]);
+  }, [
+    defaultReferenceTemperature,
+    insightDisplayUnit,
+    manualTemperatureText,
+    referenceTemperatureMode,
+    routeState.actualTemperatureC,
+    routeState.path,
+  ]);
+
+  useEffect(() => {
+    if (referenceTemperatureMode !== "manual") {
+      return;
+    }
+
+    const nextText = formatTemperatureInputValue(routeState.actualTemperatureC, insightDisplayUnit);
+    if (manualTemperatureText !== nextText) {
+      setManualTemperatureText(nextText);
+    }
+  }, [insightDisplayUnit, manualTemperatureText, referenceTemperatureMode, routeState.actualTemperatureC]);
 
   useEffect(() => {
     if (!dashboard?.locationDirectory.length) {
+      return;
+    }
+
+    if (!railExpanded) {
       return;
     }
 
@@ -1744,256 +2458,246 @@ export default function App() {
       return;
     }
 
-    let cancelled = false;
-    const controller = new AbortController();
     const visibleGroup = browsingTimezoneGroup ?? activeTimezoneGroup;
-    const staleLocations = dashboard.locationDirectory.filter((location) => {
-      if (location.timezoneGroup !== visibleGroup) {
-        return false;
+    setLocationTemperatures((current) => {
+      const next = { ...current };
+
+      for (const location of dashboard.locationDirectory) {
+        if (location.timezoneGroup !== visibleGroup) {
+          continue;
+        }
+
+        if (location.id === dashboard.hourly.location.id) {
+          const liveTemp = dashboard.hourly.current?.temperatureC ?? dashboard.hourly.items[0]?.temperatureC ?? null;
+          writeWarmCacheEntry(locationTemperatureWarmCacheRef.current, location.id, liveTemp);
+          next[location.id] = liveTemp;
+          continue;
+        }
+
+        const cachedTemp = readWarmCacheEntry<number | null>(
+          locationTemperatureWarmCacheRef.current,
+          location.id,
+          LOCATION_TEMPERATURE_TTL_MS,
+        );
+        if (cachedTemp !== null) {
+          next[location.id] = cachedTemp;
+          continue;
+        }
+
+        const cachedDashboard = readWarmCacheEntry<DashboardViewModel>(
+          dashboardWarmCacheRef.current,
+          location.id,
+          DASHBOARD_WARM_CACHE_TTL_MS,
+        );
+        if (!cachedDashboard) {
+          continue;
+        }
+
+        const dashboardTemp =
+          cachedDashboard.hourly.current?.temperatureC ?? cachedDashboard.hourly.items[0]?.temperatureC ?? null;
+        writeWarmCacheEntry(locationTemperatureWarmCacheRef.current, location.id, dashboardTemp);
+        next[location.id] = dashboardTemp;
       }
 
-      return readWarmCacheAge(locationTemperatureWarmCacheRef.current, location.id) > LOCATION_TEMPERATURE_TTL_MS;
+      return next;
     });
-
-    if (!staleLocations.length) {
-      return;
-    }
-
-    const loadTemperatures = async () => {
-      const queue = [...staleLocations];
-      const workers = Array.from({ length: Math.min(LOCATION_TEMPERATURE_CONCURRENCY, queue.length) }, async () => {
-        while (queue.length > 0) {
-          const location = queue.shift();
-          if (!location || controller.signal.aborted) {
-            return;
-          }
-
-          const response = await weatherApi.fetchHourly("1h", 1, location.id, { signal: controller.signal });
-          const temp = response.current?.temperatureC ?? response.items[0]?.temperatureC ?? null;
-          writeWarmCacheEntry(locationTemperatureWarmCacheRef.current, location.id, temp);
-        }
-      });
-
-      await Promise.allSettled(workers);
-
-      if (cancelled) {
-        return;
-      }
-
-      setLocationTemperatures((current) => {
-        const next = { ...current };
-        for (const location of staleLocations) {
-          const entry = locationTemperatureWarmCacheRef.current.get(location.id);
-          const cached =
-            entry && Date.now() - entry.cachedAt <= LOCATION_TEMPERATURE_TTL_MS
-              ? entry.data
-              : undefined;
-          if (cached !== undefined || location.id in next) {
-            next[location.id] = cached ?? null;
-          }
-        }
-        return next;
-      });
-    };
-
-    void loadTemperatures();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
   }, [
     activeTimezoneGroup,
     browsingTimezoneGroup,
     dashboard?.locationDirectory,
     loadingDashboard,
     locationTransitionState.stage,
+    railExpanded,
   ]);
 
   useEffect(() => {
+    const awaitingLocationCommit =
+      locationTransitionState.pendingLocationId !== null &&
+      locationTransitionState.pendingLocationId !== routeState.locationId;
     const dashboardAligned = dashboard?.hourly.location.id === routeState.locationId;
-    if (!dashboard || !dashboardAligned || routeState.path === "/kelly") {
+    if (awaitingLocationCommit || !dashboard || !dashboardAligned || routeState.path === "/kelly") {
       setInsight(null);
+      setDistribution(null);
       setLatestInsightEnvelope(null);
+      setLatestDistributionEnvelope(null);
       return;
     }
 
+    const generatedAt = dashboard.generatedAt;
+    const requestLocationId = routeState.locationId;
+    const defaultSelectedHour = pickSelectedTimestamp(dashboard.hourly.items, routeState.selectedHourlyTimestamp);
+    const requestSelectedTimestamp =
+      routeState.selectedInsightTimestamp &&
+      dashboard.hourly.items.some((item) => item.timestamp === routeState.selectedInsightTimestamp)
+        ? routeState.selectedInsightTimestamp
+        : defaultSelectedHour;
+    const defaultActualTemperature = resolveDefaultReferenceTemperature(dashboard, requestSelectedTimestamp);
+    const routeTimestampsHydrated =
+      routeState.selectedHourlyTimestamp === defaultSelectedHour &&
+      routeState.selectedInsightTimestamp === requestSelectedTimestamp;
+    const routeActualTemperatureHydrated =
+      referenceTemperatureMode !== "default" || routeState.actualTemperatureC === defaultActualTemperature;
+
+    if (!routeTimestampsHydrated || !routeActualTemperatureHydrated) {
+      return;
+    }
+
+    const requestActualTemperature =
+      routeState.actualTemperatureC ?? defaultActualTemperature;
+    const requestEpoch = analysisRequestEpochRef.current;
     const insightKey = buildInsightWarmKey(
-      routeState.locationId,
-      routeState.selectedInsightTimestamp ?? null,
-      routeState.actualTemperatureC ?? null,
+      requestLocationId,
+      requestSelectedTimestamp,
+      requestActualTemperature,
     );
     const cachedInsight = readWarmCacheEntry<InsightViewModel>(insightWarmCacheRef.current, insightKey);
-    if (cachedInsight) {
+    const distributionKey = buildDistributionWarmKey(requestLocationId, requestSelectedTimestamp);
+    const cachedDistribution = requestSelectedTimestamp
+      ? readWarmCacheEntry<DistributionViewModel>(distributionWarmCacheRef.current, distributionKey)
+      : null;
+
+    if (routeState.path !== "/analysis" && cachedInsight) {
       setInsight(cachedInsight);
-      const key = buildAnalysisBatchKey(routeState.locationId, cachedInsight.selectedTimestamp, dashboard.generatedAt);
+      const key = buildAnalysisBatchKey(requestLocationId, cachedInsight.selectedTimestamp);
       if (key) {
         setLatestInsightEnvelope({
           key,
-          locationId: routeState.locationId,
+          locationId: requestLocationId,
           selectedTimestamp: cachedInsight.selectedTimestamp,
-          generatedAt: dashboard.generatedAt,
+          generatedAt,
           data: cachedInsight,
         });
       }
       setInsightError(null);
       setLoadingInsight(false);
+      setLoadingDistribution(false);
       return;
     }
 
     let cancelled = false;
     insightAbortRef.current?.abort();
+    distributionAbortRef.current?.abort();
     const controller = new AbortController();
     insightAbortRef.current = controller;
+    if (routeState.path === "/analysis") {
+      distributionAbortRef.current = controller;
+    }
     setLoadingInsight(true);
+    if (routeState.path === "/analysis") {
+      setLoadingDistribution(true);
+    } else {
+      setLoadingDistribution(false);
+      setDistribution(null);
+      setLatestDistributionEnvelope(null);
+    }
 
     const load = async () => {
       try {
-        const mappedInsight = await fetchInsightSnapshot({
-          locationId: routeState.locationId,
-          selectedTimestamp: routeState.selectedInsightTimestamp ?? null,
-          actualTemperatureC: routeState.actualTemperatureC ?? null,
-          signal: controller.signal,
-        });
+        const insightPromise =
+          cachedInsight
+            ? Promise.resolve(cachedInsight)
+            : fetchInsightSnapshot({
+            locationId: requestLocationId,
+            selectedTimestamp: requestSelectedTimestamp,
+            actualTemperatureC: requestActualTemperature,
+            signal: controller.signal,
+          });
+        const distributionPromise =
+          routeState.path === "/analysis"
+            ? cachedDistribution
+              ? Promise.resolve(cachedDistribution)
+              : fetchDistributionSnapshot({
+                  locationId: requestLocationId,
+                  selectedTimestamp: requestSelectedTimestamp,
+                  signal: controller.signal,
+                })
+            : Promise.resolve(null);
+        const [insightTask, analysisTask] = await Promise.all([insightPromise, distributionPromise]);
 
         if (cancelled) {
           return;
         }
+        if (requestEpoch !== analysisRequestEpochRef.current) {
+          return;
+        }
 
-        const generatedAt = dashboard.generatedAt;
-        const key = buildAnalysisBatchKey(routeState.locationId, mappedInsight.selectedTimestamp, generatedAt);
+        const liveAnalysisRuntime = analysisRuntimeRef.current;
+        const liveRouteState = routeStateRef.current;
+        const liveSelectedTimestamp =
+          liveAnalysisRuntime.selectedInsightTimestamp ?? liveRouteState.selectedHourlyTimestamp ?? null;
+        const liveActualTemperature =
+          liveAnalysisRuntime.actualTemperatureC ??
+          resolveDefaultReferenceTemperature(dashboardRef.current, liveSelectedTimestamp);
+        if (
+          liveAnalysisRuntime.routeLocationId !== requestLocationId ||
+          liveAnalysisRuntime.routePath === "/kelly" ||
+          liveSelectedTimestamp !== requestSelectedTimestamp ||
+          liveActualTemperature !== requestActualTemperature
+        ) {
+          return;
+        }
 
-        setInsight(mappedInsight);
+        if (routeState.path === "/analysis" && (!analysisTask || liveAnalysisRuntime.routePath !== "/analysis")) {
+          return;
+        }
+
+        const key = buildAnalysisBatchKey(requestLocationId, insightTask.selectedTimestamp);
+
+        setInsight(insightTask);
         if (key) {
           setLatestInsightEnvelope({
             key,
-            locationId: routeState.locationId,
-            selectedTimestamp: mappedInsight.selectedTimestamp,
+            locationId: requestLocationId,
+            selectedTimestamp: insightTask.selectedTimestamp,
             generatedAt,
-            data: mappedInsight,
+            data: insightTask,
           });
+        }
+
+        if (routeState.path === "/analysis" && analysisTask) {
+          const distributionBatchKey = buildAnalysisBatchKey(requestLocationId, analysisTask.selectedTimestamp);
+          setDistribution(analysisTask);
+          if (distributionBatchKey) {
+            setLatestDistributionEnvelope({
+              key: distributionBatchKey,
+              locationId: requestLocationId,
+              selectedTimestamp: analysisTask.selectedTimestamp,
+              generatedAt,
+              data: analysisTask,
+            });
+          }
+          if (key && distributionBatchKey && key === distributionBatchKey) {
+            setAnalysisSnapshot({
+              key,
+              locationId: requestLocationId,
+              insight: insightTask,
+              distribution: analysisTask,
+            });
+            setLastConsistentAnalysisKey(key);
+          }
+          setDistributionError(null);
         }
         setInsightError(null);
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") {
           return;
         }
-        if (!cancelled) {
+        if (!cancelled && requestEpoch === analysisRequestEpochRef.current) {
           setInsightError(getErrorMessage(error, UI_TEXT.errors.insight));
+          if (routeState.path === "/analysis") {
+            setDistributionError(getErrorMessage(error, UI_TEXT.errors.distribution));
+          }
         }
       } finally {
-        if (!cancelled) {
+        if (!cancelled && requestEpoch === analysisRequestEpochRef.current) {
           setLoadingInsight(false);
+          if (routeState.path === "/analysis") {
+            setLoadingDistribution(false);
+          }
+          setManualAnalysisRefreshPending(false);
         }
         if (insightAbortRef.current === controller) {
           insightAbortRef.current = null;
-        }
-      }
-    };
-
-    void load();
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, [dashboard?.generatedAt, routeState.actualTemperatureC, routeState.locationId, routeState.path, routeState.selectedInsightTimestamp]);
-
-  useEffect(() => {
-    if (!insight) {
-      return;
-    }
-
-    if (routeState.selectedInsightTimestamp && insight.availableTimestamps.includes(routeState.selectedInsightTimestamp)) {
-      return;
-    }
-
-    updateRouteState((current) => ({
-      ...current,
-      selectedInsightTimestamp: insight.selectedTimestamp,
-    }));
-  }, [insight]);
-
-  useEffect(() => {
-    const distributionTimestamp = (routeState.selectedInsightTimestamp ?? insight?.selectedTimestamp) ?? null;
-    const dashboardAligned = dashboard?.hourly.location.id === routeState.locationId;
-    if (
-      routeState.path !== "/analysis" ||
-      routeState.tab !== "models" ||
-      !dashboard ||
-      !dashboardAligned ||
-      !distributionTimestamp
-    ) {
-      return;
-    }
-
-    const distributionKey = buildDistributionWarmKey(routeState.locationId, distributionTimestamp);
-    const cachedDistribution = readWarmCacheEntry<DistributionViewModel>(distributionWarmCacheRef.current, distributionKey);
-    if (cachedDistribution) {
-      setDistribution(cachedDistribution);
-      const key = buildAnalysisBatchKey(routeState.locationId, cachedDistribution.selectedTimestamp, dashboard.generatedAt);
-      if (key) {
-        setLatestDistributionEnvelope({
-          key,
-          locationId: routeState.locationId,
-          selectedTimestamp: cachedDistribution.selectedTimestamp,
-          generatedAt: dashboard.generatedAt,
-          data: cachedDistribution,
-        });
-      }
-      setDistributionError(null);
-      setLoadingDistribution(false);
-      return;
-    }
-
-    let cancelled = false;
-    distributionAbortRef.current?.abort();
-    const controller = new AbortController();
-    distributionAbortRef.current = controller;
-    setLoadingDistribution(true);
-
-    const load = async () => {
-      try {
-        const mappedDistribution = await fetchDistributionSnapshot({
-          locationId: routeState.locationId,
-          selectedTimestamp: distributionTimestamp,
-          signal: controller.signal,
-        });
-
-        if (cancelled) {
-          return;
-        }
-
-        if (!mappedDistribution) {
-          setDistribution(null);
-          setLatestDistributionEnvelope(null);
-          setDistributionError(null);
-          return;
-        }
-
-        const generatedAt = dashboard.generatedAt;
-        const key = buildAnalysisBatchKey(routeState.locationId, mappedDistribution.selectedTimestamp, generatedAt);
-
-        setDistribution(mappedDistribution);
-        if (key) {
-          setLatestDistributionEnvelope({
-            key,
-            locationId: routeState.locationId,
-            selectedTimestamp: mappedDistribution.selectedTimestamp,
-            generatedAt,
-            data: mappedDistribution,
-          });
-        }
-        setDistributionError(null);
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") {
-          return;
-        }
-        if (!cancelled) {
-          setDistributionError(getErrorMessage(error, UI_TEXT.errors.distribution));
-        }
-      } finally {
-        if (!cancelled) {
-          setLoadingDistribution(false);
         }
         if (distributionAbortRef.current === controller) {
           distributionAbortRef.current = null;
@@ -2007,17 +2711,57 @@ export default function App() {
       controller.abort();
     };
   }, [
-    dashboard?.generatedAt,
-    insight?.selectedTimestamp,
+    analysisReloadNonce,
+    dashboard?.hourly.location.id,
+    locationTransitionState.pendingLocationId,
+    referenceTemperatureMode,
+    routeState.actualTemperatureC,
     routeState.locationId,
     routeState.path,
     routeState.selectedInsightTimestamp,
+    routeState.selectedHourlyTimestamp,
     routeState.tab,
   ]);
 
   useEffect(() => {
-    const dashboardAligned = dashboard?.hourly.location.id === routeState.locationId;
-    if (routeState.path !== "/kelly" || !dashboard || !dashboardAligned || !routeState.targetDate) {
+    const awaitingLocationCommit =
+      locationTransitionState.pendingLocationId !== null &&
+      locationTransitionState.pendingLocationId !== routeState.locationId;
+    if (awaitingLocationCommit || routeState.path === "/kelly") {
+      return;
+    }
+
+    const alignedInsightEnvelope = pickAlignedAnalysisEnvelope<InsightViewModel>(
+      latestInsightEnvelope,
+      routeState.locationId,
+    );
+    const activeInsight = alignedInsightEnvelope?.data ?? null;
+    if (!activeInsight) {
+      return;
+    }
+
+    if (
+      routeState.selectedInsightTimestamp &&
+      activeInsight.availableTimestamps.includes(routeState.selectedInsightTimestamp)
+    ) {
+      return;
+    }
+
+    updateRouteState((current) => ({
+      ...current,
+      selectedInsightTimestamp: activeInsight.selectedTimestamp,
+    }));
+  }, [
+    dashboard?.hourly.location.id,
+    latestInsightEnvelope,
+    locationTransitionState.pendingLocationId,
+    routeState.locationId,
+    routeState.path,
+    routeState.selectedInsightTimestamp,
+  ]);
+
+  useEffect(() => {
+    if (routeState.path !== "/kelly" || !routeState.targetDate) {
       setManualRefreshingKelly(false);
       return;
     }
@@ -2028,7 +2772,7 @@ export default function App() {
       bankroll: routeState.bankroll,
       riskMode: routeState.riskMode,
       minEdge: routeState.minEdge,
-      actualTemperatureC: routeState.actualTemperatureC,
+      actualTemperatureC: routeState.kellyActualTemperatureC,
       selectedHour: routeState.selectedHourlyTimestamp,
     });
     const cachedKelly = readWarmCacheEntry<KellyWorkbenchResponse>(
@@ -2036,13 +2780,17 @@ export default function App() {
       kellyKey,
       KELLY_WARM_CACHE_TTL_MS,
     );
-    if (cachedKelly) {
+    if (cachedKelly && canReuseKellyWarmSnapshot(cachedKelly)) {
       setKellySnapshot(cachedKelly);
       setKellyError(null);
       setKellyStreamState(cachedKelly.streamHealth.state);
       setLoadingKelly(false);
       setManualRefreshingKelly(false);
+      kellyRequestStartedAtRef.current = 0;
       return;
+    }
+    if (cachedKelly) {
+      kellyWarmCacheRef.current.delete(kellyKey);
     }
 
     let cancelled = false;
@@ -2051,6 +2799,7 @@ export default function App() {
     kellyAbortRef.current?.abort();
     const controller = new AbortController();
     kellyAbortRef.current = controller;
+    kellyRequestStartedAtRef.current = Date.now();
     if (!manualRefreshingKelly) {
       setLoadingKelly(true);
     }
@@ -2063,7 +2812,7 @@ export default function App() {
           bankroll: routeState.bankroll,
           riskMode: routeState.riskMode,
           minEdge: routeState.minEdge,
-          actualTemperatureC: routeState.actualTemperatureC,
+          actualTemperatureC: routeState.kellyActualTemperatureC,
           selectedHour: routeState.selectedHourlyTimestamp,
           signal: controller.signal,
           bypassCache: manualRefreshingKelly,
@@ -2091,6 +2840,9 @@ export default function App() {
         if (kellyAbortRef.current === controller) {
           kellyAbortRef.current = null;
         }
+        if (requestSeq === kellyRequestSeqRef.current) {
+          kellyRequestStartedAtRef.current = 0;
+        }
       }
     };
 
@@ -2102,7 +2854,7 @@ export default function App() {
   }, [
     routeState.bankroll,
     kellyRefreshNonce,
-    routeState.actualTemperatureC,
+    routeState.kellyActualTemperatureC,
     routeState.locationId,
     routeState.minEdge,
     routeState.path,
@@ -2116,55 +2868,80 @@ export default function App() {
       return;
     }
 
-    if (latestInsightEnvelope.key !== latestDistributionEnvelope.key) {
+    if (
+      latestInsightEnvelope.locationId !== routeState.locationId ||
+      latestDistributionEnvelope.locationId !== routeState.locationId ||
+      latestInsightEnvelope.key !== latestDistributionEnvelope.key
+    ) {
       return;
     }
 
-    setAnalysisSnapshot({
+    const snapshot = {
       key: latestInsightEnvelope.key,
       locationId: latestInsightEnvelope.locationId,
       insight: latestInsightEnvelope.data,
       distribution: latestDistributionEnvelope.data,
-    });
+    } satisfies AnalysisSnapshot;
+    setAnalysisSnapshot(snapshot);
     setLastConsistentAnalysisKey(latestInsightEnvelope.key);
-  }, [latestDistributionEnvelope, latestInsightEnvelope]);
+  }, [latestDistributionEnvelope, latestInsightEnvelope, routeState.locationId]);
 
   const report = dashboard?.report;
   const reportText = report?.textZh ?? CONFIG.fallback.emptyText;
-  const imageUrl = dashboard ? weatherApi.buildMultiModelImageUrl(routeState.locationId, true, cacheBust) : null;
-  const imageUpdatedAt = dashboard?.multimodel.displayUpdatedAt ?? dashboard?.sync.updatedAt ?? null;
+  const rawImageAvailabilityStatus = dashboard?.multimodel.imageStatus ?? "unavailable";
+  const imageUrl =
+    dashboard
+      ? weatherApi.buildMultiModelImageUrl(routeState.locationId, true, cacheBust)
+      : null;
+  const imageAvailable = Boolean(imageUrl);
+  const imageAvailabilityStatus = imageAvailable
+    ? rawImageAvailabilityStatus === "fallback_error"
+      ? "fallback_error"
+      : rawImageAvailabilityStatus === "revalidating"
+        ? "revalidating"
+        : "ready"
+    : rawImageAvailabilityStatus === "revalidating"
+      ? "revalidating"
+      : "unavailable";
+  const imageUpdatedAt =
+    imageAvailabilityStatus !== "unavailable"
+      ? (dashboard?.multimodel.displayUpdatedAt ?? dashboard?.sync.updatedAt ?? null)
+      : null;
   const isAnalysis = routeState.path === "/analysis";
   const isKelly = routeState.path === "/kelly";
   const currentPage = isKelly ? "kelly" : isAnalysis ? "analysis" : "home";
   const isLocationTransitionPending = locationTransitionState.stage === "dashboard";
 
   useEffect(() => {
-    if (!imageUrl || !dashboard?.multimodel.imageUrlFound) {
+    if (!imageUrl) {
+      return;
+    }
+
+    if (routeState.path !== "/analysis" || routeState.tab !== "image") {
       return;
     }
 
     const preview = new Image();
     preview.decoding = "async";
     preview.src = imageUrl;
-  }, [dashboard?.multimodel.imageUrlFound, imageUrl]);
+  }, [imageUrl, routeState.path, routeState.tab]);
 
   useEffect(() => {
     const kellySnapshotAligned =
       kellySnapshot?.location.id === routeState.locationId && kellySnapshot?.targetDate === routeState.targetDate;
 
     if (routeState.path !== "/kelly" || !routeState.targetDate) {
-      kellySocketRef.current?.close();
-      kellySocketRef.current = null;
+      closeKellySocket();
       resetKellySocketRuntime();
       setKellyStreamState("idle");
+      kellyRequestStartedAtRef.current = 0;
       return;
     }
 
     if (!kellySnapshot || !kellySnapshotAligned) {
-      kellySocketRef.current?.close();
-      kellySocketRef.current = null;
-      clearKellySocketReconnectTimer();
-      setKellyStreamState(kellySnapshot?.streamHealth.state ?? "idle");
+      closeKellySocket();
+      resetKellySocketRuntime();
+      setKellyStreamState("idle");
       return;
     }
 
@@ -2175,21 +2952,30 @@ export default function App() {
         routeState.bankroll,
         routeState.riskMode,
         routeState.minEdge,
-        routeState.actualTemperatureC ?? undefined,
+        routeState.kellyActualTemperatureC ?? undefined,
         routeState.selectedHourlyTimestamp ?? undefined,
       ),
     );
     let intentionalClose = false;
     let reconnectRequested = false;
 
-    kellySocketRef.current?.close();
+    closeKellySocket();
     kellySocketRef.current = socket;
+    kellySocketSuppressedRef.current = null;
     setKellyStreamState("connecting");
 
     const applyStatusMessage = (message: Extract<KellyStreamMessage, { type: "status" }>) => {
+      if (kellySocketRef.current !== socket) {
+        return;
+      }
+
       setKellyStreamState(message.state);
       setKellySnapshot((current) => {
-        if (!current) {
+        if (
+          !current ||
+          current.location.id !== routeState.locationId ||
+          current.targetDate !== routeState.targetDate
+        ) {
           return current;
         }
 
@@ -2220,10 +3006,17 @@ export default function App() {
             }
 
             if (status.kind === "orderbooks" && message.lastRepricedAt) {
+              const degradedOrderbookStatus =
+                message.reasonCode === "reprice_failed" ||
+                message.reasonCode === "polling_fallback" ||
+                message.reasonCode === "ws_error" ||
+                message.reasonCode === "upstream_error";
               return {
                 ...status,
-                state: "fresh",
-                detail: "最近一次盘口快照已用于重定价。",
+                state: degradedOrderbookStatus ? "degraded" : "fresh",
+                detail: degradedOrderbookStatus
+                  ? "最近一次成功盘口快照仍在使用，当前等待下一轮有效重定价。"
+                  : "最近一次盘口快照已用于重定价。",
                 updatedAt: message.lastRepricedAt,
               };
             }
@@ -2238,6 +3031,10 @@ export default function App() {
       message: Extract<KellyStreamMessage, { type: "status" }>,
       closeSocket = false,
     ) => {
+      if (kellySocketRef.current !== socket) {
+        return;
+      }
+
       if (intentionalClose || reconnectRequested) {
         return;
       }
@@ -2275,12 +3072,20 @@ export default function App() {
     };
 
     socket.onopen = () => {
+      if (kellySocketRef.current !== socket) {
+        return;
+      }
+
       clearKellySocketReconnectTimer();
       kellySocketRetryCountRef.current = 0;
       setKellyStreamState("connecting");
     };
 
     socket.onmessage = (event) => {
+      if (kellySocketRef.current !== socket) {
+        return;
+      }
+
       kellySocketRetryCountRef.current = 0;
       try {
         const message = JSON.parse(event.data) as KellyStreamMessage;
@@ -2294,7 +3099,11 @@ export default function App() {
         startTransition(() => {
           setKellyStreamState("connected");
           setKellySnapshot((current) => {
-            if (!current) {
+            if (
+              !current ||
+              current.location.id !== routeState.locationId ||
+              current.targetDate !== routeState.targetDate
+            ) {
               return current;
             }
 
@@ -2350,6 +3159,10 @@ export default function App() {
     };
 
     socket.onclose = () => {
+      if (kellySocketRef.current !== socket) {
+        return;
+      }
+
       scheduleReconnect({
         type: "status",
         generatedAt: new Date().toISOString(),
@@ -2362,6 +3175,10 @@ export default function App() {
     };
 
     socket.onerror = () => {
+      if (kellySocketRef.current !== socket) {
+        return;
+      }
+
       scheduleReconnect(
         {
           type: "status",
@@ -2379,9 +3196,13 @@ export default function App() {
     return () => {
       intentionalClose = true;
       clearKellySocketReconnectTimer();
+      detachKellySocketHandlers(socket);
       socket.close();
       if (kellySocketRef.current === socket) {
         kellySocketRef.current = null;
+      }
+      if (kellySocketSuppressedRef.current === socket) {
+        kellySocketSuppressedRef.current = null;
       }
     };
   }, [
@@ -2389,7 +3210,7 @@ export default function App() {
     kellySnapshot?.location.id,
     kellySnapshot?.targetDate,
     kellySocketReconnectNonce,
-    routeState.actualTemperatureC,
+    routeState.kellyActualTemperatureC,
     routeState.bankroll,
     routeState.locationId,
     routeState.minEdge,
@@ -2399,42 +3220,90 @@ export default function App() {
     routeState.targetDate,
   ]);
 
-  const currentAnalysisKey = buildAnalysisBatchKey(
+  const latestInsightForCurrentLocation = pickAlignedAnalysisEnvelope<InsightViewModel>(
+    latestInsightEnvelope,
     routeState.locationId,
-    routeState.selectedInsightTimestamp ?? insight?.selectedTimestamp ?? null,
-    dashboard?.generatedAt ?? null,
   );
+  const latestDistributionForCurrentLocation = pickAlignedAnalysisEnvelope<DistributionViewModel>(
+    latestDistributionEnvelope,
+    routeState.locationId,
+  );
+  const requestedAnalysisTimestamp =
+    routeState.selectedInsightTimestamp ?? latestInsightForCurrentLocation?.selectedTimestamp ?? null;
+  const currentAnalysisKey = buildAnalysisBatchKey(routeState.locationId, requestedAnalysisTimestamp);
+  const latestInsightForCurrentBatch =
+    latestInsightForCurrentLocation &&
+    (!requestedAnalysisTimestamp || latestInsightForCurrentLocation.selectedTimestamp === requestedAnalysisTimestamp)
+      ? latestInsightForCurrentLocation
+      : null;
+  const latestDistributionForCurrentBatch =
+    latestDistributionForCurrentLocation &&
+    (!requestedAnalysisTimestamp ||
+      latestDistributionForCurrentLocation.selectedTimestamp === requestedAnalysisTimestamp)
+      ? latestDistributionForCurrentLocation
+      : null;
   const latestAnalysisReady =
     Boolean(
-      latestInsightEnvelope &&
-        latestDistributionEnvelope &&
+      latestInsightForCurrentBatch &&
+        latestDistributionForCurrentBatch &&
         currentAnalysisKey &&
-        latestInsightEnvelope.key === latestDistributionEnvelope.key &&
-        latestInsightEnvelope.key === currentAnalysisKey,
+        latestInsightForCurrentBatch.key === latestDistributionForCurrentBatch.key &&
+        latestInsightForCurrentBatch.key === currentAnalysisKey,
     ) && isAnalysis;
   const analysisSnapshotForLocation =
     analysisSnapshot && analysisSnapshot.locationId === routeState.locationId ? analysisSnapshot : null;
-  const fallbackAnalysisSnapshot =
-    analysisSnapshotForLocation ??
-    ((loadingInsight || loadingDistribution || Boolean(locationTransitionState.pendingLocationId)) ? analysisSnapshot : null);
-  const displayedAnalysisInsight = latestAnalysisReady
-    ? latestInsightEnvelope?.data ?? null
-    : analysisSnapshotForLocation?.insight ?? fallbackAnalysisSnapshot?.insight ?? insight;
-  const displayedAnalysisDistribution = latestAnalysisReady
-    ? latestDistributionEnvelope?.data ?? null
-    : analysisSnapshotForLocation?.distribution ?? fallbackAnalysisSnapshot?.distribution ?? distribution;
+  const effectiveLastConsistentAnalysisKey = analysisSnapshotForLocation?.key ?? lastConsistentAnalysisKey;
+  const displayedAnalysisInsight = isAnalysis
+    ? latestAnalysisReady
+      ? latestInsightForCurrentBatch?.data ?? null
+      : analysisSnapshotForLocation?.insight ?? null
+    : insight;
+  const displayedAnalysisDistribution = isAnalysis
+    ? latestAnalysisReady
+      ? latestDistributionForCurrentBatch?.data ?? null
+      : analysisSnapshotForLocation?.distribution ?? null
+    : distribution;
+  const hasRenderableAnalysisData = Boolean(displayedAnalysisInsight || displayedAnalysisDistribution);
+  const analysisPageLoading =
+    isAnalysis &&
+    routeState.tab === "models" &&
+    !hasRenderableAnalysisData &&
+    !insightError &&
+    !distributionError;
+  const analysisAvailabilityStatus =
+    insightError || distributionError
+      ? "fallback_error"
+      : analysisPageLoading || loadingInsight || loadingDistribution
+        ? "revalidating"
+        : hasRenderableAnalysisData
+          ? "ready"
+          : "ready";
+  const effectiveModelTimestamp =
+    requestedAnalysisTimestamp ?? displayedAnalysisDistribution?.selectedTimestamp ?? null;
+  const dashboardDefaultSelectedTimestamp = dashboard
+    ? pickSelectedTimestamp(dashboard.hourly.items, null)
+    : null;
+  const shouldSuppressRequestedTimestampFallbackWarning = Boolean(
+    dashboard?.hourly.location.id === routeState.locationId &&
+      dashboardDefaultSelectedTimestamp &&
+      referenceTemperatureMode === "default" &&
+      routeState.selectedInsightTimestamp === dashboardDefaultSelectedTimestamp &&
+      routeState.selectedHourlyTimestamp === dashboardDefaultSelectedTimestamp,
+  );
 
   const translatedWarnings = collectDisplayWarnings({
     dashboardWarnings: dashboard?.hourly.warnings,
     reportWarnings: report?.warnings,
     insightWarnings: isAnalysis ? displayedAnalysisInsight?.warnings : insight?.warnings,
     distributionWarnings: isAnalysis ? displayedAnalysisDistribution?.warnings : distribution?.warnings,
+    suppressRequestedTimestampFallback: shouldSuppressRequestedTimestampFallbackWarning,
   });
   const homepageWarnings = collectHomeDisplayWarnings({
     dashboardWarnings: dashboard?.hourly.warnings,
     reportWarnings: report?.warnings,
     insightWarnings: insight?.warnings,
     distributionWarnings: distribution?.warnings,
+    suppressRequestedTimestampFallback: shouldSuppressRequestedTimestampFallbackWarning,
   });
   const activeLocationTimezone =
     dashboard?.locationDirectory.find((location) => location.id === displayedLocationId)?.timezone ??
@@ -2477,24 +3346,33 @@ export default function App() {
   const pendingLocationName = pendingLocation?.displayName ?? null;
 
   const hasCommittedSnapshot = Boolean(dashboard);
+  const showDashboardWarning = hasCommittedSnapshot && Boolean(dashboardError);
+  const showDashboardFallback = !hasCommittedSnapshot && Boolean(dashboardError);
   const workspaceMuted = isLocationTransitionPending && !hasCommittedSnapshot;
   const kellyRefreshDisabled = !routeState.targetDate || manualRefreshingKelly || isLocationTransitionPending;
   const headerRefreshState = isKelly
     ? manualRefreshingKelly || isLocationTransitionPending
       ? "pending"
       : "idle"
-    : refreshState;
+    : loadingDashboard || manualAnalysisRefreshPending
+      ? "pending"
+      : refreshState;
   const headerRefreshDisabled = isKelly
     ? kellyRefreshDisabled
-    : refreshState === "pending" || isLocationTransitionPending;
+    : loadingDashboard || manualAnalysisRefreshPending || refreshState === "pending" || isLocationTransitionPending;
+  const headerSyncState =
+    dashboard?.sync.state === "fallback_error"
+      ? "fallback_error"
+      : "fresh";
   const peakSummary = displayedAnalysisInsight
     ? buildPeakSummary(displayedAnalysisInsight.peakTimeDistribution, activeLocationTimezone)
     : UI_TEXT.analysis.peakSummaryLoading;
 
   return (
     <div
-      className={`weather-shell ${railExpanded ? "weather-shell-rail-open" : ""} ${currentPage === "analysis" ? "weather-shell-analysis" : currentPage === "kelly" ? "weather-shell-kelly" : "weather-shell-home"}`}
+      className={`weather-shell ${isMobileLayout ? "weather-shell-mobile" : ""} ${railExpanded ? "weather-shell-rail-open" : ""} ${currentPage === "analysis" ? "weather-shell-analysis" : currentPage === "kelly" ? "weather-shell-kelly" : "weather-shell-home"}`}
       data-page={currentPage}
+      data-mobile-layout={isMobileLayout ? "true" : "false"}
     >
       <TerminalBackdrop />
 
@@ -2508,7 +3386,7 @@ export default function App() {
         transitioning={isLocationTransitionPending}
         locationTimezone={activeLocationTimezone}
         updatedAt={dashboard?.sync.updatedAt ?? null}
-        syncState={dashboard?.sync.state ?? "fresh"}
+        syncState={headerSyncState}
         refreshState={headerRefreshState}
         refreshDisabled={headerRefreshDisabled}
         currentPage={currentPage}
@@ -2558,9 +3436,31 @@ export default function App() {
         }}
       />
 
-      {dashboardError ? <WarningLines items={[dashboardError]} /> : null}
+      {showDashboardWarning && dashboardError ? <WarningLines items={[dashboardError]} /> : null}
 
-      {!hasCommittedSnapshot && !dashboardError ? (
+      {showDashboardFallback && dashboardError ? (
+        <section className="terminal-panel flex flex-1 items-center justify-center px-6 py-10">
+          <div className="panel-section max-w-2xl text-center">
+            <div className="eyebrow">首屏快照暂时不可用</div>
+            <div className="mt-3 text-3xl font-semibold text-white">决策台还没有拿到可展示的数据。</div>
+            <p className="mt-3 text-sm leading-6 text-white/70">{dashboardError}</p>
+            <p className="mt-2 text-sm leading-6 text-white/52">
+              可以直接点右上角刷新重试；一旦首屏快照恢复，首页和工作区会继续按当前地点正常加载。
+            </p>
+            <button
+              type="button"
+              className="mt-6 inline-flex items-center justify-center rounded-full border border-white/18 bg-white/8 px-5 py-2 text-sm font-medium text-white transition hover:border-white/28 hover:bg-white/12"
+              onClick={() => {
+                void refreshDashboard(true, routeState.locationId);
+              }}
+            >
+              立即重试
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      {!hasCommittedSnapshot && !showDashboardFallback ? (
         <section className="terminal-panel flex flex-1 items-center justify-center px-6 py-10">
           <div className="panel-section text-center">
             <div className="eyebrow">{UI_TEXT.app.loadingEyebrow}</div>
@@ -2573,6 +3473,7 @@ export default function App() {
       {hasCommittedSnapshot && dashboard ? (
         <div className={`${isAnalysis ? "analysis-layout-shell" : "terminal-layout"} workspace-stage`}>
           <LocationRail
+            mobile={isMobileLayout}
             expanded={railExpanded}
             activeId={displayedLocationId}
             pendingId={locationTransitionState.pendingLocationId}
@@ -2584,14 +3485,11 @@ export default function App() {
               setBrowsingTimezoneGroup(group);
             }}
             onSelect={(id) => {
-              const nextGroup = locations.find((location) => location.id === id)?.timezoneGroup;
-              if (nextGroup) {
-                setBrowsingTimezoneGroup(nextGroup);
-              }
               void transitionToLocation(id, "push");
             }}
             onToggleFavorite={(id) => void toggleFavorite(id)}
             onDismiss={() => setRailExpanded(false)}
+            onExpand={() => setRailExpanded(true)}
           />
 
           {isAnalysis ? (
@@ -2605,11 +3503,20 @@ export default function App() {
                 }
               >
                 <LazyAnalysisWorkspace
-                  tab={routeState.tab}
+                  tab={analysisTab}
                   insight={displayedAnalysisInsight}
                   distribution={displayedAnalysisDistribution}
                   dashboard={dashboard}
+                  displayUnit={
+                    displayedAnalysisInsight?.displayUnit ??
+                    displayedAnalysisDistribution?.displayUnit ??
+                    activeDisplayUnit
+                  }
                   locationTimezone={activeLocationTimezone}
+                  selectedWeatherTimestamp={routeState.selectedHourlyTimestamp}
+                  selectedModelTimestamp={effectiveModelTimestamp}
+                  analysisStatus={analysisAvailabilityStatus}
+                  imageStatus={imageAvailabilityStatus}
                   imageUrl={imageUrl}
                   imageUpdatedAt={imageUpdatedAt}
                   loadingInsight={loadingInsight}
@@ -2620,8 +3527,11 @@ export default function App() {
                   warnings={translatedWarnings}
                   peakSummary={peakSummary}
                   analysisKey={currentAnalysisKey}
-                  lastConsistentAnalysisKey={lastConsistentAnalysisKey}
-                  onTabChange={(tabValue) =>
+                  lastConsistentAnalysisKey={effectiveLastConsistentAnalysisKey}
+                  analysisRefreshing={manualAnalysisRefreshPending}
+                  pageLoading={analysisPageLoading}
+                  onTabChange={(tabValue) => {
+                    setAnalysisTab(tabValue);
                     updateRouteState(
                       (current) => ({
                         ...current,
@@ -2629,8 +3539,8 @@ export default function App() {
                         tab: tabValue,
                       }),
                       "push",
-                    )
-                  }
+                    );
+                  }}
                 />
               </Suspense>
             </div>
@@ -2646,6 +3556,9 @@ export default function App() {
               >
                 <LazyKellyWorkbench
                   snapshot={kellySnapshot}
+                  sourceMetadata={dashboard.sourceMetadata}
+                  intradaySignals={dashboard.intradaySignals}
+                  marketReference={dashboard.marketReference}
                   locations={dashboard.locationDirectory}
                   activeLocationId={routeState.locationId}
                   timezone={activeLocationTimezone}
@@ -2717,6 +3630,9 @@ export default function App() {
                   pageUrl={dashboard.hourly.pageUrl}
                   reportText={toDecisionSummaryText(homeViewModel.summaryText)}
                   items={homeViewModel.items}
+                  metar={dashboard.metar}
+                  taf={dashboard.taf}
+                  displayUnit={dashboard.displayUnit ?? activeDisplayUnit}
                   locationTimezone={activeLocationTimezone}
                   selectedTimestamp={routeState.selectedHourlyTimestamp}
                   onSelectTimestamp={(timestamp) =>
@@ -2728,6 +3644,8 @@ export default function App() {
                   }
                   currentItem={homeViewModel.currentItem}
                   selectedItem={homeViewModel.selectedItem}
+                  intradaySignals={dashboard.intradaySignals}
+                  marketReference={dashboard.marketReference}
                   predictabilityScore={dashboard.report.metrics.predictabilityScore ?? null}
                   predictabilityLabel={dashboard.report.metrics.predictability}
                 />
@@ -2738,17 +3656,28 @@ export default function App() {
                   insight={insight}
                   loading={loadingInsight}
                   error={insightError}
+                  displayUnit={insightDisplayUnit}
                   locationTimezone={activeLocationTimezone}
-                  selectedInsightTimestamp={routeState.selectedInsightTimestamp}
+                  selectedWeatherTimestamp={routeState.selectedHourlyTimestamp}
+                  selectedModelTimestamp={effectiveModelTimestamp}
                   actualTemperatureC={routeState.actualTemperatureC}
                   manualTemperatureText={manualTemperatureText}
                   referenceMode={referenceTemperatureMode}
                   onSelectTimestamp={(value) =>
-                    updateRouteState((current) => ({
-                      ...current,
-                      selectedInsightTimestamp: value,
-                      selectedHourlyTimestamp: value ?? current.selectedHourlyTimestamp,
-                    }))
+                    updateRouteState((current) => {
+                      const nextSelectedTimestamp = value ?? current.selectedInsightTimestamp ?? current.selectedHourlyTimestamp;
+                      const nextActualTemperature =
+                        referenceTemperatureMode === "default"
+                          ? resolveDefaultReferenceTemperature(dashboardRef.current, nextSelectedTimestamp)
+                          : current.actualTemperatureC;
+
+                      return {
+                        ...current,
+                        selectedInsightTimestamp: nextSelectedTimestamp,
+                        selectedHourlyTimestamp: nextSelectedTimestamp,
+                        actualTemperatureC: nextActualTemperature,
+                      };
+                    })
                   }
                   onTemperatureChange={(value) => {
                     setReferenceTemperatureMode("manual");
@@ -2756,12 +3685,13 @@ export default function App() {
                     const parsed = Number.parseFloat(value);
                     updateRouteState((current) => ({
                       ...current,
-                      actualTemperatureC: Number.isFinite(parsed) ? parsed : null,
+                      actualTemperatureC:
+                        Number.isFinite(parsed) ? convertTemperatureToC(parsed, insightDisplayUnit) : null,
                     }));
                   }}
                   onResetTemperature={() => {
                     setReferenceTemperatureMode("default");
-                    setManualTemperatureText(defaultReferenceTemperature !== null ? String(defaultReferenceTemperature) : "");
+                    setManualTemperatureText(formatTemperatureInputValue(defaultReferenceTemperature, insightDisplayUnit));
                     updateRouteState((current) => ({
                       ...current,
                       actualTemperatureC: defaultReferenceTemperature,
@@ -2777,6 +3707,19 @@ export default function App() {
                       "push",
                     )
                   }
+                />
+
+                <HomeReferenceCard
+                  hourly={dashboard.hourly}
+                  metar={dashboard.metar}
+                  taf={dashboard.taf}
+                  report={dashboard.report}
+                  multimodel={dashboard.multimodel}
+                  insight={insight}
+                  sourceMetadata={dashboard.sourceMetadata}
+                  pageUrl={dashboard.hourly.pageUrl}
+                  displayUnit={dashboard.displayUnit ?? activeDisplayUnit}
+                  locationTimezone={activeLocationTimezone}
                 />
 
                 {homepageWarnings.length > 0 ? <WarningLines items={homepageWarnings.slice(0, 2)} /> : null}

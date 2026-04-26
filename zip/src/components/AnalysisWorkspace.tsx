@@ -7,23 +7,50 @@ import {
   ShieldCheck,
   Thermometer,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { UI_TEXT, translatePredictabilityLabel, translateStatusLabel } from "../display-text";
+import {
+  UI_TEXT,
+  describeMultimodelStatus,
+  translatePredictabilityLabel,
+  translateStatusLabel,
+} from "../display-text";
 import type { DashboardViewModel, DistributionViewModel, InsightViewModel } from "../mappers";
 import { resolveModelCatalogEntry } from "../model-catalog";
-import type { MultiModelDistributionBucket } from "../types";
-import { formatDateTime, formatNumber, formatTime } from "../utils";
+import type { KellyTemperatureUnit, MultiModelDistributionBucket } from "../types";
+import { formatDateTime, formatNumber, formatTemperature, formatTemperatureDelta, formatTime } from "../utils";
 import { MetricTile } from "./MetricTile";
 import { PredictabilityDots } from "./PredictabilityDots";
 import { WarningLines } from "./WarningLines";
 
-const DEGREE_C = "°C";
 const NO_FILTER_MATCH_TEXT = "当前筛选暂无命中模型。";
 const PROVIDER_UPDATE_FALLBACK = "实时 Last update 以 provider 页面为准";
+
+const WEATHER_TIMESTAMP_LABEL = "天气时刻";
+const MODEL_TIMESTAMP_LABEL = "模型时刻";
+const WEATHER_TIMESTAMP_PENDING = "等待天气时刻";
+const MODEL_TIMESTAMP_PENDING = "等待模型时刻";
+const ANALYSIS_STATE_LABEL = "分析状态";
+const IMAGE_STATE_LABEL = "原图状态";
+const ANALYSIS_MOBILE_MEDIA_QUERY = "(max-width: 900px)";
+
+const detectAnalysisMobileLayout = () =>
+  typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia(ANALYSIS_MOBILE_MEDIA_QUERY).matches
+    : false;
+
+const resolveStatusTone = (status: "ready" | "revalidating" | "fallback_error" | "unavailable") => {
+  if (status === "ready") {
+    return "success" as const;
+  }
+  if (status === "revalidating") {
+    return "accent" as const;
+  }
+  return "warning" as const;
+};
 
 type ActiveDistributionFilter =
   | { kind: "none" }
@@ -44,7 +71,7 @@ const formatDelta = (value: number | null | undefined) => {
     return "--";
   }
 
-  return `${value > 0 ? "+" : ""}${formatNumber(value)}${DEGREE_C}`;
+  return value > 0 ? `+${formatNumber(value)}` : formatNumber(value);
 };
 
 const sumBucketCount = (buckets: MultiModelDistributionBucket[]) =>
@@ -66,6 +93,29 @@ const findBucketLabel = (
   return match?.label ?? null;
 };
 
+const formatBucketRangeLabel = (
+  bucket: MultiModelDistributionBucket,
+  displayUnit: KellyTemperatureUnit,
+) =>
+  `${formatTemperature(bucket.bucketStartC, displayUnit)} - ${formatTemperature(bucket.bucketEndC, displayUnit)}`;
+
+const formatBucketLabelFromKey = (
+  buckets: MultiModelDistributionBucket[] | null | undefined,
+  label: string | null | undefined,
+  displayUnit: KellyTemperatureUnit,
+) => {
+  if (!label) {
+    return null;
+  }
+
+  const match = buckets?.find((item) => item.label === label);
+  if (!match) {
+    return label;
+  }
+
+  return formatBucketRangeLabel(match, displayUnit);
+};
+
 const RuntimeRow = ({
   label,
   value,
@@ -82,6 +132,42 @@ const RuntimeRow = ({
   </div>
 );
 
+const ANALYSIS_CONFIDENCE_LABEL = {
+  high: "高",
+  medium: "中",
+  low: "低",
+} as const;
+
+const ANALYSIS_SOURCE_STATUS_LABEL: Record<string, string> = {
+  production: "已接入",
+  planned: "计划接入",
+  candidate: "待确认",
+  unavailable: "暂不可用",
+};
+
+const describeAnalysisReferenceStation = (sourceMetadata: DashboardViewModel["sourceMetadata"]) =>
+  sourceMetadata.contract.settlementReference.stationCode ?? sourceMetadata.contract.settlementReference.label;
+
+const AnalysisStatusPill = ({
+  label,
+  tone = "muted",
+}: {
+  label: string;
+  tone?: "good" | "warn" | "muted";
+}) => (
+  <span
+    className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] ${
+      tone === "good"
+        ? "border-[rgba(216,255,79,0.24)] bg-[rgba(216,255,79,0.1)] text-[var(--accent)]"
+        : tone === "warn"
+          ? "border-[rgba(255,200,107,0.24)] bg-[rgba(255,200,107,0.1)] text-[var(--warning)]"
+          : "border-white/10 bg-white/[0.03] text-white/54"
+    }`}
+  >
+    {label}
+  </span>
+);
+
 const DistributionFilterCard = ({
   title,
   icon,
@@ -91,6 +177,7 @@ const DistributionFilterCard = ({
   active,
   loading,
   warning,
+  emptyStateText,
   onClear,
   items,
   onToggle,
@@ -103,6 +190,7 @@ const DistributionFilterCard = ({
   active: boolean;
   loading: boolean;
   warning: string | null;
+  emptyStateText?: string;
   onClear: () => void;
   items: DistributionPreviewItem[];
   onToggle: (key: string) => void;
@@ -158,7 +246,7 @@ const DistributionFilterCard = ({
         ))
       ) : (
         <div className="rounded-[16px] border border-white/8 bg-black/20 px-3 py-3 text-xs leading-5 text-white/48">
-          {loading ? UI_TEXT.analysis.distributionLoading : UI_TEXT.analysis.waitingModelData}
+          {loading ? UI_TEXT.analysis.distributionLoading : (emptyStateText ?? UI_TEXT.analysis.waitingModelData)}
         </div>
       )}
     </div>
@@ -172,7 +260,12 @@ export const AnalysisWorkspace = ({
   insight,
   distribution,
   dashboard,
+  displayUnit,
   locationTimezone,
+  selectedWeatherTimestamp,
+  selectedModelTimestamp,
+  analysisStatus,
+  imageStatus,
   imageUrl,
   imageUpdatedAt,
   loadingInsight,
@@ -184,13 +277,20 @@ export const AnalysisWorkspace = ({
   peakSummary,
   analysisKey,
   lastConsistentAnalysisKey,
+  analysisRefreshing,
+  pageLoading,
   onTabChange,
 }: {
   tab: "models" | "image";
   insight: InsightViewModel | null;
   distribution: DistributionViewModel | null;
   dashboard: DashboardViewModel | null;
+  displayUnit: KellyTemperatureUnit;
   locationTimezone?: string;
+  selectedWeatherTimestamp: string | null;
+  selectedModelTimestamp: string | null;
+  analysisStatus: DashboardViewModel["multimodel"]["analysisStatus"];
+  imageStatus: DashboardViewModel["multimodel"]["imageStatus"];
   imageUrl: string | null;
   imageUpdatedAt: string | null;
   loadingInsight: boolean;
@@ -202,12 +302,44 @@ export const AnalysisWorkspace = ({
   peakSummary: string;
   analysisKey: string | null;
   lastConsistentAnalysisKey: string | null;
+  analysisRefreshing: boolean;
+  pageLoading: boolean;
   onTabChange: (tab: "models" | "image") => void;
 }) => {
   const reportMetrics = dashboard?.report.metrics ?? null;
+  const intradaySignals = dashboard?.intradaySignals ?? null;
+  const sourceMetadata = dashboard?.sourceMetadata ?? null;
+  const marketReference = dashboard?.marketReference ?? null;
+  const [isMobileLayout, setIsMobileLayout] = useState(detectAnalysisMobileLayout);
   const [hoveredModelName, setHoveredModelName] = useState<string | null>(null);
   const [selectedModelName, setSelectedModelName] = useState<string | null>(null);
   const [activeDistributionFilter, setActiveDistributionFilter] = useState<ActiveDistributionFilter>({ kind: "none" });
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return;
+    }
+
+    const mediaQueryList = window.matchMedia(ANALYSIS_MOBILE_MEDIA_QUERY);
+    const handleChange = (event: MediaQueryListEvent) => {
+      setIsMobileLayout(event.matches);
+    };
+
+    setIsMobileLayout(mediaQueryList.matches);
+    if (typeof mediaQueryList.addEventListener === "function") {
+      mediaQueryList.addEventListener("change", handleChange);
+      return () => mediaQueryList.removeEventListener("change", handleChange);
+    }
+
+    mediaQueryList.addListener(handleChange);
+    return () => mediaQueryList.removeListener(handleChange);
+  }, []);
+
+  useEffect(() => {
+    setHoveredModelName(null);
+    setSelectedModelName(null);
+    setActiveDistributionFilter({ kind: "none" });
+  }, [analysisKey, lastConsistentAnalysisKey]);
 
   const modelInventory = useMemo(
     () => insight?.modelInventory ?? distribution?.modelInventory ?? [],
@@ -328,18 +460,64 @@ export const AnalysisWorkspace = ({
         ? activeDistributionFilter.label
         : null;
 
+  const highlightedCurrentBucketLabelDisplay = formatBucketLabelFromKey(
+    distribution?.distribution,
+    highlightedCurrentBucketLabel,
+    displayUnit,
+  );
+  const highlightedDayPeakBucketLabelDisplay = formatBucketLabelFromKey(
+    distribution?.peakDistribution,
+    highlightedDayPeakBucketLabel,
+    displayUnit,
+  );
+
   const catalogHitCount = useMemo(
     () => (insight?.rankedModels ?? []).filter((model) => Boolean(catalogByModelName.get(model.modelName))).length,
     [catalogByModelName, insight?.rankedModels],
   );
 
   const softWarnings = useMemo(() => Array.from(new Set((warnings ?? []).filter(Boolean))), [warnings]);
-  const analysisRefreshing = Boolean(
-    analysisKey &&
-      lastConsistentAnalysisKey &&
-      analysisKey !== lastConsistentAnalysisKey &&
-      (loadingInsight || loadingDistribution),
-  );
+  const resolvedAnalysisStatus = analysisStatus ?? "unavailable";
+  const resolvedImageStatus = imageStatus ?? "unavailable";
+  const analysisStatusCaption = describeMultimodelStatus("analysis", resolvedAnalysisStatus);
+  const imageStatusCaption = describeMultimodelStatus("image", resolvedImageStatus);
+  const weatherTimestampValue = selectedWeatherTimestamp
+    ? formatTime(selectedWeatherTimestamp, locationTimezone)
+    : "--";
+  const weatherTimestampCaption = selectedWeatherTimestamp
+    ? formatDateTime(selectedWeatherTimestamp, locationTimezone)
+    : WEATHER_TIMESTAMP_PENDING;
+  const modelTimestampValue = selectedModelTimestamp
+    ? formatTime(selectedModelTimestamp, locationTimezone)
+    : "--";
+  const modelTimestampCaption = selectedModelTimestamp
+    ? formatDateTime(selectedModelTimestamp, locationTimezone)
+    : MODEL_TIMESTAMP_PENDING;
+  const analysisUnavailable =
+    !loadingInsight &&
+    !loadingDistribution &&
+    !insight &&
+    !distribution &&
+    !insightError &&
+    !distributionError;
+  const analysisEmptyStateText =
+    !loadingInsight &&
+    !loadingDistribution &&
+    !insight &&
+    !distribution &&
+    !insightError &&
+    !distributionError
+      ? UI_TEXT.analysis.waitingModelData
+      : undefined;
+
+  const currentBucketSelectedLabel =
+    activeDistributionFilter.kind === "currentTempBucket"
+      ? formatBucketLabelFromKey(distribution?.distribution, activeDistributionFilter.label, displayUnit)
+      : null;
+  const dayPeakBucketSelectedLabel =
+    activeDistributionFilter.kind === "dayPeakBucket"
+      ? formatBucketLabelFromKey(distribution?.peakDistribution, activeDistributionFilter.label, displayUnit)
+      : null;
 
   const interactionSummary = useMemo(() => {
     if (selectedModelName) {
@@ -352,23 +530,37 @@ export const AnalysisWorkspace = ({
       return `${UI_TEXT.analysis.peakPrefix} ${formatTime(activeDistributionFilter.timestamp, locationTimezone)}`;
     }
     if (activeDistributionFilter.kind === "currentTempBucket") {
-      return `${UI_TEXT.analysis.bucketPrefix} ${activeDistributionFilter.label}`;
+      return `${UI_TEXT.analysis.bucketPrefix} ${
+        currentBucketSelectedLabel ?? activeDistributionFilter.label ?? UI_TEXT.analysis.defaultBucketState
+      }`;
     }
     if (activeDistributionFilter.kind === "dayPeakBucket") {
-      return `${UI_TEXT.analysis.highestPeakDistribution} ${activeDistributionFilter.label}`;
+      return `${UI_TEXT.analysis.highestPeakDistribution} ${
+        dayPeakBucketSelectedLabel ?? activeDistributionFilter.label ?? UI_TEXT.analysis.defaultBucketState
+      }`;
     }
     return UI_TEXT.analysis.hoverHint;
-  }, [activeDistributionFilter, hoveredModelName, locationTimezone, selectedModelName]);
+  }, [
+    activeDistributionFilter,
+    currentBucketSelectedLabel,
+    dayPeakBucketSelectedLabel,
+    hoveredModelName,
+    locationTimezone,
+    selectedModelName,
+  ]);
 
   const currentFilterSummary = useMemo(() => {
     if (activeDistributionFilter.kind === "peakTime") {
       return formatTime(activeDistributionFilter.timestamp, locationTimezone);
     }
-    if (activeDistributionFilter.kind === "currentTempBucket" || activeDistributionFilter.kind === "dayPeakBucket") {
-      return activeDistributionFilter.label;
+    if (activeDistributionFilter.kind === "currentTempBucket") {
+      return currentBucketSelectedLabel ?? activeDistributionFilter.label ?? UI_TEXT.analysis.filterAll;
+    }
+    if (activeDistributionFilter.kind === "dayPeakBucket") {
+      return dayPeakBucketSelectedLabel ?? activeDistributionFilter.label ?? UI_TEXT.analysis.filterAll;
     }
     return UI_TEXT.analysis.filterAll;
-  }, [activeDistributionFilter, locationTimezone]);
+  }, [activeDistributionFilter, currentBucketSelectedLabel, dayPeakBucketSelectedLabel, locationTimezone]);
 
   const peakCardItems = useMemo<DistributionPreviewItem[]>(
     () =>
@@ -377,33 +569,33 @@ export const AnalysisWorkspace = ({
         label: formatTime(item.timestamp, locationTimezone),
         count: item.modelCount,
         ratio: insight?.modelCount ? item.modelCount / insight.modelCount : 0,
-        meta: `${UI_TEXT.analysis.average} ${formatNumber(item.avgPeakTemperatureC)}${DEGREE_C}`,
+        meta: `${UI_TEXT.analysis.average} ${formatTemperature(item.avgPeakTemperatureC, displayUnit)}`,
       })),
-    [insight?.modelCount, insight?.peakTimeDistribution, locationTimezone],
+    [displayUnit, insight?.modelCount, insight?.peakTimeDistribution, locationTimezone],
   );
 
   const currentBucketItems = useMemo<DistributionPreviewItem[]>(
     () =>
       (distribution?.distribution ?? []).map((bucket) => ({
         key: bucket.label,
-        label: bucket.label,
+        label: formatBucketRangeLabel(bucket, displayUnit),
         count: bucket.count,
         ratio: distribution?.modelCount ? bucket.count / distribution.modelCount : 0,
-        meta: `${formatNumber(bucket.bucketStartC)}${DEGREE_C} - ${formatNumber(bucket.bucketEndC)}${DEGREE_C}`,
+        meta: `${formatTemperature(bucket.bucketStartC, displayUnit)} - ${formatTemperature(bucket.bucketEndC, displayUnit)}`,
       })),
-    [distribution?.distribution, distribution?.modelCount],
+    [displayUnit, distribution?.distribution, distribution?.modelCount],
   );
 
   const dayPeakBucketItems = useMemo<DistributionPreviewItem[]>(
     () =>
       (distribution?.peakDistribution ?? []).map((bucket) => ({
         key: bucket.label,
-        label: bucket.label,
+        label: formatBucketRangeLabel(bucket, displayUnit),
         count: bucket.count,
         ratio: distribution?.modelCount ? bucket.count / distribution.modelCount : 0,
-        meta: `${formatNumber(bucket.bucketStartC)}${DEGREE_C} - ${formatNumber(bucket.bucketEndC)}${DEGREE_C}`,
+        meta: `${formatTemperature(bucket.bucketStartC, displayUnit)} - ${formatTemperature(bucket.bucketEndC, displayUnit)}`,
       })),
-    [distribution?.modelCount, distribution?.peakDistribution],
+    [displayUnit, distribution?.modelCount, distribution?.peakDistribution],
   );
 
   const currentDistributionWarning =
@@ -431,33 +623,230 @@ export const AnalysisWorkspace = ({
       ? formatDateTime(insight.fetchedAt, locationTimezone)
       : "--";
   const hasPeakSummary = Boolean(insight?.peakTimeDistribution.length || distribution?.peakDistribution.length);
+  const modelsLoadingCaption =
+    selectedWeatherTimestamp ? `${WEATHER_TIMESTAMP_LABEL} ${weatherTimestampCaption}` : UI_TEXT.analysis.distributionLoading;
+  const handleTabSelect = (nextTab: "models" | "image") => {
+    if (nextTab === tab) {
+      return;
+    }
+
+    onTabChange(nextTab);
+  };
+
+  const modelProfilePanel = (
+    <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+      <div className="flex items-center justify-between gap-3">
+        <div className="eyebrow flex items-center gap-2"><Info className="h-4 w-4 text-[var(--accent)]" />{UI_TEXT.analysis.modelProfile}</div>
+        {selectedModelName ? <button type="button" onClick={() => setSelectedModelName(null)} className="text-xs text-white/48 transition hover:text-white/72">{UI_TEXT.analysis.clearLock}</button> : null}
+      </div>
+
+      {!activeModel ? (
+        <div className="mt-4 space-y-4">
+          <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-4 text-sm leading-6 text-white/60">{UI_TEXT.analysis.modelProfileHint}</div>
+          <MetricTile label={UI_TEXT.analysis.profileCoverage} value={insight ? `${catalogHitCount}/${insight.modelCount}` : "--"} caption={UI_TEXT.analysis.dynamicJoinCaption} />
+          <MetricTile label={UI_TEXT.analysis.interactionState} value={interactionSummary} caption={analysisRefreshing ? UI_TEXT.analysis.distributionLoading : UI_TEXT.analysis.interactionClickHint} />
+        </div>
+      ) : (
+        <div className="mt-4 space-y-4">
+          <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-4">
+            <div className="text-lg font-semibold text-white">{activeModel.modelName}</div>
+            <div className="mt-1 text-sm text-white/54">{activeCatalog?.fullName ?? UI_TEXT.analysis.staticProfileMissing}</div>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
+              <MetricTile label={UI_TEXT.analysis.currentPrediction} value={formatTemperature(activeModel.currentTemperatureC, displayUnit)} caption={`${UI_TEXT.analysis.deviation} ${formatTemperatureDelta(activeModel.deltaToActualTemperatureC, displayUnit, 1, true)}`} tone="accent" />
+              <MetricTile label={UI_TEXT.analysis.dayPeakTemperature} value={formatTemperature(activeModel.dayPeakTemperatureC, displayUnit)} caption={activeModel.dayPeakTimestamp ? formatDateTime(activeModel.dayPeakTimestamp, locationTimezone) : "--"} tone="warning" />
+            </div>
+          </div>
+
+          <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-4 text-sm leading-6 text-white/64">
+            <div>{`${UI_TEXT.analysis.profileOrganization}: ${activeCatalog?.agency ?? "--"}`}</div>
+            <div>{`${UI_TEXT.analysis.profileType}: ${activeCatalog?.domainType ?? "--"}`}</div>
+            <div>{`${UI_TEXT.analysis.profileCoverageLabel}: ${activeCatalog?.coverage ?? "--"}`}</div>
+            <div>{`${UI_TEXT.analysis.profileResolution}: ${activeCatalog?.resolutionLabel ?? "--"}`}</div>
+            <div>{`${UI_TEXT.analysis.profileUpdate}: ${officialCadenceValue}`}</div>
+            <div>{`${UI_TEXT.analysis.profileHorizon}: ${activeCatalog?.forecastHorizon ?? "--"}`}</div>
+          </div>
+
+          <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-4">
+            <div className="text-sm font-medium text-white">{UI_TEXT.analysis.profileRuntime}</div>
+            <div className="mt-3 grid gap-3">
+              <RuntimeRow label={UI_TEXT.analysis.profilePageUpdate} value={pageUpdateValue} hint={activeInventory?.sourceProvider ?? activeInventory?.sourceDisplayName ?? null} />
+              <RuntimeRow label={UI_TEXT.analysis.profileOfficialCadence} value={officialCadenceValue} hint={activeCatalog?.officialVerifiedAt ? `${UI_TEXT.analysis.profileVerifiedAt} ${activeCatalog.officialVerifiedAt}` : null} />
+              <RuntimeRow label={UI_TEXT.analysis.profileFetchedAt} value={fetchedAtValue} hint={activeInventory?.pageOrder ? `#${activeInventory.pageOrder}` : null} />
+            </div>
+          </div>
+
+          {activeCatalog ? (
+            <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-4 text-sm leading-6 text-white/64">
+              <div className="text-sm font-medium text-white">{UI_TEXT.analysis.profileStrengths}</div>
+              {activeCatalog.strengthsZh.map((item) => <div key={item}>- {item}</div>)}
+              <div className="mt-3 text-sm font-medium text-white">{UI_TEXT.analysis.profileLimits}</div>
+              {activeCatalog.limitsZh.map((item) => <div key={item}>- {item}</div>)}
+            </div>
+          ) : null}
+
+          <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-4 text-sm leading-6 text-white/64">
+            <div>{`${UI_TEXT.analysis.profileDistributionTemp}: ${activeMember ? formatTemperature(activeMember.temperatureC, displayUnit) : "--"}`}</div>
+            <div>{`${UI_TEXT.analysis.profileBucket}: ${highlightedCurrentBucketLabelDisplay ?? "--"}`}</div>
+            <div>{`${UI_TEXT.analysis.highestPeakDistribution}: ${highlightedDayPeakBucketLabelDisplay ?? "--"}`}</div>
+            <div>{`${UI_TEXT.analysis.profilePeakHit}: ${activeDistributionFilter.kind === "peakTime" ? (activeModel.dayPeakTimestamp === activeDistributionFilter.timestamp ? UI_TEXT.analysis.hit : UI_TEXT.analysis.miss) : "--"}`}</div>
+            <div>{`${UI_TEXT.analysis.profileNotes}: ${activeCatalog?.notes ?? "--"}`}</div>
+          </div>
+
+          <div className="rounded-[18px] border border-[rgba(242,183,109,0.2)] bg-[rgba(242,183,109,0.08)] px-4 py-4 text-sm leading-6 text-white/66">{UI_TEXT.analysis.profileDisclaimer}</div>
+          {activeCatalog?.officialSourceUrl ? <a href={activeCatalog.officialSourceUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 text-sm text-white/72 transition hover:text-white">{UI_TEXT.analysis.openOfficialSource}<ArrowUpRight className="h-4 w-4" /></a> : null}
+        </div>
+      )}
+    </section>
+  );
 
   return (
     <section className="analysis-panel terminal-panel">
-      <Tabs value={tab} onValueChange={(value) => onTabChange(value as "models" | "image")} className="panel-section flex h-full min-h-0 flex-col gap-4 p-5">
+      <Tabs value={tab} onValueChange={(value) => handleTabSelect(value as "models" | "image")} className="panel-section flex h-full min-h-0 flex-col gap-4 p-5">
         <div className="analysis-header">
           <div>
             <div className="eyebrow">{UI_TEXT.analysis.eyebrow}</div>
             <h2 className="mt-3 text-[2rem] font-semibold tracking-[-0.04em] text-white">{UI_TEXT.analysis.title}</h2>
             <p className="mt-2 text-sm leading-6 text-white/58">{UI_TEXT.analysis.description}</p>
           </div>
-          <TabsList>
-            <TabsTrigger value="models">{UI_TEXT.analysis.modelsTab}</TabsTrigger>
-            <TabsTrigger value="image">{UI_TEXT.analysis.imageTab}</TabsTrigger>
+          <TabsList className="analysis-tabs-list">
+            <TabsTrigger value="models" onClick={() => handleTabSelect("models")}>
+              {UI_TEXT.analysis.modelsTab}
+            </TabsTrigger>
+            <TabsTrigger value="image" onClick={() => handleTabSelect("image")}>
+              {UI_TEXT.analysis.imageTab}
+            </TabsTrigger>
           </TabsList>
         </div>
 
         <TabsContent value="models" className="min-h-0 flex-1">
+          {pageLoading ? (
+            <section className="flex h-full items-center justify-center rounded-[26px] border border-white/8 bg-white/[0.025] px-6 py-8">
+              <div className="w-full max-w-3xl space-y-4">
+                <div className="eyebrow">{UI_TEXT.analysis.eyebrow}</div>
+                <div className="text-3xl font-semibold tracking-[-0.03em] text-white">{UI_TEXT.analysis.distributionLoading}</div>
+                <div className="text-sm leading-6 text-white/58">{modelsLoadingCaption}</div>
+                <div className="grid gap-3 md:grid-cols-3">
+                  <div className="h-28 rounded-[22px] border border-white/8 bg-white/[0.03]" />
+                  <div className="h-28 rounded-[22px] border border-white/8 bg-white/[0.03]" />
+                  <div className="h-28 rounded-[22px] border border-white/8 bg-white/[0.03]" />
+                </div>
+              </div>
+            </section>
+          ) : (
           <ScrollArea className="h-full rounded-[26px] border border-white/8 bg-white/[0.025]">
             <div className="analysis-content space-y-4 p-4">
               <div className="metric-grid">
-                <MetricTile label={UI_TEXT.analysis.referenceTemperature} value={actualTemperatureC !== null ? `${formatNumber(actualTemperatureC)}${DEGREE_C}` : "--"} caption={UI_TEXT.header.home} tone="accent" />
-                <MetricTile label={UI_TEXT.analysis.modelCount} value={insight ? String(insight.modelCount) : "--"} caption={insight?.selectedTimestamp ? formatDateTime(insight.selectedTimestamp, locationTimezone) : UI_TEXT.analysis.waitingModelData} />
-                <MetricTile label={UI_TEXT.analysis.temperatureSpread} value={distribution ? `${formatNumber(distribution.highlights.spreadTemperatureC)}${DEGREE_C}` : "--"} caption={UI_TEXT.analysis.temperatureSpreadCaption} tone="warning" />
+                <MetricTile
+                  label={UI_TEXT.analysis.referenceTemperature}
+                  value={formatTemperature(actualTemperatureC, displayUnit)}
+                  caption={`${WEATHER_TIMESTAMP_LABEL} ${weatherTimestampCaption}`}
+                  tone="accent"
+                />
+                <MetricTile
+                  label={MODEL_TIMESTAMP_LABEL}
+                  value={modelTimestampValue}
+                  caption={
+                    insight
+                      ? `${modelTimestampCaption} 璺?${insight.modelCount} ${UI_TEXT.analysis.modelUnit}`
+                      : modelTimestampCaption
+                  }
+                />
+                <MetricTile
+                  label={UI_TEXT.analysis.temperatureSpread}
+                  value={distribution ? formatTemperatureDelta(distribution.highlights.spreadTemperatureC, displayUnit) : "--"}
+                  caption={UI_TEXT.analysis.temperatureSpreadCaption}
+                  tone="warning"
+                />
                 <MetricTile label={UI_TEXT.analysis.catalogCoverage} value={insight ? `${catalogHitCount}/${insight.modelCount}` : "--"} caption={interactionSummary} tone="success" />
               </div>
 
               {softWarnings.length > 0 ? <WarningLines items={softWarnings.slice(0, 4)} /> : null}
+              <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+                <div className="grid gap-3 md:grid-cols-2">
+                  <MetricTile
+                    label={ANALYSIS_STATE_LABEL}
+                    value={translateStatusLabel(resolvedAnalysisStatus)}
+                    caption={analysisStatusCaption}
+                    tone={resolveStatusTone(resolvedAnalysisStatus)}
+                  />
+                  <MetricTile
+                    label={IMAGE_STATE_LABEL}
+                    value={translateStatusLabel(resolvedImageStatus)}
+                    caption={imageStatusCaption}
+                    tone={resolveStatusTone(resolvedImageStatus)}
+                  />
+                </div>
+              </section>
+
+              {intradaySignals && sourceMetadata && marketReference ? (
+                <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="eyebrow flex items-center gap-2">
+                        <ShieldCheck className="h-4 w-4 text-[var(--accent)]" />
+                        今天判断
+                      </div>
+                      <div className="mt-2 text-lg font-semibold text-white">{intradaySignals.headline}</div>
+                      <div className="mt-2 text-sm leading-6 text-white/58">先看今天大概落在哪个温度区间，再用下方模型分歧确认判断是否稳定。</div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <AnalysisStatusPill label={`把握度 ${ANALYSIS_CONFIDENCE_LABEL[intradaySignals.confidence]}`} tone="good" />
+                      <AnalysisStatusPill
+                        label={`参考站点 ${describeAnalysisReferenceStation(sourceMetadata)}`}
+                      />
+                      <AnalysisStatusPill
+                        label={`重点时段 ${sourceMetadata.contract.peakWindowLocal.startHour}:00-${sourceMetadata.contract.peakWindowLocal.endHour}:00`}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 lg:grid-cols-3">
+                    <RuntimeRow label="大致判断" value={intradaySignals.baseCase} />
+                    <RuntimeRow label="偏高的话" value={intradaySignals.upsideCase} />
+                    <RuntimeRow label="偏低的话" value={intradaySignals.downsideCase} />
+                  </div>
+
+                  <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,0.9fr)]">
+                    <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3">
+                      <div className="eyebrow flex items-center gap-2">
+                        <Info className="h-4 w-4 text-[var(--accent-secondary)]" />
+                        主要参考
+                      </div>
+                      <div className="mt-3 space-y-2 text-sm leading-6 text-white/68">
+                        {intradaySignals.evidence.slice(0, 4).map((item) => (
+                          <div key={item}>• {item}</div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3">
+                      <div className="eyebrow flex items-center gap-2">
+                        <Clock3 className="h-4 w-4 text-[var(--warning)]" />
+                        数据参考
+                      </div>
+                      <div className="mt-3 space-y-2 text-sm leading-6 text-white/68">
+                        <div>
+                          小时预报：{sourceMetadata.contract.currentSources.baselineForecast.label} /{" "}
+                          {ANALYSIS_SOURCE_STATUS_LABEL[sourceMetadata.contract.currentSources.baselineForecast.status] ??
+                            sourceMetadata.contract.currentSources.baselineForecast.status}
+                        </div>
+                        <div>
+                          多模型参考：{sourceMetadata.contract.currentSources.modelEnvelope.label} /{" "}
+                          {ANALYSIS_SOURCE_STATUS_LABEL[sourceMetadata.contract.currentSources.modelEnvelope.status] ??
+                            sourceMetadata.contract.currentSources.modelEnvelope.status}
+                        </div>
+                        <div>
+                          机场天气提示：{ANALYSIS_SOURCE_STATUS_LABEL[sourceMetadata.contract.targetUpgrades.taf.status] ??
+                            sourceMetadata.contract.targetUpgrades.taf.status}
+                        </div>
+                        <div>
+                          下一观察点：{intradaySignals.nextObservationAt ? formatDateTime(intradaySignals.nextObservationAt, locationTimezone) : "--"}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              ) : null}
 
               <div className="analysis-models-layout">
                 <div className="space-y-4">
@@ -466,7 +855,7 @@ export const AnalysisWorkspace = ({
                       <div>
                         <div className="eyebrow">{UI_TEXT.analysis.filterState}</div>
                         <div className="mt-2 text-sm font-medium text-white">{currentFilterSummary}</div>
-                        <div className="mt-1 text-xs text-white/48">{filteredModels.length} {UI_TEXT.analysis.modelUnit} · {analysisRefreshing ? UI_TEXT.analysis.distributionLoading : UI_TEXT.analysis.localFilterOnly}</div>
+                        <div className="mt-1 text-xs text-white/48">{filteredModels.length} {UI_TEXT.analysis.modelUnit} 璺?{analysisRefreshing ? UI_TEXT.analysis.distributionLoading : UI_TEXT.analysis.localFilterOnly}</div>
                       </div>
                       {activeDistributionFilter.kind !== "none" ? (
                         <button type="button" onClick={() => setActiveDistributionFilter({ kind: "none" })} className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/58 transition hover:border-white/18 hover:text-white/78">
@@ -485,6 +874,7 @@ export const AnalysisWorkspace = ({
                         active={activeDistributionFilter.kind === "peakTime"}
                         loading={loadingInsight}
                         warning={insightError}
+                        emptyStateText={analysisEmptyStateText}
                         onClear={() => setActiveDistributionFilter({ kind: "none" })}
                         items={peakCardItems}
                         onToggle={(timestamp) => setActiveDistributionFilter((current) => current.kind === "peakTime" && current.timestamp === timestamp ? { kind: "none" } : { kind: "peakTime", timestamp })}
@@ -492,12 +882,17 @@ export const AnalysisWorkspace = ({
                       <DistributionFilterCard
                         title={UI_TEXT.analysis.temperatureDistribution}
                         icon={<Thermometer className="h-4 w-4 text-[var(--accent-secondary)]" />}
-                        selectedLabel={activeDistributionFilter.kind === "currentTempBucket" ? activeDistributionFilter.label : UI_TEXT.analysis.defaultBucketState}
+                        selectedLabel={
+                          activeDistributionFilter.kind === "currentTempBucket"
+                            ? currentBucketSelectedLabel ?? activeDistributionFilter.label ?? UI_TEXT.analysis.defaultBucketState
+                            : UI_TEXT.analysis.defaultBucketState
+                        }
                         selectedCount={`${activeDistributionFilter.kind === "currentTempBucket" && currentBucketSet ? currentBucketSet.size : distribution?.modelCount ?? 0} ${UI_TEXT.analysis.modelUnit}`}
                         activeKey={activeDistributionFilter.kind === "currentTempBucket" ? activeDistributionFilter.label : null}
                         active={activeDistributionFilter.kind === "currentTempBucket"}
                         loading={loadingDistribution}
                         warning={currentDistributionWarning}
+                        emptyStateText={analysisEmptyStateText}
                         onClear={() => setActiveDistributionFilter({ kind: "none" })}
                         items={currentBucketItems}
                         onToggle={(label) => setActiveDistributionFilter((current) => current.kind === "currentTempBucket" && current.label === label ? { kind: "none" } : { kind: "currentTempBucket", label })}
@@ -505,12 +900,17 @@ export const AnalysisWorkspace = ({
                       <DistributionFilterCard
                         title={UI_TEXT.analysis.highestPeakDistribution}
                         icon={<BarChart3 className="h-4 w-4 text-[var(--accent)]" />}
-                        selectedLabel={activeDistributionFilter.kind === "dayPeakBucket" ? activeDistributionFilter.label : UI_TEXT.analysis.defaultBucketState}
+                        selectedLabel={
+                          activeDistributionFilter.kind === "dayPeakBucket"
+                            ? dayPeakBucketSelectedLabel ?? activeDistributionFilter.label ?? UI_TEXT.analysis.defaultBucketState
+                            : UI_TEXT.analysis.defaultBucketState
+                        }
                         selectedCount={`${activeDistributionFilter.kind === "dayPeakBucket" && dayPeakBucketSet ? dayPeakBucketSet.size : distribution?.modelCount ?? 0} ${UI_TEXT.analysis.modelUnit}`}
                         activeKey={activeDistributionFilter.kind === "dayPeakBucket" ? activeDistributionFilter.label : null}
                         active={activeDistributionFilter.kind === "dayPeakBucket"}
                         loading={loadingDistribution}
                         warning={dayPeakDistributionWarning}
+                        emptyStateText={analysisEmptyStateText}
                         onClear={() => setActiveDistributionFilter({ kind: "none" })}
                         items={dayPeakBucketItems}
                         onToggle={(label) => setActiveDistributionFilter((current) => current.kind === "dayPeakBucket" && current.label === label ? { kind: "none" } : { kind: "dayPeakBucket", label })}
@@ -538,20 +938,22 @@ export const AnalysisWorkspace = ({
                                 <div className="text-lg font-semibold text-white">{model.modelName}</div>
                                 {catalogEntry ? <span className="rounded-full border border-white/10 bg-white/[0.03] px-2 py-0.5 text-[11px] text-white/54">{UI_TEXT.analysis.hasCatalog}</span> : null}
                               </div>
-                              <div className="mt-1 text-sm text-white/56">{UI_TEXT.analysis.currentPrediction} {formatNumber(model.currentTemperatureC)}{DEGREE_C} · {UI_TEXT.analysis.deviation} {formatDelta(model.deltaToActualTemperatureC)}</div>
+                              <div className="mt-1 text-sm text-white/56">{UI_TEXT.analysis.currentPrediction} {formatTemperature(model.currentTemperatureC, displayUnit)} 璺?{UI_TEXT.analysis.deviation} {formatTemperatureDelta(model.deltaToActualTemperatureC, displayUnit, 1, true)}</div>
                             </div>
                             <div className="rounded-[18px] border border-white/8 bg-white/[0.03] px-4 py-3">
                               <div className="eyebrow">{UI_TEXT.analysis.dayPeakTemperature}</div>
-                              <div className="data-mono mt-2 text-2xl font-semibold text-white">{formatNumber(model.dayPeakTemperatureC)}{DEGREE_C}</div>
+                              <div className="data-mono mt-2 text-2xl font-semibold text-white">{formatTemperature(model.dayPeakTemperatureC, displayUnit)}</div>
                               <div className="mt-2 text-xs text-white/54">{model.dayPeakTimestamp ? formatDateTime(model.dayPeakTimestamp, locationTimezone) : UI_TEXT.analysis.noPeakMoment}</div>
                             </div>
                           </article>
                         );
-                      }) : <div className="rounded-[20px] border border-white/8 bg-black/20 px-4 py-5 text-sm leading-6 text-white/56">{NO_FILTER_MATCH_TEXT}</div>}
+                      }) : <div className="rounded-[20px] border border-white/8 bg-black/20 px-4 py-5 text-sm leading-6 text-white/56">{analysisUnavailable ? UI_TEXT.analysis.waitingModelData : NO_FILTER_MATCH_TEXT}</div>}
                     </div>
                     {loadingInsight ? <div className="mt-4 text-xs text-white/54">{UI_TEXT.analysis.rankingLoading}</div> : null}
                     {insightError ? <div className="mt-3 text-sm text-[var(--warning)]">{insightError}</div> : null}
                   </section>
+
+                  {isMobileLayout ? <div className="analysis-mobile-profile">{modelProfilePanel}</div> : null}
 
                   <div className="analysis-grid analysis-grid-secondary">
                     <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
@@ -565,7 +967,7 @@ export const AnalysisWorkspace = ({
                     <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
                       <div className="eyebrow">{UI_TEXT.analysis.extendedMetrics}</div>
                       <div className="mt-4 space-y-4">
-                        <MetricTile label={UI_TEXT.analysis.maxTemperature} value={reportMetrics?.maxTemperatureC !== null && reportMetrics?.maxTemperatureC !== undefined ? `${formatNumber(reportMetrics.maxTemperatureC)}${DEGREE_C}` : "--"} caption={reportMetrics?.forecastDayLabel ?? UI_TEXT.analysis.weatherReport} tone="warning" />
+                        <MetricTile label={UI_TEXT.analysis.maxTemperature} value={formatTemperature(reportMetrics?.maxTemperatureC, displayUnit)} caption={reportMetrics?.forecastDayLabel ?? UI_TEXT.analysis.weatherReport} tone="warning" />
                         <MetricTile label={UI_TEXT.analysis.uvIndex} value={reportMetrics?.uvIndex !== null && reportMetrics?.uvIndex !== undefined ? formatNumber(reportMetrics.uvIndex, 0) : "--"} caption={UI_TEXT.analysis.fromWeatherReport} tone="accent" />
                         <PredictabilityDots score={reportMetrics?.predictabilityScore ?? null} label={`${UI_TEXT.analysis.predictabilityPrefix} ${translatePredictabilityLabel(reportMetrics?.predictability) ?? "--"}`} />
                       </div>
@@ -573,7 +975,7 @@ export const AnalysisWorkspace = ({
                   </div>
                 </div>
 
-                <aside className="analysis-side-panel space-y-4">
+                <aside className={`${isMobileLayout ? "hidden " : ""}analysis-side-panel space-y-4`}>
                   <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
                     <div className="flex items-center justify-between gap-3">
                       <div className="eyebrow flex items-center gap-2"><Info className="h-4 w-4 text-[var(--accent)]" />{UI_TEXT.analysis.modelProfile}</div>
@@ -592,18 +994,18 @@ export const AnalysisWorkspace = ({
                           <div className="text-lg font-semibold text-white">{activeModel.modelName}</div>
                           <div className="mt-1 text-sm text-white/54">{activeCatalog?.fullName ?? UI_TEXT.analysis.staticProfileMissing}</div>
                           <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
-                            <MetricTile label={UI_TEXT.analysis.currentPrediction} value={`${formatNumber(activeModel.currentTemperatureC)}${DEGREE_C}`} caption={`${UI_TEXT.analysis.deviation} ${formatDelta(activeModel.deltaToActualTemperatureC)}`} tone="accent" />
-                            <MetricTile label={UI_TEXT.analysis.dayPeakTemperature} value={`${formatNumber(activeModel.dayPeakTemperatureC)}${DEGREE_C}`} caption={activeModel.dayPeakTimestamp ? formatDateTime(activeModel.dayPeakTimestamp, locationTimezone) : "--"} tone="warning" />
+                            <MetricTile label={UI_TEXT.analysis.currentPrediction} value={formatTemperature(activeModel.currentTemperatureC, displayUnit)} caption={`${UI_TEXT.analysis.deviation} ${formatTemperatureDelta(activeModel.deltaToActualTemperatureC, displayUnit, 1, true)}`} tone="accent" />
+                            <MetricTile label={UI_TEXT.analysis.dayPeakTemperature} value={formatTemperature(activeModel.dayPeakTemperatureC, displayUnit)} caption={activeModel.dayPeakTimestamp ? formatDateTime(activeModel.dayPeakTimestamp, locationTimezone) : "--"} tone="warning" />
                           </div>
                         </div>
 
                         <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-4 text-sm leading-6 text-white/64">
-                          <div>{UI_TEXT.analysis.profileOrganization}：{activeCatalog?.agency ?? "--"}</div>
-                          <div>{UI_TEXT.analysis.profileType}：{activeCatalog?.domainType ?? "--"}</div>
-                          <div>{UI_TEXT.analysis.profileCoverageLabel}：{activeCatalog?.coverage ?? "--"}</div>
-                          <div>{UI_TEXT.analysis.profileResolution}：{activeCatalog?.resolutionLabel ?? "--"}</div>
-                          <div>{UI_TEXT.analysis.profileUpdate}：{officialCadenceValue}</div>
-                          <div>{UI_TEXT.analysis.profileHorizon}：{activeCatalog?.forecastHorizon ?? "--"}</div>
+                          <div>{`${UI_TEXT.analysis.profileOrganization}: ${activeCatalog?.agency ?? "--"}`}</div>
+                          <div>{`${UI_TEXT.analysis.profileType}: ${activeCatalog?.domainType ?? "--"}`}</div>
+                          <div>{`${UI_TEXT.analysis.profileCoverageLabel}: ${activeCatalog?.coverage ?? "--"}`}</div>
+                          <div>{`${UI_TEXT.analysis.profileResolution}: ${activeCatalog?.resolutionLabel ?? "--"}`}</div>
+                          <div>{`${UI_TEXT.analysis.profileUpdate}: ${officialCadenceValue}`}</div>
+                          <div>{`${UI_TEXT.analysis.profileHorizon}: ${activeCatalog?.forecastHorizon ?? "--"}`}</div>
                         </div>
 
                         <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-4">
@@ -625,11 +1027,11 @@ export const AnalysisWorkspace = ({
                         ) : null}
 
                         <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-4 text-sm leading-6 text-white/64">
-                          <div>{UI_TEXT.analysis.profileDistributionTemp}：{activeMember ? `${formatNumber(activeMember.temperatureC)}${DEGREE_C}` : "--"}</div>
-                          <div>{UI_TEXT.analysis.profileBucket}：{highlightedCurrentBucketLabel ?? "--"}</div>
-                          <div>{UI_TEXT.analysis.highestPeakDistribution}：{highlightedDayPeakBucketLabel ?? "--"}</div>
-                          <div>{UI_TEXT.analysis.profilePeakHit}：{activeDistributionFilter.kind === "peakTime" ? activeModel.dayPeakTimestamp === activeDistributionFilter.timestamp ? UI_TEXT.analysis.hit : UI_TEXT.analysis.miss : "--"}</div>
-                          <div>{UI_TEXT.analysis.profileNotes}：{activeCatalog?.notes ?? "--"}</div>
+                          <div>{`${UI_TEXT.analysis.profileDistributionTemp}: ${activeMember ? formatTemperature(activeMember.temperatureC, displayUnit) : "--"}`}</div>
+                          <div>{`${UI_TEXT.analysis.profileBucket}: ${highlightedCurrentBucketLabelDisplay ?? "--"}`}</div>
+                          <div>{`${UI_TEXT.analysis.highestPeakDistribution}: ${highlightedDayPeakBucketLabelDisplay ?? "--"}`}</div>
+                          <div>{`${UI_TEXT.analysis.profilePeakHit}: ${activeDistributionFilter.kind === "peakTime" ? (activeModel.dayPeakTimestamp === activeDistributionFilter.timestamp ? UI_TEXT.analysis.hit : UI_TEXT.analysis.miss) : "--"}`}</div>
+                          <div>{`${UI_TEXT.analysis.profileNotes}: ${activeCatalog?.notes ?? "--"}`}</div>
                         </div>
 
                         <div className="rounded-[18px] border border-[rgba(242,183,109,0.2)] bg-[rgba(242,183,109,0.08)] px-4 py-4 text-sm leading-6 text-white/66">{UI_TEXT.analysis.profileDisclaimer}</div>
@@ -641,12 +1043,13 @@ export const AnalysisWorkspace = ({
               </div>
             </div>
           </ScrollArea>
+          )}
         </TabsContent>
 
         <TabsContent value="image" className="min-h-0 flex-1">
           <div className="analysis-image-layout">
             <section className="rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
-              <div className="flex items-start justify-between gap-4">
+              <div className="analysis-image-toolbar flex flex-wrap items-start justify-between gap-4">
                 <div>
                   <div className="eyebrow flex items-center gap-2"><ImageIcon className="h-4 w-4 text-[var(--accent)]" />{UI_TEXT.analysis.officialImage}</div>
                   <h3 className="mt-3 text-2xl font-semibold text-white">{UI_TEXT.analysis.officialImageViewer}</h3>
@@ -655,16 +1058,26 @@ export const AnalysisWorkspace = ({
                 {imageUrl ? <a href={imageUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:text-white">{UI_TEXT.analysis.openInNewTab}<ArrowUpRight className="h-4 w-4" /></a> : null}
               </div>
 
-              <div className="mt-4 grid gap-3 sm:grid-cols-4">
-                <MetricTile label={UI_TEXT.analysis.currentStatus} value={translateStatusLabel(dashboard?.multimodel.statusLabel ?? null)} caption={dashboard?.multimodel.stale ? UI_TEXT.analysis.cachedVersionCaption : UI_TEXT.analysis.latestVersionCaption} tone={dashboard?.multimodel.stale ? "warning" : "success"} />
-                <MetricTile label={UI_TEXT.analysis.displayVersion} value={dashboard?.multimodel.stale ? UI_TEXT.analysis.cachedImage : UI_TEXT.analysis.latestImage} caption={dashboard?.multimodel.lastError ? UI_TEXT.analysis.backgroundRefreshFailed : UI_TEXT.analysis.backgroundRefreshReady} />
+              <div className="analysis-image-metric-grid mt-4 grid gap-3 sm:grid-cols-4">
+                <MetricTile
+                  label={ANALYSIS_STATE_LABEL}
+                  value={translateStatusLabel(resolvedAnalysisStatus)}
+                  caption={analysisStatusCaption}
+                  tone={resolveStatusTone(resolvedAnalysisStatus)}
+                />
+                <MetricTile
+                  label={IMAGE_STATE_LABEL}
+                  value={translateStatusLabel(resolvedImageStatus)}
+                  caption={imageStatusCaption}
+                  tone={resolveStatusTone(resolvedImageStatus)}
+                />
                 <MetricTile label={UI_TEXT.analysis.readTime} value={imageUpdatedAt ? formatDateTime(imageUpdatedAt, locationTimezone) : "--"} caption={UI_TEXT.analysis.prewarmHint} />
                 <MetricTile label={UI_TEXT.analysis.peakSummary} value={hasPeakSummary ? UI_TEXT.analysis.available : "--"} caption={peakSummary} tone="accent" />
               </div>
             </section>
 
             <section className="analysis-image-canvas rounded-[24px] border border-white/8 bg-black/20">
-              {imageUrl ? <div className="analysis-image-scroll"><img src={imageUrl} alt="meteoblue official multimodel chart" className="analysis-image rounded-[20px] border border-white/8 bg-black/30 shadow-[0_18px_60px_rgba(0,0,0,0.28)]" decoding="async" fetchPriority="high" /></div> : <div className="flex h-full min-h-[380px] items-center justify-center px-6 text-sm text-white/58">{UI_TEXT.analysis.imageUnavailable}</div>}
+              {imageUrl ? <div className="analysis-image-scroll"><img src={imageUrl} alt="meteoblue official multimodel chart" className="analysis-image rounded-[20px] border border-white/8 bg-black/30 shadow-[0_18px_60px_rgba(0,0,0,0.28)]" decoding="async" fetchPriority="high" /></div> : <div className="flex h-full min-h-[380px] items-center justify-center px-6 text-sm text-white/58">{imageStatusCaption}</div>}
             </section>
           </div>
         </TabsContent>

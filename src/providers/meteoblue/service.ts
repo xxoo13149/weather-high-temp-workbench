@@ -31,6 +31,7 @@ import type {
   WeatherReportResponse,
   WeatherService,
 } from "../../domain/weather.js";
+import { normalizeDashboardMetarSnapshot } from "../../domain/weather.js";
 import { buildDiscoveryWarnings, PolymarketClient, type NormalizedOrderBook, type PolymarketDiscoveryResult } from "../../kelly/polymarket.js";
 import {
   applyPricingToMarkets,
@@ -46,6 +47,7 @@ import {
 import { RefreshableCache } from "../../lib/cache.js";
 import { FavoritesStore, type FavoritesStoreLike } from "../../lib/favorites-store.js";
 import { fetchBinary, fetchText } from "../../lib/http.js";
+import { withHandledTimeout as withTimeout } from "../../lib/with-timeout.js";
 import { fetchMetarSnapshot } from "../metar/service.js";
 import { fetchTafSnapshot } from "../taf/service.js";
 import { resolveLocation } from "./location-registry.js";
@@ -93,6 +95,11 @@ const POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 15_
 const POLYMARKET_ORDERBOOK_TOTAL_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 15_000);
 const KELLY_MARKET_DISCOVERY_STAGE_TIMEOUT_MS = Math.min(POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS, 3_500);
 const KELLY_ORDERBOOK_STAGE_TIMEOUT_MS = Math.min(POLYMARKET_ORDERBOOK_TOTAL_TIMEOUT_MS, 4_000);
+const KELLY_FORCE_REFRESH_SOFT_TIMEOUT_MS = 4_000;
+const KELLY_MARKET_LOAD_CONCURRENCY = 3;
+const KELLY_ORDERBOOK_LOAD_CONCURRENCY = 3;
+const KELLY_MARKET_SLOT_TIMEOUT_MS = POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS + 5_000;
+const KELLY_ORDERBOOK_SLOT_TIMEOUT_MS = POLYMARKET_ORDERBOOK_TOTAL_TIMEOUT_MS + 5_000;
 const KELLY_WORKBENCH_TOTAL_TIMEOUT_MS = Math.max(
   POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS + POLYMARKET_ORDERBOOK_TOTAL_TIMEOUT_MS,
   30_000,
@@ -178,26 +185,36 @@ const withWeekCacheLoadSlot = createGlobalLimiter(METEOBLUE_WEEK_CACHE_LOAD_CONC
     ),
 });
 
+const withKellyMarketLoadSlot = createGlobalLimiter(KELLY_MARKET_LOAD_CONCURRENCY, {
+  waitTimeoutMs: KELLY_MARKET_SLOT_TIMEOUT_MS,
+  createTimeoutError: () =>
+    new AppError(
+      503,
+      "POLYMARKET_DISCOVERY_BUSY",
+      `Polymarket discovery queue exceeded ${KELLY_MARKET_SLOT_TIMEOUT_MS}ms.`,
+      {
+        retryable: true,
+      },
+    ),
+});
+
+const withKellyOrderbookLoadSlot = createGlobalLimiter(KELLY_ORDERBOOK_LOAD_CONCURRENCY, {
+  waitTimeoutMs: KELLY_ORDERBOOK_SLOT_TIMEOUT_MS,
+  createTimeoutError: () =>
+    new AppError(
+      503,
+      "POLYMARKET_ORDERBOOK_BUSY",
+      `Polymarket orderbook queue exceeded ${KELLY_ORDERBOOK_SLOT_TIMEOUT_MS}ms.`,
+      {
+        retryable: true,
+      },
+    ),
+});
+
 const createWeekPageLoaderSignal = () => AbortSignal.timeout(METEOBLUE_WEEK_PAGE_LOADER_TIMEOUT_MS);
 const createWeekMeteogramLoaderSignal = () => AbortSignal.timeout(METEOBLUE_WEEK_METEOGRAM_LOADER_TIMEOUT_MS);
 const createOptionalWeekMeteogramLoaderSignal = () => AbortSignal.timeout(METEOBLUE_WEEK_OPTIONAL_METEOGRAM_TIMEOUT_MS);
 const createMultiModelLoaderSignal = () => AbortSignal.timeout(METEOBLUE_MULTIMODEL_LOADER_TIMEOUT_MS);
-
-const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, createError: () => Error): Promise<T> => {
-  let timerId: ReturnType<typeof setTimeout> | null = null;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timerId = setTimeout(() => reject(createError()), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timerId) {
-      clearTimeout(timerId);
-    }
-  }
-};
 
 interface WeekCacheValue {
   fetchedAt: string;
@@ -243,6 +260,8 @@ interface ImageCacheValue {
 interface MetarCacheValue {
   observation: Omit<MetarObservation, "stale" | "cacheHit"> | null;
   recentTemperatures: MetarTemperatureSample[];
+  recentObservations?: NonNullable<DashboardMetarSnapshot["recentObservations"]>;
+  recentReports?: NonNullable<DashboardMetarSnapshot["recentReports"]>;
 }
 
 interface TafCacheValue {
@@ -377,7 +396,8 @@ const buildKellySnapshotRequestKey = (
     options.actualTemperatureC ?? "default-temp",
     options.selectedHourTimestamp ?? "default-hour",
   ].join("::");
-const KELLY_SNAPSHOT_RESULT_TTL_MS = 5_000;
+const KELLY_SNAPSHOT_RESULT_TTL_MS = 30_000;
+const KELLY_SNAPSHOT_MAX_STALE_MS = 20 * 60_000;
 
 const resolveMetarObservedHighFloor = (
   recentTemperatures: MetarTemperatureSample[],
@@ -508,6 +528,117 @@ const resolveKellyDistributionSelection = (
 const normalizeText = (value: string): string => value.replace(/\s+/g, " ").trim();
 const hasDiscoveryCandidates = (value: PolymarketDiscoveryResult | null | undefined): boolean =>
   Boolean(value) && (value!.candidates.length > 0 || value!.inactiveCandidates.length > 0);
+const appendWarningIfMissing = (warnings: string[], warning: string) => {
+  if (!warnings.includes(warning)) {
+    warnings.push(warning);
+  }
+};
+
+const toRetainedDiscoveryCandidate = (
+  market: KellyWorkbenchResponse["markets"][number],
+): PolymarketDiscoveryResult["candidates"][number] => ({
+  marketId: market.marketId,
+  slug: market.slug,
+  title: market.title,
+  marketUrl: market.marketUrl,
+  conditionId: market.conditionId,
+  contractType: market.contractType,
+  unit: market.unit,
+  bucketStartC: market.bucketStartC,
+  bucketEndC: market.bucketEndC,
+  bucketLabel: market.bucketLabel,
+  lifecycle: market.lifecycle,
+  inactiveReason: market.inactiveReason,
+  parseStatus: market.parseStatus,
+  exclusionReason: market.exclusionReason,
+  yesTokenId: market.yesTokenId,
+  noTokenId: market.noTokenId,
+  updatedAt: market.updatedAt,
+  eventTitle: null,
+  eventUrl: null,
+  liquidity: market.liquidity,
+  volume24h: market.volume24h,
+});
+
+const buildRetainedDiscoveryResultFromSnapshot = (
+  snapshot: KellyWorkbenchResponse | null,
+): PolymarketDiscoveryResult | null => {
+  if (!snapshot) {
+    return null;
+  }
+
+  const allCandidates = [
+    ...snapshot.markets,
+    ...(snapshot.inactiveMarkets ?? []),
+    ...(snapshot.unresolvedMarkets ?? []),
+  ].map((market) => toRetainedDiscoveryCandidate(market));
+  if (allCandidates.length === 0) {
+    return null;
+  }
+
+  return {
+    fetchedAt: snapshot.freshness.marketDiscoveredAt ?? snapshot.generatedAt,
+    candidates: allCandidates.filter((candidate) => candidate.lifecycle !== "inactive"),
+    inactiveCandidates: allCandidates.filter((candidate) => candidate.lifecycle === "inactive"),
+    sourceLinks: snapshot.sourceLinks,
+  };
+};
+
+const buildRetainedOrderBooksFromSnapshot = (
+  snapshot: KellyWorkbenchResponse | null,
+): {
+  books: Map<string, NormalizedOrderBook>;
+  observedAt: string | null;
+} | null => {
+  if (!snapshot) {
+    return null;
+  }
+
+  const observedAt = snapshot.freshness.orderbookFetchedAt ?? snapshot.generatedAt;
+  const books = new Map<string, NormalizedOrderBook>();
+  const trackedMarkets = [...snapshot.markets, ...(snapshot.inactiveMarkets ?? [])];
+
+  for (const market of trackedMarkets) {
+    const updatedAt = market.updatedAt || observedAt || snapshot.generatedAt;
+    const yesBestBid = market.yesBestBid ?? null;
+    const yesBestAsk = market.yesBestAsk ?? market.yesPrice ?? null;
+    const noBestBid = market.noBestBid ?? null;
+    const noBestAsk = market.noBestAsk ?? market.noPrice ?? null;
+
+    if (market.yesTokenId) {
+      books.set(market.yesTokenId, {
+        tokenId: market.yesTokenId,
+        bestBid: yesBestBid,
+        bestAsk: yesBestAsk,
+        midpoint:
+          yesBestBid !== null && yesBestAsk !== null ? (yesBestBid + yesBestAsk) / 2 : yesBestAsk ?? yesBestBid ?? null,
+        updatedAt,
+        status: yesBestBid !== null || yesBestAsk !== null ? "available" : "no-orderbook",
+      });
+    }
+
+    if (market.noTokenId) {
+      books.set(market.noTokenId, {
+        tokenId: market.noTokenId,
+        bestBid: noBestBid,
+        bestAsk: noBestAsk,
+        midpoint:
+          noBestBid !== null && noBestAsk !== null ? (noBestBid + noBestAsk) / 2 : noBestAsk ?? noBestBid ?? null,
+        updatedAt,
+        status: noBestBid !== null || noBestAsk !== null ? "available" : "no-orderbook",
+      });
+    }
+  }
+
+  if (books.size === 0) {
+    return null;
+  }
+
+  return {
+    books,
+    observedAt,
+  };
+};
 const dateFormatterCache = new Map<string, Intl.DateTimeFormat>();
 
 const getDateFormatter = (timeZone: string): Intl.DateTimeFormat => {
@@ -732,9 +863,9 @@ const pushRefreshableCacheWarning = (
     if (!options?.includeRevalidating) {
       return;
     }
-    warnings.push(messages.revalidating);
+    appendWarningIfMissing(warnings, messages.revalidating);
   } else if (isFallbackErrorFreshness(freshness)) {
-    warnings.push(messages.fallbackError);
+    appendWarningIfMissing(warnings, messages.fallbackError);
   }
 };
 
@@ -770,6 +901,7 @@ export class MeteoblueWeatherService implements WeatherService {
     string,
     {
       expiresAt: number;
+      staleUntil: number;
       snapshot: KellyWorkbenchResponse;
     }
   >();
@@ -888,8 +1020,22 @@ export class MeteoblueWeatherService implements WeatherService {
     });
   }
 
-  private readKellySnapshotResult(cacheKey: string, options?: { includeExpired?: boolean }) {
+  private readKellySnapshotResultEntry(cacheKey: string) {
     const cached = this.kellySnapshotResults.get(cacheKey);
+    if (!cached) {
+      return null;
+    }
+
+    if (cached.staleUntil > Date.now()) {
+      return cached;
+    }
+
+    this.kellySnapshotResults.delete(cacheKey);
+    return null;
+  }
+
+  private readKellySnapshotResult(cacheKey: string, options?: { includeExpired?: boolean }) {
+    const cached = this.readKellySnapshotResultEntry(cacheKey);
     if (!cached) {
       return null;
     }
@@ -898,19 +1044,81 @@ export class MeteoblueWeatherService implements WeatherService {
       return cached.snapshot;
     }
 
-    this.kellySnapshotResults.delete(cacheKey);
     return null;
   }
 
+  private writeKellySnapshotResult(cacheKey: string, snapshot: KellyWorkbenchResponse, storedAt = new Date()) {
+    const storedAtMs = storedAt.getTime();
+    this.kellySnapshotResults.set(cacheKey, {
+      expiresAt: storedAtMs + KELLY_SNAPSHOT_RESULT_TTL_MS,
+      staleUntil: storedAtMs + KELLY_SNAPSHOT_MAX_STALE_MS,
+      snapshot,
+    });
+  }
+
   private buildKellyFallbackSnapshotFromCache(snapshot: KellyWorkbenchResponse, reason: unknown): KellyWorkbenchResponse {
-    const detail =
-      reason instanceof AppError ? `${reason.code}: ${reason.message}` : reason instanceof Error ? reason.message : String(reason);
-    const warning = `本轮 Kelly 刷新超时或失败，当前继续沿用上一轮可用快照。${detail ? `(${detail})` : ""}`;
+    const warning = "Kelly 刷新较慢，当前继续沿用上一轮可用结果。";
 
     return {
       ...snapshot,
       warnings: snapshot.warnings.includes(warning) ? snapshot.warnings : [...snapshot.warnings, warning],
     };
+  }
+
+  private buildKellyRevalidatingSnapshotFromCache(snapshot: KellyWorkbenchResponse): KellyWorkbenchResponse {
+    const warning = "Kelly 后台刷新中，当前继续沿用最近一次可用结果。";
+
+    return {
+      ...snapshot,
+      warnings: snapshot.warnings.includes(warning) ? snapshot.warnings : [...snapshot.warnings, warning],
+    };
+  }
+
+  private createKellyWorkbenchSnapshotTask(
+    cacheKey: string,
+    locationId: LocationInfo["id"],
+    location: ReturnType<MeteoblueWeatherService["requireLocation"]>,
+    targetDate: string,
+    options: KellyRequestOptions,
+    fallbackSnapshot: KellyWorkbenchResponse | null,
+  ) {
+    const task = withTimeout(
+      this.buildKellyWorkbenchSnapshot(locationId, location, targetDate, options),
+      KELLY_WORKBENCH_TOTAL_TIMEOUT_MS,
+      () =>
+        new AppError(
+          504,
+          "KELLY_WORKBENCH_TIMEOUT",
+          `Kelly snapshot refresh exceeded ${KELLY_WORKBENCH_TOTAL_TIMEOUT_MS}ms.`,
+          {
+            retryable: true,
+            staleAvailable: fallbackSnapshot !== null,
+            lastSuccessAt: fallbackSnapshot?.generatedAt ?? this.kellyRuntimeHealth.lastSnapshotSuccessAt,
+          },
+        ),
+    )
+      .then((snapshot) => {
+        this.writeKellySnapshotResult(cacheKey, snapshot);
+        this.writeKellyStreamModelContext(cacheKey, snapshot.probabilityCurve, snapshot.distributionSummary.shrink);
+        return snapshot;
+      })
+      .catch((error) => {
+        if (fallbackSnapshot) {
+          const snapshot = this.buildKellyFallbackSnapshotFromCache(fallbackSnapshot, error);
+          this.writeKellySnapshotResult(cacheKey, snapshot);
+          return snapshot;
+        }
+        throw error;
+      });
+
+    this.kellySnapshotInFlight.set(cacheKey, task);
+    void task.finally(() => {
+      if (this.kellySnapshotInFlight.get(cacheKey) === task) {
+        this.kellySnapshotInFlight.delete(cacheKey);
+      }
+    });
+
+    return task;
   }
 
   private recordKellySnapshotSuccess(details: {
@@ -1315,18 +1523,20 @@ export class MeteoblueWeatherService implements WeatherService {
     cache = new RefreshableCache<PolymarketDiscoveryResult>(
       config.polymarketMarketTtlMs,
       async () => {
-        const discoveryResult = await withTimeout(
-          this.polymarketClient.discoverMarkets(location, targetDate),
-          POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS,
-          () =>
-            new AppError(
-              503,
-              "POLYMARKET_DISCOVERY_TIMEOUT",
-              `Polymarket discovery exceeded ${POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS}ms.`,
-              {
-                retryable: true,
-              },
-            ),
+        const discoveryResult = await withKellyMarketLoadSlot(async () =>
+          await withTimeout(
+            this.polymarketClient.discoverMarkets(location, targetDate),
+            POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS,
+            () =>
+              new AppError(
+                503,
+                "POLYMARKET_DISCOVERY_TIMEOUT",
+                `Polymarket discovery exceeded ${POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS}ms.`,
+                {
+                  retryable: true,
+                },
+              ),
+          ),
         );
         const previousDiscovery = cache?.peek().entry?.value ?? null;
         if (!hasDiscoveryCandidates(discoveryResult) && hasDiscoveryCandidates(previousDiscovery)) {
@@ -1388,18 +1598,20 @@ export class MeteoblueWeatherService implements WeatherService {
     }
 
     this.recordKellyOrderbookAttempt();
-    const task = withTimeout(
-      this.polymarketClient.fetchOrderBooks(tokenIds),
-      POLYMARKET_ORDERBOOK_TOTAL_TIMEOUT_MS,
-      () =>
-        new AppError(
-          503,
-          "POLYMARKET_ORDERBOOK_TIMEOUT",
-          `Polymarket orderbook fetch exceeded ${POLYMARKET_ORDERBOOK_TOTAL_TIMEOUT_MS}ms.`,
-          {
-            retryable: true,
-          },
-        ),
+    const task = withKellyOrderbookLoadSlot(async () =>
+      await withTimeout(
+        this.polymarketClient.fetchOrderBooks(tokenIds),
+        POLYMARKET_ORDERBOOK_TOTAL_TIMEOUT_MS,
+        () =>
+          new AppError(
+            503,
+            "POLYMARKET_ORDERBOOK_TIMEOUT",
+            `Polymarket orderbook fetch exceeded ${POLYMARKET_ORDERBOOK_TOTAL_TIMEOUT_MS}ms.`,
+            {
+              retryable: true,
+            },
+          ),
+      ),
     )
       .then((books) => {
         this.recordKellyOrderbookSuccess({
@@ -1806,15 +2018,14 @@ export class MeteoblueWeatherService implements WeatherService {
           }
         : null;
 
-      return {
+      return normalizeDashboardMetarSnapshot({
         observation,
         recentTemperatures: result.value.recentTemperatures,
-      };
+        recentObservations: result.value.recentObservations,
+        recentReports: result.value.recentReports,
+      });
     } catch {
-      return {
-        observation: null,
-        recentTemperatures: [],
-      };
+      return normalizeDashboardMetarSnapshot();
     }
   }
 
@@ -2079,11 +2290,48 @@ export class MeteoblueWeatherService implements WeatherService {
     const targetDate = resolveKellyTargetDate(location.timezone, options.targetDate);
     const cacheKey = buildKellySnapshotRequestKey(locationId, targetDate, options);
     const forceRefresh = options.forceRefresh === true;
-    const fallbackSnapshot = this.readKellySnapshotResult(cacheKey, { includeExpired: true });
-    if (!forceRefresh) {
-      const cached = this.readKellySnapshotResult(cacheKey);
-      if (cached) {
-        return cached;
+    const cachedEntry = this.readKellySnapshotResultEntry(cacheKey);
+    const cachedSnapshot = cachedEntry?.snapshot ?? null;
+    const hasFreshSnapshot = Boolean(cachedEntry && cachedEntry.expiresAt > Date.now());
+
+    if (!forceRefresh && hasFreshSnapshot && cachedSnapshot) {
+      return cachedSnapshot;
+    }
+
+    if (!forceRefresh && cachedSnapshot) {
+      if (!this.kellySnapshotInFlight.has(cacheKey)) {
+        this.createKellyWorkbenchSnapshotTask(cacheKey, locationId, location, targetDate, options, cachedSnapshot);
+      }
+      return this.buildKellyRevalidatingSnapshotFromCache(cachedSnapshot);
+    }
+
+    if (forceRefresh && cachedSnapshot) {
+      const refreshTask =
+        this.kellySnapshotInFlight.get(cacheKey) ??
+        this.createKellyWorkbenchSnapshotTask(cacheKey, locationId, location, targetDate, options, cachedSnapshot);
+
+      try {
+        return await withTimeout(
+          refreshTask,
+          KELLY_FORCE_REFRESH_SOFT_TIMEOUT_MS,
+          () =>
+            new AppError(
+              503,
+              "KELLY_FORCE_REFRESH_TIMEOUT",
+              `Kelly force refresh exceeded ${KELLY_FORCE_REFRESH_SOFT_TIMEOUT_MS}ms.`,
+              {
+                retryable: true,
+                staleAvailable: true,
+                lastSuccessAt: cachedSnapshot.generatedAt,
+              },
+            ),
+        );
+      } catch (error) {
+        if (error instanceof AppError && error.code === "KELLY_FORCE_REFRESH_TIMEOUT") {
+          return this.buildKellyRevalidatingSnapshotFromCache(cachedSnapshot);
+        }
+
+        return this.buildKellyFallbackSnapshotFromCache(cachedSnapshot, error);
       }
     }
 
@@ -2094,49 +2342,7 @@ export class MeteoblueWeatherService implements WeatherService {
       }
     }
 
-    const task = withTimeout(
-      this.buildKellyWorkbenchSnapshot(locationId, location, targetDate, options),
-      KELLY_WORKBENCH_TOTAL_TIMEOUT_MS,
-      () =>
-        new AppError(
-          504,
-          "KELLY_WORKBENCH_TIMEOUT",
-          `Kelly snapshot refresh exceeded ${KELLY_WORKBENCH_TOTAL_TIMEOUT_MS}ms.`,
-          {
-            retryable: true,
-            staleAvailable: fallbackSnapshot !== null,
-            lastSuccessAt: fallbackSnapshot?.generatedAt ?? this.kellyRuntimeHealth.lastSnapshotSuccessAt,
-          },
-        ),
-    )
-      .then((snapshot) => {
-        this.kellySnapshotResults.set(cacheKey, {
-          expiresAt: Date.now() + KELLY_SNAPSHOT_RESULT_TTL_MS,
-          snapshot,
-        });
-        this.writeKellyStreamModelContext(cacheKey, snapshot.probabilityCurve, snapshot.distributionSummary.shrink);
-        return snapshot;
-      })
-      .catch((error) => {
-        if (fallbackSnapshot) {
-          const snapshot = this.buildKellyFallbackSnapshotFromCache(fallbackSnapshot, error);
-          this.kellySnapshotResults.set(cacheKey, {
-            expiresAt: Date.now() + KELLY_SNAPSHOT_RESULT_TTL_MS,
-            snapshot,
-          });
-          return snapshot;
-        }
-        throw error;
-      });
-    this.kellySnapshotInFlight.set(cacheKey, task);
-
-    try {
-      return await task;
-    } finally {
-      if (this.kellySnapshotInFlight.get(cacheKey) === task) {
-        this.kellySnapshotInFlight.delete(cacheKey);
-      }
-    }
+    return await this.createKellyWorkbenchSnapshotTask(cacheKey, locationId, location, targetDate, options, cachedSnapshot);
   }
 
   private async buildKellyWorkbenchSnapshot(
@@ -2186,6 +2392,12 @@ export class MeteoblueWeatherService implements WeatherService {
       );
       const targetDistributionTimestamp = distributionSelection.timestamp;
       const effectiveTargetDate = distributionSelection.effectiveTargetDate;
+      const fallbackSnapshot = this.readKellySnapshotResult(
+        buildKellySnapshotRequestKey(locationId, targetDate, options),
+        { includeExpired: true },
+      );
+      const retainedStageSnapshot =
+        fallbackSnapshot && fallbackSnapshot.targetDate === effectiveTargetDate ? fallbackSnapshot : null;
 
       if (!targetDistributionTimestamp) {
         throw new AppError(
@@ -2207,23 +2419,19 @@ export class MeteoblueWeatherService implements WeatherService {
       }
       if (!options.actualTemperatureC && metarObservation === null) {
         warnings.push("METAR 实况当前不可用，Kelly 下界约束回退到站点当前小时温度。");
-      } else if (metarObservation?.stale) {
-        warnings.push("METAR 实况当前使用最近一次成功缓存。");
       }
       let tafForecast: KellyWeatherEvidence["tafForecast"] = null;
       if (tafOutcome.ok) {
         tafForecast = tafOutcome.snapshot.forecast;
-        if (tafForecast?.stale) {
-          warnings.push("TAF 机场预报当前使用最近一次成功缓存。");
-        }
       }
       const strictMarketRefresh = options.forceRefresh === true;
       let discoveryResult: PolymarketDiscoveryResult | null = null;
       let discoveryFetchedAt: string | null = null;
+      const marketCache = this.getKellyMarketCache(locationId, effectiveTargetDate);
 
       try {
         const marketResult = await measureAsync(stageTimings, "marketDiscovery", async () => {
-          return await loadKellyStageCache(this.getKellyMarketCache(locationId, effectiveTargetDate), {
+          return await loadKellyStageCache(marketCache, {
             allowStaleOnError: true,
             forceRefresh: options.forceRefresh,
             softTimeoutMs: strictMarketRefresh ? null : KELLY_MARKET_DISCOVERY_STAGE_TIMEOUT_MS,
@@ -2241,8 +2449,8 @@ export class MeteoblueWeatherService implements WeatherService {
         discoveryResult = marketResult.value;
         discoveryFetchedAt = discoveryResult.fetchedAt;
         pushRefreshableCacheWarning(warnings, marketResult.freshness, {
-          revalidating: "Polymarket 市场目录后台刷新中，当前先展示最近一次成功缓存。",
-          fallbackError: "Polymarket 市场目录刷新失败，当前使用最近一次成功缓存。",
+          revalidating: "市场目录后台刷新中，当前先展示最近一次成功结果。",
+          fallbackError: "市场目录刷新失败，当前沿用最近一次成功结果。",
         });
         warnings.push(
           ...buildDiscoveryWarnings([
@@ -2254,20 +2462,41 @@ export class MeteoblueWeatherService implements WeatherService {
         if (strictMarketRefresh) {
           throw error;
         }
-        warnings.push(
-          error instanceof AppError && error.code === "KELLY_MARKET_DISCOVERY_STAGE_TIMEOUT"
-            ? "Polymarket 市场目录刷新超时，当前仅展示天气侧推导结果。"
-            : "Polymarket 市场目录暂时不可用，当前仅展示天气侧推导结果。",
-        );
+        const retainedDiscovery = buildRetainedDiscoveryResultFromSnapshot(retainedStageSnapshot);
+        if (retainedDiscovery) {
+          discoveryResult = retainedDiscovery;
+          discoveryFetchedAt = retainedDiscovery.fetchedAt;
+          marketCache.set(retainedDiscovery, new Date(retainedDiscovery.fetchedAt));
+          appendWarningIfMissing(
+            warnings,
+            error instanceof AppError && error.code === "KELLY_MARKET_DISCOVERY_STAGE_TIMEOUT"
+              ? "市场目录刷新较慢，当前沿用上一轮市场结果。"
+              : "市场目录暂时不可用，当前沿用上一轮市场结果。",
+          );
+          warnings.push(
+            ...buildDiscoveryWarnings([
+              ...retainedDiscovery.candidates,
+              ...retainedDiscovery.inactiveCandidates,
+            ]),
+          );
+        } else {
+          appendWarningIfMissing(
+            warnings,
+            error instanceof AppError && error.code === "KELLY_MARKET_DISCOVERY_STAGE_TIMEOUT"
+              ? "市场目录刷新较慢，当前先展示天气判断，稍后会自动补齐。"
+              : "市场目录暂时不可用，当前先展示天气判断。",
+          );
+        }
       }
 
       let orderBooks = new Map<string, NormalizedOrderBook>();
       let orderbookObservedAt: string | null = null;
+      const orderBookCache = this.getKellyOrderBookCache(locationId, effectiveTargetDate);
 
       if (discoveryResult?.candidates.some((candidate) => candidate.parseStatus === "matched")) {
         try {
           const orderBookResult = await measureAsync(stageTimings, "orderbook", async () => {
-            return await loadKellyStageCache(this.getKellyOrderBookCache(locationId, effectiveTargetDate), {
+            return await loadKellyStageCache(orderBookCache, {
               allowStaleOnError: !strictMarketRefresh,
               forceRefresh: options.forceRefresh,
               softTimeoutMs: strictMarketRefresh ? null : KELLY_ORDERBOOK_STAGE_TIMEOUT_MS,
@@ -2285,18 +2514,45 @@ export class MeteoblueWeatherService implements WeatherService {
           orderBooks = orderBookResult.value;
           orderbookObservedAt = resolveLatestOrderbookTimestamp(orderBooks);
           pushRefreshableCacheWarning(warnings, orderBookResult.freshness, {
-            revalidating: "Polymarket 盘口快照后台刷新中，当前先使用最近一次成功缓存。",
-            fallbackError: "Polymarket 盘口快照刷新失败，当前使用最近一次成功缓存。",
+            revalidating: "盘口后台刷新中，当前先展示最近一次成功结果。",
+            fallbackError: "盘口刷新失败，当前沿用最近一次成功结果。",
           });
         } catch (error) {
           if (strictMarketRefresh) {
             throw error;
           }
-          warnings.push(
-            error instanceof AppError && error.code === "KELLY_ORDERBOOK_STAGE_TIMEOUT"
-              ? "Polymarket 盘口快照刷新超时，当前先展示公允概率与档位匹配。"
-              : "Polymarket 盘口快照暂时不可用，当前仅展示公允概率与档位匹配。",
-          );
+          const retainedOrderBooks = buildRetainedOrderBooksFromSnapshot(retainedStageSnapshot);
+          const matchedTokenIds =
+            discoveryResult?.candidates
+              .filter((candidate) => candidate.parseStatus === "matched")
+              .flatMap((candidate) => [candidate.yesTokenId, candidate.noTokenId])
+              .filter((tokenId): tokenId is string => Boolean(tokenId)) ?? [];
+          const hasRetainedOrderbooks =
+            retainedOrderBooks !== null &&
+            matchedTokenIds.some((tokenId) => retainedOrderBooks.books.has(tokenId));
+
+          if (retainedOrderBooks && hasRetainedOrderbooks) {
+            orderBooks = retainedOrderBooks.books;
+            orderbookObservedAt = retainedOrderBooks.observedAt;
+            if (retainedOrderBooks.observedAt) {
+              orderBookCache.set(retainedOrderBooks.books, new Date(retainedOrderBooks.observedAt));
+            } else {
+              orderBookCache.set(retainedOrderBooks.books);
+            }
+            appendWarningIfMissing(
+              warnings,
+              error instanceof AppError && error.code === "KELLY_ORDERBOOK_STAGE_TIMEOUT"
+                ? "盘口刷新较慢，当前沿用最近一次可用价格。"
+                : "盘口暂时不可用，当前沿用最近一次可用价格。",
+            );
+          } else {
+            appendWarningIfMissing(
+              warnings,
+              error instanceof AppError && error.code === "KELLY_ORDERBOOK_STAGE_TIMEOUT"
+                ? "盘口刷新较慢，当前先展示市场档位与天气判断，价格稍后自动补齐。"
+                : "盘口暂时不可用，当前先展示市场档位与天气判断。",
+            );
+          }
         }
       }
 

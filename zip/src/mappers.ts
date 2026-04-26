@@ -2,12 +2,17 @@ import { CONFIG } from "./config";
 import type {
   DashboardResponse,
   DashboardSyncInfo,
+  DashboardMetarSnapshot,
+  DashboardTafSnapshot,
   DockLocation,
   DockLocationGroup,
   HourlyWeatherItem,
   MultiModelDistributionResponse,
   MultiModelInsightRankedModel,
   MultiModelInsightResponse,
+  DashboardSourceMetadata,
+  IntradaySignalsSummary,
+  MarketReferenceSummary,
   WeatherReportResponse,
 } from "./types";
 import { translatePredictabilityLabel } from "./display-text";
@@ -18,17 +23,51 @@ const sanitizeNumber = (value: number | null | undefined) =>
 const sanitizeString = (value: string | null | undefined) =>
   typeof value === "string" && value.trim() ? value.trim() : null;
 
+const ICAO_STATION_CODE_PATTERN = /^[A-Z0-9]{4}$/;
+
+const buildStationCodes = (location: DashboardResponse["locationDirectory"][number]) => {
+  const codes = new Set<string>();
+  const addCode = (value: string | null | undefined) => {
+    const normalized = sanitizeString(value)?.toUpperCase();
+    if (normalized) {
+      codes.add(normalized);
+    }
+  };
+
+  const locationCode = sanitizeString(location.code)?.toUpperCase();
+  if (locationCode && ICAO_STATION_CODE_PATTERN.test(locationCode)) {
+    codes.add(locationCode);
+    return [...codes];
+  }
+
+  const contract = location.sourceMetadata;
+  addCode(contract?.settlementReference?.stationCode);
+
+  Object.values(contract?.currentSources ?? {}).forEach((source) => addCode(source.stationCode));
+  addCode(contract?.targetUpgrades?.openMeteoMultiModel?.stationCode);
+  addCode(contract?.targetUpgrades?.taf?.stationCode);
+  contract?.targetUpgrades?.officialEnhancements?.forEach((source) => addCode(source.stationCode));
+
+  return [...codes];
+};
+
 export interface DashboardViewModel {
   generatedAt: string;
+  displayUnit: DashboardResponse["displayUnit"];
   sync: DashboardSyncInfo;
   locationDirectory: DashboardResponse["locationDirectory"];
+  metar: DashboardMetarSnapshot;
+  taf: DashboardTafSnapshot;
   hourly: {
     location: DashboardResponse["hourly"]["location"];
     locationName: string;
     locationTimezone: string;
+    fetchedAt: DashboardResponse["hourly"]["fetchedAt"];
+    sourceObservedAt: DashboardResponse["hourly"]["sourceObservedAt"];
     sourceType: DashboardResponse["hourly"]["sourceType"];
     fieldCoverage: DashboardResponse["hourly"]["fieldCoverage"];
     stale: boolean;
+    freshness: DashboardResponse["hourly"]["freshness"];
     warnings: string[];
     pageUrl: string;
     items: HourlyWeatherItem[];
@@ -36,6 +75,9 @@ export interface DashboardViewModel {
   };
   report: WeatherReportResponse;
   multimodel: DashboardResponse["multimodel"];
+  sourceMetadata: DashboardSourceMetadata;
+  intradaySignals: IntradaySignalsSummary;
+  marketReference: MarketReferenceSummary;
 }
 
 export interface DistributionViewModel extends MultiModelDistributionResponse {}
@@ -74,15 +116,27 @@ export const mapDashboardResponse = (
 
   return {
     generatedAt: dashboard.generatedAt,
+    displayUnit: dashboard.displayUnit,
     sync: dashboard.sync,
     locationDirectory: dashboard.locationDirectory,
+    metar: dashboard.metar ?? {
+      observation: null,
+      recentTemperatures: [],
+    },
+    taf: dashboard.taf ?? {
+      forecast: null,
+      forecasts: [],
+    },
     hourly: {
       location: dashboard.hourly.location,
       locationName: dashboard.hourly.location.name,
       locationTimezone: dashboard.hourly.location.timezone,
+      fetchedAt: dashboard.hourly.fetchedAt,
+      sourceObservedAt: dashboard.hourly.sourceObservedAt,
       sourceType: dashboard.hourly.sourceType,
       fieldCoverage: dashboard.hourly.fieldCoverage,
       stale: dashboard.hourly.stale,
+      freshness: dashboard.hourly.freshness,
       warnings: dashboard.hourly.warnings,
       pageUrl: dashboard.hourly.pageUrl,
       current: dashboard.hourly.current,
@@ -102,6 +156,9 @@ export const mapDashboardResponse = (
     },
     report,
     multimodel: dashboard.multimodel,
+    sourceMetadata: dashboard.sourceMetadata,
+    intradaySignals: dashboard.intradaySignals,
+    marketReference: dashboard.marketReference,
   };
 };
 
@@ -180,13 +237,14 @@ export const buildDockLocations = (
   locationTemperatures: Record<string, number | null>,
   favoriteLocationIds: string[],
 ): DockLocation[] => {
-  const groupOrder: DockLocation["timezoneGroup"][] = ["asia", "europe", "americas"];
+  const groupOrder: DockLocation["timezoneGroup"][] = ["asia", "europe", "africa", "americas", "oceania"];
 
   return locationDirectory
     .filter((location) => location.enabled)
     .map((location) => ({
       id: location.id,
       code: location.code,
+      stationCodes: buildStationCodes(location),
       displayName: location.displayName,
       displayNameZh: location.displayNameZh,
       shortLabel: location.shortLabel,
@@ -197,6 +255,7 @@ export const buildDockLocations = (
       temp: Object.prototype.hasOwnProperty.call(locationTemperatures, location.id)
         ? locationTemperatures[location.id] ?? null
         : null,
+      displayUnit: location.displayUnit,
       isFavorite: favoriteLocationIds.includes(location.id),
       isActive: location.id === activeLocationId,
       enabled: location.enabled,
@@ -212,7 +271,7 @@ export const buildDockLocations = (
 };
 
 export const buildDockLocationGroups = (locations: DockLocation[]): DockLocationGroup[] => {
-  const groupLabels: Record<DockLocation["timezoneGroup"], string> = {
+  const groupLabels: Partial<Record<DockLocation["timezoneGroup"], string>> = {
     asia: "亚洲",
     europe: "欧洲",
     americas: "美洲",
@@ -221,7 +280,9 @@ export const buildDockLocationGroups = (locations: DockLocation[]): DockLocation
   const groups: DockLocationGroup[] = [
     { group: "asia", label: groupLabels.asia, items: [] },
     { group: "europe", label: groupLabels.europe, items: [] },
+    { group: "africa", label: "非洲", items: [] },
     { group: "americas", label: groupLabels.americas, items: [] },
+    { group: "oceania", label: "大洋洲", items: [] },
   ];
 
   const groupMap = new Map(groups.map((group) => [group.group, group]));

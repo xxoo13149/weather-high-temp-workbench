@@ -281,4 +281,115 @@ describe("parseWeekPage", () => {
 
     expect(parsed.threeHourItems[0]?.timestamp).toBe("2026-04-04T18:00:00+02:00");
   });
+
+  test("normalizes imperial temperatures into canonical Celsius fields for Miami-style pages", () => {
+    const html = `
+      <!DOCTYPE html>
+      <html lang="en">
+        <body>
+          <section class="weather-report-text">
+            <h3 class="report-heading">Weather report for Miami International Airport</h3>
+            <p>
+              During the night and in the morning a few clouds are expected, and some more clouds roll across in the afternoon.
+              Temperatures peaking at 76 °F.
+              Overnight into Saturday blows a light breeze (7 to 12 km/h). During the day a gentle breeze is expected (12 to 20 km/h).
+              Winds blowing overnight from South and by day from Southeast.
+              The weather forecast for Miami International Airport for Saturday is likely to be accurate.
+            </p>
+          </section>
+          <table class="picto hourly-view">
+            <tbody>
+              <tr class="times">
+                <td><time datetime="2026-03-28T03:00:00-04:00">03</time></td>
+                <td><time datetime="2026-03-28T04:00:00-04:00">04</time></td>
+              </tr>
+              <tr class="icons">
+                <td><img class="picon1h" alt="Partly cloudy" src="https://example.com/1.svg" /></td>
+                <td><img class="picon1h" alt="Clear" src="https://example.com/2.svg" /></td>
+              </tr>
+              <tr class="temperatures"><td>72°</td><td>73°</td></tr>
+              <tr class="feels_like"><td>70°</td><td>74°</td></tr>
+              <tr class="windspeeds"><td>7-12</td><td>8-13</td></tr>
+              <tr class="precips"><td>-</td><td>0.0</td></tr>
+            </tbody>
+          </table>
+          <div class="three-hourly-table">
+            <table class="picto three-hourly-view">
+              <tbody>
+                <tr class="times">
+                  <td><time datetime="2026-03-28T03:00:00-04:00">03</time></td>
+                </tr>
+                <tr class="icons">
+                  <td><img class="picon3h" alt="Cloudy" src="https://static.example/icon.svg" /></td>
+                </tr>
+                <tr class="temperatures"><td>72°</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </body>
+      </html>
+    `;
+
+    const parsed = parseWeekPage(
+      html,
+      new Date("2026-03-28T06:00:00.000Z"),
+      "America/New_York",
+      "Miami International Airport",
+      "F",
+    );
+
+    expect(parsed.oneHourItems[0]).toMatchObject({
+      temperatureC: 22.2,
+      feelsLikeC: 21.1,
+    });
+    expect(parsed.oneHourItems[1]).toMatchObject({
+      temperatureC: 22.8,
+      feelsLikeC: 23.3,
+    });
+    expect(parsed.threeHourItems[0]?.temperatureC).toBeCloseTo(22.2, 1);
+    expect(parsed.report.metrics.maxTemperatureC).toBeCloseTo(24.4, 1);
+    expect(parsed.report.textZh).toContain("24.4°C");
+    expect(parsed.report.textZh).not.toContain("76°C");
+  });
+
+  test("prefers the source-selected temperature unit over inactive toggle options", () => {
+    const html = `
+      <!DOCTYPE html>
+      <html lang="en">
+        <body>
+          <ul class="unit-selector">
+            <li class="selected"><a class="unit" data-type="temp" data-unit="CELSIUS">°C</a></li>
+            <li><a class="unit" data-type="temp" data-unit="FAHRENHEIT">°F</a></li>
+          </ul>
+          <section class="weather-report-text">
+            <h3 class="report-heading">Weather report for Shanghai Pudong International Airport</h3>
+            <p>Temperatures peaking at 21 °C. The weather forecast for Shanghai Pudong International Airport for Saturday is likely to be accurate.</p>
+          </section>
+          <table class="picto hourly-view">
+            <tbody>
+              <tr class="times">
+                <td><time datetime="2026-03-28T03:00:00+08:00">03</time></td>
+                <td><time datetime="2026-03-28T06:00:00+08:00">06</time></td>
+              </tr>
+              <tr class="icons">
+                <td><img class="picon1h" alt="Partly cloudy" src="https://example.com/1.svg" /></td>
+                <td><img class="picon1h" alt="Clear" src="https://example.com/2.svg" /></td>
+              </tr>
+              <tr class="temperatures"><td>20°</td><td>18°</td></tr>
+              <tr class="windspeeds"><td>7-12</td><td>8-13</td></tr>
+              <tr class="precips"><td>-</td><td>0.0</td></tr>
+            </tbody>
+          </table>
+          ${minimalThreeHourTable}
+        </body>
+      </html>
+    `;
+
+    const parsed = parseWeekPage(html, referenceDate, timeZone, locationName, "F");
+
+    expect(parsed.oneHourItems[0]?.temperatureC).toBe(20);
+    expect(parsed.oneHourItems[1]?.temperatureC).toBe(18);
+    expect(parsed.report.metrics.maxTemperatureC).toBe(21);
+    expect(parsed.report.textZh).toContain("21°C");
+  });
 });

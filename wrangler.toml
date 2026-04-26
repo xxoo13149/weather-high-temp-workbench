@@ -12,10 +12,8 @@ not_found_handling = "single-page-application"
 [vars]
 HOST = "0.0.0.0"
 PORT = "8787"
-# Production Kelly bridge stays behind the same user-facing domain via Worker proxy.
-KELLY_BRIDGE_BASE_URL = "http://kelly-bridge.lukaluka.fun"
-KELLY_BRIDGE_LOCAL_FALLBACK = "false"
-# Store KELLY_BRIDGE_SHARED_SECRET with `wrangler secret put KELLY_BRIDGE_SHARED_SECRET`.
+KELLY_SERVER_BASE_URL = "http://kelly-origin.lukaluka.fun:8081"
+KELLY_STREAM_PROXY_MODE = "canary"
 
 [[routes]]
 pattern = "lukaluka.fun"

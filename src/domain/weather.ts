@@ -4,6 +4,9 @@ export type HourlyFieldName = "precipitationProbabilityPct" | "feelsLikeC" | "wi
 export type HourlyFieldCoverageSource = HourlySourceType | "mixed";
 export type HourlyFieldCoverageCompleteness = "full" | "partial" | "missing";
 export type HourlyFieldMissingReason = "source-unpublished" | "parser-unrecognized" | "fallback-unavailable";
+export type DataFreshnessState = "fresh" | "revalidating" | "fallback_error";
+export type MultiModelImageAvailability = "ready" | "revalidating" | "fallback_error" | "unavailable";
+export type MultiModelAnalysisAvailability = "ready" | "revalidating" | "fallback_error" | "unavailable";
 
 export interface HourlyFieldCoverageEntry {
   availableHours: number;
@@ -36,10 +39,87 @@ export interface LocationDirectoryEntry {
   countryName: string;
   timezone: string;
   timezoneGroup: import("../config.js").TimezoneGroup;
+  displayUnit: import("../config.js").DisplayTemperatureUnit;
+  fallbackDisplayUnit: import("../config.js").DisplayTemperatureUnit;
   enabled: boolean;
   sortOrder: number;
   weekPageUrl: string;
   multimodelPageUrl: string;
+  sourceMetadata?: LocationSourceContract;
+}
+
+export type LocationRolloutTier = "tier-1" | "tier-2" | "tier-3";
+export type LocationCapabilityStatus = "production" | "planned" | "candidate" | "unavailable";
+
+export interface LocationContractSource {
+  key: string;
+  label: string;
+  status: LocationCapabilityStatus;
+  detail: string;
+  stationCode: string | null;
+}
+
+export interface LocationSettlementReference {
+  label: string;
+  kind: "metar" | "official-station" | "airport-reference" | "pending-contract";
+  stationCode: string | null;
+  detail: string;
+}
+
+export interface LocationSourceContract {
+  contractVersion: string;
+  rolloutTier: LocationRolloutTier;
+  settlementReference: LocationSettlementReference;
+  currentSources: {
+    baselineForecast: LocationContractSource;
+    modelEnvelope: LocationContractSource;
+    primaryObservation: LocationContractSource;
+  };
+  targetUpgrades: {
+    openMeteoMultiModel: LocationContractSource;
+    taf: LocationContractSource & {
+      role: "airport-disruption-confirmation";
+    };
+    officialEnhancements: LocationContractSource[];
+  };
+  peakWindowLocal: {
+    startHour: number;
+    endHour: number;
+    rationale: string;
+  };
+  kellyMarketMapping: {
+    status: LocationCapabilityStatus;
+    detail: string;
+  };
+}
+
+export interface IntradaySignalsSummary {
+  headline: string;
+  confidence: "high" | "medium" | "low";
+  baseCase: string;
+  upsideCase: string;
+  downsideCase: string;
+  nextObservationAt: string | null;
+  evidence: string[];
+  invalidationRules: string[];
+  confirmationRules: string[];
+}
+
+export interface MarketReferenceSummary {
+  mode: "qualitative-only";
+  summary: string;
+  kellyRoute: string;
+  targetDate: string | null;
+  notes: string[];
+}
+
+export interface DashboardSourceMetadata {
+  contract: LocationSourceContract;
+  freshness: {
+    hourly: DataFreshnessState;
+    report: DataFreshnessState;
+    multimodel: DataFreshnessState;
+  };
 }
 
 export interface HourlyWeatherItem {
@@ -65,6 +145,7 @@ export interface HourlyWeatherResponse {
   periodHours: number;
   sourceType: HourlySourceType;
   stale: boolean;
+  freshness: DataFreshnessState;
   pageUrl: string;
   parserVersion: string;
   items: HourlyWeatherItem[];
@@ -99,6 +180,7 @@ export interface WeatherReportResponse {
   fetchedAt: string;
   sourceObservedAt: string | null;
   stale: boolean;
+  freshness: DataFreshnessState;
   cacheHit: boolean;
   pageUrl: string;
   parserVersion: string;
@@ -123,7 +205,177 @@ export interface MetarObservation {
   sourceUrl: string;
   fetchedAt: string;
   stale: boolean;
+  freshness: DataFreshnessState;
   cacheHit: boolean;
+}
+
+export interface MetarTemperatureSample {
+  observedAt: string;
+  temperatureC: number;
+}
+
+export interface MetarRecentReport {
+  stationId: string;
+  stationName: string | null;
+  observedAt: string;
+  temperatureC: number | null;
+  dewpointC: number | null;
+  windDirectionDegrees: number | null;
+  windSpeedKts: number | null;
+  rawReport: string | null;
+}
+
+export interface DashboardMetarSnapshot {
+  observation: MetarObservation | null;
+  recentTemperatures: MetarTemperatureSample[];
+  recentReports?: MetarRecentReport[];
+  recentObservations?: MetarRecentReport[];
+}
+
+const toMetarRecentReport = (
+  observation: Pick<
+    MetarObservation,
+    | "stationId"
+    | "stationName"
+    | "observedAt"
+    | "temperatureC"
+    | "dewpointC"
+    | "windDirectionDegrees"
+    | "windSpeedKts"
+    | "rawReport"
+  >,
+): MetarRecentReport => ({
+  stationId: observation.stationId,
+  stationName: observation.stationName,
+  observedAt: observation.observedAt,
+  temperatureC: observation.temperatureC,
+  dewpointC: observation.dewpointC,
+  windDirectionDegrees: observation.windDirectionDegrees,
+  windSpeedKts: observation.windSpeedKts,
+  rawReport: observation.rawReport,
+});
+
+export const normalizeDashboardMetarSnapshot = (
+  snapshot?: DashboardMetarSnapshot | null,
+): DashboardMetarSnapshot => {
+  const observation = snapshot?.observation ?? null;
+  const recentTemperatures = snapshot?.recentTemperatures ?? [];
+  const fallbackReports =
+    observation && typeof observation.stationId === "string" && typeof observation.observedAt === "string"
+      ? [toMetarRecentReport(observation)]
+      : [];
+  const recentReports = snapshot?.recentReports ?? snapshot?.recentObservations ?? fallbackReports;
+  const recentObservations = snapshot?.recentObservations ?? recentReports;
+
+  return {
+    observation,
+    recentTemperatures,
+    recentReports,
+    recentObservations,
+  };
+};
+
+export type TafFlightCategory = "VFR" | "MVFR" | "IFR" | "LIFR";
+
+export interface TafCloudLayerDetail {
+  raw: string;
+  cover: string;
+  baseFt: number | null;
+  cloudType: string | null;
+}
+
+export interface TafWindShearSummary {
+  raw: string;
+  heightFtAgl: number | null;
+  directionDegrees: number | null;
+  speedKts: number | null;
+}
+
+export type TafPhenomenonCategory = "precipitation" | "visibility" | "thunderstorm" | "wind" | "other";
+
+export interface TafPhenomenon {
+  raw: string;
+  code: string;
+  labelZh: string;
+  category: TafPhenomenonCategory;
+}
+
+export interface TafTemperatureExtreme {
+  raw: string;
+  kind: "max" | "min";
+  temperatureC: number;
+  occursAt: string | null;
+}
+
+export interface TafTemperatureTrendSummary {
+  headlineZh: string;
+  detailZh: string;
+  currentPhaseZh: string | null;
+  nextTurningPointKind: "max" | "min" | null;
+  nextTurningPointAt: string | null;
+  nextTurningPointTemperatureC: number | null;
+}
+
+export interface TafTrendSummary {
+  changeLabel: string;
+  timeFrom: string | null;
+  timeTo: string | null;
+  headlineZh: string;
+}
+
+export interface TafDailySummary {
+  headlineZh: string;
+  maxTemperatureC: number | null;
+  minTemperatureC: number | null;
+  temperatureExtremes: TafTemperatureExtreme[];
+  temperatureTrend: TafTemperatureTrendSummary | null;
+  dominantWeather: TafPhenomenon[];
+  activeHeadlineZh: string | null;
+  activeWeatherTextZh: string | null;
+  activeWindTextZh: string | null;
+  activeCloudTextZh: string | null;
+  changeHighlights: TafTrendSummary[];
+}
+
+export interface TafForecastSegment {
+  changeLabel: string;
+  plainEnglish: string | null;
+  timeFrom: string | null;
+  timeTo: string | null;
+  visibilityKm: number | null;
+  clouds: string[];
+  cloudLayers?: TafCloudLayerDetail[];
+  windDirectionDegrees: number | null;
+  windSpeedKts: number | null;
+  windGustKts: number | null;
+  weatherCodes?: string[];
+  weather?: TafPhenomenon[];
+  windShear?: TafWindShearSummary | null;
+  headlineZh?: string | null;
+  flightCategory: TafFlightCategory | null;
+}
+
+export interface TafForecastOverview {
+  location: LocationInfo;
+  stationId: string;
+  stationName: string | null;
+  issuedAt: string | null;
+  validFrom: string | null;
+  validTo: string | null;
+  rawTaf: string | null;
+  sourceUrl: string;
+  officialSourceUrl: string;
+  activeForecast: TafForecastSegment | null;
+  dailySummary?: TafDailySummary | null;
+  fetchedAt: string;
+  stale: boolean;
+  freshness: DataFreshnessState;
+  cacheHit: boolean;
+}
+
+export interface DashboardTafSnapshot {
+  forecast: TafForecastOverview | null;
+  forecasts: TafForecastSegment[];
 }
 
 export interface MultiModelImageResponse {
@@ -131,16 +383,22 @@ export interface MultiModelImageResponse {
   body: Buffer;
   cacheHit: boolean;
   stale: boolean;
+  freshness: DataFreshnessState;
   headers: Record<string, string>;
 }
 
 export interface MultiModelStatusResponse {
   location: LocationInfo;
+  displayUnit: KellyTemperatureUnit;
+  fallbackDisplayUnit: KellyTemperatureUnit;
   pageFetchedAt: string | null;
   imageFetchedAt: string | null;
   imageUrlFound: boolean;
   cacheHit: boolean;
   stale: boolean;
+  freshness: DataFreshnessState;
+  imageStatus: MultiModelImageAvailability;
+  analysisStatus: MultiModelAnalysisAvailability;
   lastError: string | null;
   lastSuccessAt: string | null;
   imageUrl: string | null;
@@ -198,15 +456,28 @@ export interface MultiModelDistributionHighlights {
   highestPeakMember: MultiModelDistributionMember;
 }
 
+export type MultiModelTimestampResolutionReason =
+  | "requested"
+  | "requested-fallback"
+  | "nearest-now"
+  | "first-available";
+
 export interface MultiModelDistributionResponse {
   location: LocationInfo;
   fetchedAt: string;
   stale: boolean;
+  freshness: DataFreshnessState;
   cacheHit: boolean;
   pageUrl: string;
   sourceType: "meteoblue-page-highcharts";
+  displayUnit: KellyTemperatureUnit;
+  fallbackDisplayUnit: KellyTemperatureUnit;
   requestedTimestamp: string | null;
+  requestedTimestampValid: boolean;
+  resolvedTimestamp: string;
+  resolvedTimestampReason: MultiModelTimestampResolutionReason;
   selectedTimestamp: string;
+  selectedTimestampReason: MultiModelTimestampResolutionReason;
   availableTimestamps: string[];
   bucketSizeC: number;
   modelCount: number;
@@ -251,11 +522,18 @@ export interface MultiModelInsightResponse {
   location: LocationInfo;
   fetchedAt: string;
   stale: boolean;
+  freshness: DataFreshnessState;
   cacheHit: boolean;
   pageUrl: string;
   sourceType: "meteoblue-page-highcharts";
+  displayUnit: KellyTemperatureUnit;
+  fallbackDisplayUnit: KellyTemperatureUnit;
+  requestedTimestamp: string | null;
+  requestedTimestampValid: boolean;
+  resolvedTimestamp: string;
+  resolvedTimestampReason: MultiModelTimestampResolutionReason;
   selectedTimestamp: string;
-  selectedTimestampReason: "requested" | "nearest-now" | "first-available";
+  selectedTimestampReason: MultiModelTimestampResolutionReason;
   availableTimestamps: string[];
   modelCount: number;
   modelInventory: MultiModelInventoryItem[];
@@ -273,6 +551,8 @@ export interface MultiModelInsightResponse {
 export type KellyRiskMode = "conservative" | "balanced" | "aggressive";
 export type KellyContractType = "range" | "atLeast" | "atMost" | "exact";
 export type KellyTemperatureUnit = "C" | "F";
+export type KellyOriginMode = "remote" | "local-fallback";
+export type KellyCircuitState = "closed" | "open" | "half-open";
 export type KellySourceState = "fresh" | "stale" | "degraded" | "unavailable" | "connected" | "disconnected";
 export type KellyMarketLifecycle = "tradable" | "inactive" | "unresolved";
 export type KellyInactiveReason =
@@ -324,6 +604,7 @@ export interface KellyWeatherEvidence {
   observationFloorSource: "manual" | "metar" | "hourly-current" | "hourly-observed" | "none";
   observationFloorObservedAt: string | null;
   metarObservation: MetarObservation | null;
+  tafForecast: TafForecastOverview | null;
   sourceSummaryZh: string | null;
   hourlyPageUrl: string;
   multimodelPageUrl: string;
@@ -565,7 +846,7 @@ export interface KellyStreamHealth {
   lastRepricedAt: string | null;
 }
 
-export interface KellyBridgeStageTimings {
+export interface KellyRuntimeStageTimings {
   hourly: number | null;
   report: number | null;
   metar: number | null;
@@ -577,17 +858,24 @@ export interface KellyBridgeStageTimings {
   total: number | null;
 }
 
-export interface KellyBridgeHealth {
+export interface KellyRuntimeHealth {
+  service: "kelly-origin";
   lastSnapshotSuccessAt: string | null;
   lastSnapshotErrorAt: string | null;
   lastSnapshotError: string | null;
   lastMarketDiscoveryAt: string | null;
+  lastOrderbookAttemptAt?: string | null;
+  lastOrderbookSuccessAt?: string | null;
+  lastOrderbookFailureAt?: string | null;
+  lastOrderbookFailureCode?: string | null;
   lastOrderbookAt: string | null;
   lastRepricedAt: string | null;
+  lastSignalAt: string | null;
   lastStreamEventAt: string | null;
   openStreamCount: number;
+  activeHubCount: number;
   fallbackMode: boolean;
-  lastStageTimingsMs: KellyBridgeStageTimings;
+  lastStageTimingsMs: KellyRuntimeStageTimings;
 }
 
 export interface KellyWorkbenchResponse {
@@ -655,6 +943,8 @@ export type KellyStreamMessage =
       message: string;
       lastSignalAt?: string | null;
       lastRepricedAt?: string | null;
+      originMode?: KellyOriginMode;
+      circuitState?: KellyCircuitState;
     }
   | {
       type: "markets";
@@ -663,6 +953,8 @@ export type KellyStreamMessage =
       frames: KellyFramePoint[];
       lastSignalAt?: string | null;
       lastRepricedAt?: string | null;
+      originMode?: KellyOriginMode;
+      circuitState?: KellyCircuitState;
     };
 
 export interface KellyRequestOptions {
@@ -672,6 +964,7 @@ export interface KellyRequestOptions {
   minEdge?: number;
   actualTemperatureC?: number;
   selectedHourTimestamp?: string;
+  forceRefresh?: boolean;
 }
 
 export interface KellyStreamHandle {
@@ -683,9 +976,63 @@ export interface UserFavoritesResponse {
   locationIds: LocationInfo["id"][];
 }
 
+export interface RuntimeCacheBucketStatus {
+  entryCount: number;
+  freshCount: number;
+  revalidatingCount: number;
+  fallbackErrorCount: number;
+  inFlightCount: number;
+  lastSuccessAt: string | null;
+}
+
+export interface ServiceRuntimeStatus {
+  caches: {
+    week: RuntimeCacheBucketStatus;
+    multiModelImage: RuntimeCacheBucketStatus;
+    multiModelDistribution: RuntimeCacheBucketStatus;
+  };
+  kelly: KellyRuntimeHealth | null;
+}
+
+export interface SystemStatusSourceCoverage {
+  key: string;
+  label: string;
+  scope: "current" | "target";
+  productionCount: number;
+  plannedCount: number;
+  candidateCount: number;
+  unavailableCount: number;
+}
+
+export interface SystemStatusResponse {
+  ok: true;
+  service: string;
+  buildId: string;
+  startedAt: string;
+  generatedAt: string;
+  roadmap: {
+    profile: "polyweather-absorption-v1";
+    cleanRoom: true;
+    probabilityLayerEnabled: false;
+    marketNarrative: "qualitative-only";
+  };
+  sourceContractsVersion: string;
+  locationCoverage: {
+    totalEnabled: number;
+    byTimezoneGroup: Record<import("../config.js").TimezoneGroup, number>;
+    byRolloutTier: Record<LocationRolloutTier, number>;
+  };
+  sourceCoverage: SystemStatusSourceCoverage[];
+  runtime: ServiceRuntimeStatus | null;
+  kellyProxy?: Record<string, unknown>;
+  watchdog?: Record<string, unknown> | null;
+}
+
 export interface WeatherService {
   getHourly(locationId: LocationInfo["id"], mode: HourlyMode, limit?: number): Promise<HourlyWeatherResponse>;
   getWeatherReport(locationId: LocationInfo["id"]): Promise<WeatherReportResponse>;
+  getMetarSnapshot?(locationId: LocationInfo["id"]): Promise<DashboardMetarSnapshot>;
+  getTafSnapshot?(locationId: LocationInfo["id"]): Promise<DashboardTafSnapshot>;
   getMultiModelImage(locationId: LocationInfo["id"], allowStale: boolean): Promise<MultiModelImageResponse>;
   getMultiModelStatus(locationId: LocationInfo["id"]): Promise<MultiModelStatusResponse>;
   getMultiModelDistribution(
@@ -707,7 +1054,8 @@ export interface WeatherService {
     options: KellyRequestOptions,
     onMessage: (message: KellyStreamMessage) => void,
   ): Promise<KellyStreamHandle>;
-  getKellyBridgeHealth?(): KellyBridgeHealth;
+  getKellyRuntimeHealth?(): KellyRuntimeHealth;
+  getSystemStatus?(): ServiceRuntimeStatus;
   getUserFavorites?(): Promise<UserFavoritesResponse>;
   setUserFavorite?(locationId: LocationInfo["id"], favorite: boolean): Promise<UserFavoritesResponse>;
 }

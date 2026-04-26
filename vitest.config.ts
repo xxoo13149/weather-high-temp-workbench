@@ -6,6 +6,7 @@ export default defineConfig({
     exclude: [
       ...configDefaults.exclude,
       "**/.npm-cache/**",
+      "**/tools/**/*.spec.ts",
       "**/tmp-snapshot-*/**",
       "**/zip/dist/**",
     ],

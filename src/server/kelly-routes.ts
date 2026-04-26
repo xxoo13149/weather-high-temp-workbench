@@ -2,7 +2,7 @@ import type { FastifyInstance, preHandlerHookHandler } from "fastify";
 
 import { DEFAULT_LOCATION, LOCATION_REGISTRY } from "../config.js";
 import { AppError } from "../domain/errors.js";
-import type { KellyRiskMode, KellyStreamMessage, LocationInfo, WeatherService } from "../domain/weather.js";
+import type { KellyRiskMode, KellyStreamHandle, KellyStreamMessage, LocationInfo, WeatherService } from "../domain/weather.js";
 
 const parseTimestamp = (raw: unknown): string | undefined => {
   if (raw === undefined || raw === "") {
@@ -96,6 +96,22 @@ const parseKellyMinEdge = (raw: unknown): number | undefined => {
   return value;
 };
 
+const parseForceRefresh = (raw: unknown): boolean | undefined => {
+  if (raw === undefined || raw === "") {
+    return undefined;
+  }
+
+  if (raw === "true" || raw === "1") {
+    return true;
+  }
+
+  if (raw === "false" || raw === "0") {
+    return false;
+  }
+
+  throw new AppError(400, "BAD_REQUEST", "Query parameter 'forceRefresh' must be boolean.");
+};
+
 const parseQueryLocationId = (raw: unknown): LocationInfo["id"] => {
   if (raw === undefined || raw === "") {
     return DEFAULT_LOCATION;
@@ -124,6 +140,7 @@ const parseKellyQuery = (query: Record<string, unknown> | undefined) => {
       minEdge: parseKellyMinEdge(normalizedQuery.minEdge),
       actualTemperatureC: parseActualTemperatureC(normalizedQuery.actualTemperatureC),
       selectedHourTimestamp: parseTimestamp(normalizedQuery.selectedHour),
+      forceRefresh: parseForceRefresh(normalizedQuery.forceRefresh),
     },
   };
 };
@@ -139,6 +156,13 @@ const sendSocketMessage = (socket: { readyState: number; OPEN: number; send(valu
   }
 
   socket.send(JSON.stringify(message));
+};
+
+const KELLY_STREAM_INIT_MAX_ATTEMPTS = 2;
+const KELLY_STREAM_INIT_RETRY_DELAY_MS = 750;
+
+const sleep = async (ms: number) => {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 };
 
 export const registerKellyRoutes = (
@@ -185,19 +209,98 @@ export const registerKellyRoutes = (
           socket.close();
           return;
         }
+        const createKellyStream = service.createKellyStream.bind(service);
+
+        let streamHandle: KellyStreamHandle | null = null;
+        let closeRequested = false;
+        let resolveClosed: (() => void) | null = null;
+        const socketClosed = new Promise<void>((resolve) => {
+          resolveClosed = resolve;
+        });
+
+        socket.on("close", () => {
+          closeRequested = true;
+          if (streamHandle) {
+            const streamToClose = streamHandle;
+            streamHandle = null;
+            void streamToClose.close();
+          }
+          resolveClosed?.();
+        });
 
         try {
           const { locationId, options: kellyOptions } = parseKellyQuery(
             (request.query as Record<string, unknown> | undefined) ?? {},
           );
 
-          const stream = await service.createKellyStream(locationId, kellyOptions, (message) => {
-            sendSocketMessage(socket, message);
+          sendSocketMessage(socket, {
+            type: "status",
+            generatedAt: new Date().toISOString(),
+            state: "connected",
+            reasonCode: "snapshot_loaded",
+            message: "实时流握手成功，正在初始化首轮快照。",
+            lastSignalAt: null,
+            lastRepricedAt: null,
           });
 
-          socket.on("close", async () => {
-            await stream.close();
-          });
+          void (async () => {
+            try {
+              for (let attempt = 1; attempt <= KELLY_STREAM_INIT_MAX_ATTEMPTS; attempt += 1) {
+                try {
+                  const nextHandle = await createKellyStream(locationId, kellyOptions, (message) => {
+                    sendSocketMessage(socket, message);
+                  });
+
+                  if (closeRequested || socket.readyState !== socket.OPEN) {
+                    await nextHandle.close();
+                    return;
+                  }
+
+                  streamHandle = nextHandle;
+                  return;
+                } catch (error) {
+                  const appError =
+                    error instanceof AppError
+                      ? error
+                      : new AppError(500, "KELLY_STREAM_ERROR", "Kelly stream initialization failed.");
+                  if (attempt >= KELLY_STREAM_INIT_MAX_ATTEMPTS) {
+                    throw appError;
+                  }
+
+                  sendSocketMessage(socket, {
+                    type: "status",
+                    generatedAt: new Date().toISOString(),
+                    state: "degraded",
+                    reasonCode: "upstream_error",
+                    message: "Kelly stream bootstrap hit a transient error, retrying once.",
+                  });
+
+                  if (closeRequested || socket.readyState !== socket.OPEN) {
+                    return;
+                  }
+
+                  await sleep(KELLY_STREAM_INIT_RETRY_DELAY_MS);
+                }
+              }
+            } catch (error) {
+              const appError =
+                error instanceof AppError
+                  ? error
+                  : new AppError(500, "KELLY_STREAM_ERROR", "Kelly stream initialization failed.");
+              if (socket.readyState === socket.OPEN) {
+                sendSocketMessage(socket, {
+                  type: "status",
+                  generatedAt: new Date().toISOString(),
+                  state: "degraded",
+                  reasonCode: "upstream_error",
+                  message: appError.message,
+                });
+                socket.close();
+              }
+            }
+          })();
+
+          await socketClosed;
         } catch (error) {
           const appError =
             error instanceof AppError ? error : new AppError(500, "KELLY_STREAM_ERROR", "Kelly stream initialization failed.");
@@ -209,6 +312,7 @@ export const registerKellyRoutes = (
             message: appError.message,
           });
           socket.close();
+          await socketClosed;
         }
       },
     );

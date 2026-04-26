@@ -7,6 +7,7 @@ import { parseLocalDateTimeInTimeZone, parseObservedTime, toIsoInTimeZone } from
 export const WEEK_PARSER_VERSION = "2026-04-04.2";
 type CheerioRoot = ReturnType<typeof load>;
 type CheerioSelection = ReturnType<CheerioRoot>;
+type ParsedTemperatureUnit = "C" | "F";
 
 interface ParsedWeatherReport {
   available: boolean;
@@ -165,6 +166,72 @@ const emptyReportMetrics = (): WeatherReportMetrics => ({
 const parseNumber = (value: string): number | null => {
   const match = normalizeText(value).match(/-?\d+(?:\.\d+)?/);
   return match ? Number.parseFloat(match[0]) : null;
+};
+
+const roundCanonicalTemperatureC = (value: number): number => Number.parseFloat(value.toFixed(1));
+
+const normalizeTemperatureToC = (value: number | null, unit: ParsedTemperatureUnit): number | null => {
+  if (value === null) {
+    return null;
+  }
+
+  return unit === "F" ? roundCanonicalTemperatureC(((value - 32) * 5) / 9) : value;
+};
+
+const parseTemperature = (value: string, unit: ParsedTemperatureUnit): number | null =>
+  normalizeTemperatureToC(parseNumber(value), unit);
+
+const formatCanonicalTemperatureC = (value: number): string => {
+  const rounded = roundCanonicalTemperatureC(value);
+  return Number.isInteger(rounded) ? String(rounded) : String(rounded);
+};
+
+const parseTemperatureUnitToken = (raw: string | null | undefined): ParsedTemperatureUnit | null => {
+  const normalized = normalizeText(raw ?? "").toUpperCase();
+  if (normalized === "C" || normalized === "°C" || normalized === "CELSIUS") {
+    return "C";
+  }
+  if (normalized === "F" || normalized === "°F" || normalized === "FAHRENHEIT") {
+    return "F";
+  }
+
+  return null;
+};
+
+const resolvePageTemperatureUnit = ($: CheerioRoot, fallbackUnit: ParsedTemperatureUnit): ParsedTemperatureUnit => {
+  const selectedUnitCandidates = [
+    $("li.selected a.unit[data-type='temp'][data-unit]").first().attr("data-unit"),
+    $("a.unit.selected[data-type='temp'][data-unit]").first().attr("data-unit"),
+    $("[aria-current='true'][data-type='temp'][data-unit]").first().attr("data-unit"),
+    $("[aria-selected='true'][data-type='temp'][data-unit]").first().attr("data-unit"),
+  ];
+
+  for (const candidate of selectedUnitCandidates) {
+    const parsed = parseTemperatureUnitToken(candidate);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  const signals = [
+    normalizeText($("section.weather-report-text").text()),
+    normalizeText($("table.hourly-view, table.one-hourly-view, table.three-hourly-view").text()),
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const hasFahrenheitSignal = /(?:°|\bdegrees?\b)\s*F\b|fahrenheit/i.test(signals);
+  const hasCelsiusSignal = /(?:°|\bdegrees?\b)\s*C\b|celsius/i.test(signals);
+
+  if (hasFahrenheitSignal && !hasCelsiusSignal) {
+    return "F";
+  }
+
+  if (hasCelsiusSignal && !hasFahrenheitSignal) {
+    return "C";
+  }
+
+  return fallbackUnit;
 };
 
 const parsePercent = (value: string): number | null => {
@@ -534,7 +601,12 @@ const appendFieldMissingWarning = (
   }
 };
 
-const parseOneHourMode = ($: CheerioRoot, warnings: string[], timezone: string): ParsedOneHourModeResult => {
+const parseOneHourMode = (
+  $: CheerioRoot,
+  warnings: string[],
+  timezone: string,
+  pageTemperatureUnit: ParsedTemperatureUnit,
+): ParsedOneHourModeResult => {
   const diagnostics = createEmptyOneHourFieldDiagnostics();
   const table = $("table.hourly-view, table.one-hourly-view").first();
   if (table.length === 0) {
@@ -558,7 +630,7 @@ const parseOneHourMode = ($: CheerioRoot, warnings: string[], timezone: string):
     $,
     findFirstRow(table, ["tr.temperatures", "tr.temperature", "tr.air-temperature"]),
     items,
-    parseNumber,
+    (value) => parseTemperature(value, pageTemperatureUnit),
     (item, value) => {
       item.temperatureC = value;
     },
@@ -584,7 +656,7 @@ const parseOneHourMode = ($: CheerioRoot, warnings: string[], timezone: string):
 
       const wrapped = $(cell);
       const signals = collectCellSignals($, wrapped);
-      const value = parseNumberFromSignals(signals);
+      const value = normalizeTemperatureToC(parseNumberFromSignals(signals), pageTemperatureUnit);
       if (value !== null) {
         item.feelsLikeC = value;
         return;
@@ -743,7 +815,12 @@ const parseOneHourMode = ($: CheerioRoot, warnings: string[], timezone: string):
   };
 };
 
-const parseThreeHourMode = ($: ReturnType<typeof load>, warnings: string[], timezone: string): HourlyWeatherItem[] => {
+const parseThreeHourMode = (
+  $: ReturnType<typeof load>,
+  warnings: string[],
+  timezone: string,
+  pageTemperatureUnit: ParsedTemperatureUnit,
+): HourlyWeatherItem[] => {
   const table = $("div.three-hourly-table table.three-hourly-view, table.three-hourly-view").first();
   if (table.length === 0) {
     warnings.push("3h table not found.");
@@ -756,15 +833,21 @@ const parseThreeHourMode = ($: ReturnType<typeof load>, warnings: string[], time
     return [];
   }
 
-  assignNumericCells($, table.find("tr.temperatures, tr.temperature").first(), items, parseNumber, (item, value) => {
+  assignNumericCells(
+    $,
+    table.find("tr.temperatures, tr.temperature").first(),
+    items,
+    (value) => parseTemperature(value, pageTemperatureUnit),
+    (item, value) => {
     item.temperatureC = value;
-  });
+    },
+  );
 
   assignNumericCells(
     $,
     table.find("tr.windchills, tr.feelslike, tr.feels-like, tr.apparent-temperatures").first(),
     items,
-    parseNumber,
+    (value) => parseTemperature(value, pageTemperatureUnit),
     (item, value) => {
       item.feelsLikeC = value;
     },
@@ -875,12 +958,17 @@ const extractPredictabilityHint = ($: ReturnType<typeof load>): PredictabilityRe
   return { level: null, score: null };
 };
 
-const parseWeatherReportMetrics = (bodyText: string, predictabilityHint: PredictabilityResult): WeatherReportMetrics => {
-  const maxTemperatureC = parseNumber(
+const parseWeatherReportMetrics = (
+  bodyText: string,
+  predictabilityHint: PredictabilityResult,
+  pageTemperatureUnit: ParsedTemperatureUnit,
+): WeatherReportMetrics => {
+  const maxTemperatureC = parseTemperature(
     bodyText.match(/Temperatures peaking at ([^.]*)\./i)?.[1] ??
       bodyText.match(/Temperatures as high as ([^.]*) are foreseen\./i)?.[1] ??
       bodyText.match(/Temperature highs are likely to reach ([^.]*)\./i)?.[1] ??
       "",
+    pageTemperatureUnit,
   );
 
   const uvIndex = parseNumber(
@@ -950,7 +1038,7 @@ const parseWeatherReportMetrics = (bodyText: string, predictabilityHint: Predict
 const buildNarrativeFallback = (metrics: WeatherReportMetrics): string => {
   const details: string[] = [];
   if (metrics.maxTemperatureC !== null) {
-    details.push(`\u6700\u9ad8\u6c14\u6e29\u7ea6 ${metrics.maxTemperatureC}\u00b0C`);
+    details.push(`\u6700\u9ad8\u6c14\u6e29\u7ea6 ${formatCanonicalTemperatureC(metrics.maxTemperatureC)}\u00b0C`);
   }
   if (metrics.daytimeWindKphMin !== null && metrics.daytimeWindKphMax !== null) {
     details.push(`\u767d\u5929\u98ce\u901f\u7ea6 ${metrics.daytimeWindKphMin}\u2013${metrics.daytimeWindKphMax} km/h`);
@@ -966,7 +1054,23 @@ const buildNarrativeFallback = (metrics: WeatherReportMetrics): string => {
 const splitIntoSentences = (value: string): string[] =>
   (normalizeText(value).match(/[^.!?]+[.!?]?/g) ?? []).map((sentence) => normalizeText(sentence)).filter(Boolean);
 
-const sentenceTranslators: Array<{ pattern: RegExp; render: (match: RegExpMatchArray) => string }> = [
+const renderTemperatureNarrative = (
+  prefix: string,
+  rawTemperature: string,
+  pageTemperatureUnit: ParsedTemperatureUnit,
+): string => {
+  const normalizedTemperatureC = parseTemperature(rawTemperature, pageTemperatureUnit);
+  if (normalizedTemperatureC === null) {
+    return `${prefix} ${normalizeText(rawTemperature)}。`;
+  }
+
+  return `${prefix} ${formatCanonicalTemperatureC(normalizedTemperatureC)}°C。`;
+};
+
+const sentenceTranslators: Array<{
+  pattern: RegExp;
+  render: (match: RegExpMatchArray, pageTemperatureUnit: ParsedTemperatureUnit) => string;
+}> = [
   {
     pattern: /^During the night and in the morning a few clouds are expected, and some more clouds roll across (?:after noon|in the afternoon)\.?$/i,
     render: () => "\u591c\u95f4\u5230\u4e0a\u5348\u4e91\u91cf\u8f83\u5c11\uff0c\u4e0b\u5348\u4e91\u91cf\u5c06\u9010\u6e10\u589e\u591a\u3002",
@@ -977,11 +1081,11 @@ const sentenceTranslators: Array<{ pattern: RegExp; render: (match: RegExpMatchA
   },
   {
     pattern: /^Temperatures peaking at ([^.]*)\.?$/i,
-    render: (match) => `\u6700\u9ad8\u6c14\u6e29\u7ea6 ${normalizeText(match[1])}\u3002`,
+    render: (match, pageTemperatureUnit) => renderTemperatureNarrative("\u6700\u9ad8\u6c14\u6e29\u7ea6", match[1], pageTemperatureUnit),
   },
   {
     pattern: /^Temperatures as high as ([^.]*) are foreseen\.?$/i,
-    render: (match) => `\u6700\u9ad8\u6c14\u6e29\u53ef\u8fbe ${normalizeText(match[1])}\u3002`,
+    render: (match, pageTemperatureUnit) => renderTemperatureNarrative("\u6700\u9ad8\u6c14\u6e29\u53ef\u8fbe", match[1], pageTemperatureUnit),
   },
   {
     pattern: /^With a UV-Index as high as ([^ ]+) make sure to properly protect your skin\.?$/i,
@@ -1021,11 +1125,11 @@ const sentenceTranslators: Array<{ pattern: RegExp; render: (match: RegExpMatchA
   },
 ];
 
-const translateSentence = (sentence: string): string | null => {
+const translateSentence = (sentence: string, pageTemperatureUnit: ParsedTemperatureUnit): string | null => {
   for (const translator of sentenceTranslators) {
     const match = sentence.match(translator.pattern);
     if (match) {
-      return normalizeTranslatedSentence(translator.render(match));
+      return normalizeTranslatedSentence(translator.render(match, pageTemperatureUnit));
     }
   }
 
@@ -1045,7 +1149,12 @@ const ensureChineseNarrative = (textZh: string | null, metrics: WeatherReportMet
   return normalized;
 };
 
-const translateNarrativeFromEnglish = (sourceTextEn: string, titleEn: string, metrics: WeatherReportMetrics): string => {
+const translateNarrativeFromEnglish = (
+  sourceTextEn: string,
+  titleEn: string,
+  metrics: WeatherReportMetrics,
+  pageTemperatureUnit: ParsedTemperatureUnit,
+): string => {
   const body = normalizeText(sourceTextEn.replace(titleEn, "").trim());
   if (!body) {
     return buildNarrativeFallback(metrics);
@@ -1053,7 +1162,7 @@ const translateNarrativeFromEnglish = (sourceTextEn: string, titleEn: string, me
 
   const translated: string[] = [];
   for (const sentence of splitIntoSentences(body)) {
-    const zh = translateSentence(sentence);
+    const zh = translateSentence(sentence, pageTemperatureUnit);
     if (!zh) {
       return buildNarrativeFallback(metrics);
     }
@@ -1075,11 +1184,13 @@ export const sanitizeReportTextZh = ({
   sourceTextEn,
   titleEn,
   metrics,
+  pageTemperatureUnit,
 }: {
   textZh: string | null;
   sourceTextEn: string | null;
   titleEn: string | null;
   metrics: WeatherReportMetrics;
+  pageTemperatureUnit: ParsedTemperatureUnit;
 }): string => {
   const normalized = normalizeText(textZh ?? "");
   if (normalized !== "" && containsChinese(normalized) && !containsLatinLetters(normalized)) {
@@ -1087,7 +1198,7 @@ export const sanitizeReportTextZh = ({
   }
 
   if (sourceTextEn) {
-    return translateNarrativeFromEnglish(sourceTextEn, titleEn ?? "", metrics);
+    return translateNarrativeFromEnglish(sourceTextEn, titleEn ?? "", metrics, pageTemperatureUnit);
   }
 
   return buildNarrativeFallback(metrics);
@@ -1132,7 +1243,11 @@ const extractReportFromHeading = ($: ReturnType<typeof load>, locationName: stri
   return best ? { titleEn: best.titleEn, sourceTextEn: best.sourceTextEn } : null;
 };
 
-const extractWeatherReport = ($: ReturnType<typeof load>, locationName: string): ParsedWeatherReport => {
+const extractWeatherReport = (
+  $: ReturnType<typeof load>,
+  locationName: string,
+  pageTemperatureUnit: ParsedTemperatureUnit,
+): ParsedWeatherReport => {
   const fallbackTitleEn = `Weather report for ${locationName}`;
   const fullText = normalizeText($.root().text());
   const headingExtraction = extractReportFromHeading($, locationName);
@@ -1161,12 +1276,13 @@ const extractWeatherReport = ($: ReturnType<typeof load>, locationName: string):
 
   const bodyText = normalizeText(sourceTextEn.replace(titleEn, "").trim());
   const predictabilityHint = extractPredictabilityHint($);
-  const metrics = parseWeatherReportMetrics(bodyText, predictabilityHint);
+  const metrics = parseWeatherReportMetrics(bodyText, predictabilityHint, pageTemperatureUnit);
   const textZh = sanitizeReportTextZh({
     textZh: null,
     sourceTextEn,
     titleEn,
     metrics,
+    pageTemperatureUnit,
   });
 
   if (!headingExtraction) {
@@ -1183,16 +1299,23 @@ const extractWeatherReport = ($: ReturnType<typeof load>, locationName: string):
   };
 };
 
-export const parseWeekPage = (html: string, referenceDate: Date, timezone: string, locationName: string): ParsedWeekData => {
+export const parseWeekPage = (
+  html: string,
+  referenceDate: Date,
+  timezone: string,
+  locationName: string,
+  fallbackDisplayUnit: ParsedTemperatureUnit = "C",
+): ParsedWeekData => {
   const $ = load(html);
   const oneHourWarnings: string[] = [];
   const warnings: string[] = [];
+  const pageTemperatureUnit = resolvePageTemperatureUnit($, fallbackDisplayUnit);
 
   const observedTimeText = normalizeText($("a.current-weather .current-description span").last().text()) || null;
   const sourceObservedAt = parseObservedTime(observedTimeText, referenceDate, timezone)?.toISOString() ?? null;
-  const oneHourParsed = parseOneHourMode($, oneHourWarnings, timezone);
-  const threeHourItems = parseThreeHourMode($, warnings, timezone);
-  const report = extractWeatherReport($, locationName);
+  const oneHourParsed = parseOneHourMode($, oneHourWarnings, timezone, pageTemperatureUnit);
+  const threeHourItems = parseThreeHourMode($, warnings, timezone, pageTemperatureUnit);
+  const report = extractWeatherReport($, locationName, pageTemperatureUnit);
 
   if (oneHourParsed.items.length === 0 && threeHourItems.length === 0) {
     throw new AppError(502, "WEEK_PARSE_FAILED", "Could not parse any hourly forecast data from the week page.", {
