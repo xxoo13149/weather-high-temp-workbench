@@ -13,6 +13,7 @@ import type {
   DashboardSourceMetadata,
   IntradaySignalsSummary,
   MarketReferenceSummary,
+  SupplementalEvidenceSnapshot,
   WeatherReportResponse,
 } from "./types";
 import { translatePredictabilityLabel } from "./display-text";
@@ -75,6 +76,7 @@ export interface DashboardViewModel {
   };
   report: WeatherReportResponse;
   multimodel: DashboardResponse["multimodel"];
+  supplementalEvidence: SupplementalEvidenceSnapshot | null;
   sourceMetadata: DashboardSourceMetadata;
   intradaySignals: IntradaySignalsSummary;
   marketReference: MarketReferenceSummary;
@@ -156,6 +158,7 @@ export const mapDashboardResponse = (
     },
     report,
     multimodel: dashboard.multimodel,
+    supplementalEvidence: dashboard.supplementalEvidence ?? null,
     sourceMetadata: dashboard.sourceMetadata,
     intradaySignals: dashboard.intradaySignals,
     marketReference: dashboard.marketReference,

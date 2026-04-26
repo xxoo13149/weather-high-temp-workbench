@@ -3632,6 +3632,7 @@ export default function App() {
                   items={homeViewModel.items}
                   metar={dashboard.metar}
                   taf={dashboard.taf}
+                  supplementalEvidence={dashboard.supplementalEvidence}
                   displayUnit={dashboard.displayUnit ?? activeDisplayUnit}
                   locationTimezone={activeLocationTimezone}
                   selectedTimestamp={routeState.selectedHourlyTimestamp}
@@ -3715,6 +3716,7 @@ export default function App() {
                   taf={dashboard.taf}
                   report={dashboard.report}
                   multimodel={dashboard.multimodel}
+                  supplementalEvidence={dashboard.supplementalEvidence}
                   insight={insight}
                   sourceMetadata={dashboard.sourceMetadata}
                   pageUrl={dashboard.hourly.pageUrl}

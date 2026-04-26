@@ -9,8 +9,10 @@ import type {
   KellyRiskMode,
   KellyStreamMessage,
   LocationInfo,
+  SupplementalEvidenceSnapshot,
 } from "../domain/weather.js";
 import { normalizeDashboardMetarSnapshot } from "../domain/weather.js";
+import { withHandledTimeout } from "../lib/with-timeout.js";
 import {
   buildDashboardEnhancements,
   buildLocationDirectory,
@@ -19,6 +21,7 @@ import {
   getLocationSourceContract,
 } from "../operational-metadata.js";
 import { MeteoblueWeatherService } from "../providers/meteoblue/service.js";
+import { buildEmptySupplementalEvidence } from "../providers/supplemental/service.js";
 import { CloudflareFavoritesStore, InMemoryFavoritesStore } from "./favorites-store.js";
 
 type AssetBinding = {
@@ -76,6 +79,7 @@ const KELLY_PROXY_FAILURE_WINDOW_MS = 60_000;
 const KELLY_PROXY_OPEN_DURATION_MS = 5 * 60_000;
 const KELLY_PROXY_GET_TIMEOUT_MS = 14_000;
 const DASHBOARD_PROXY_GET_TIMEOUT_MS = 14_000;
+const DASHBOARD_SUPPLEMENTAL_TIMEOUT_MS = 3_500;
 const KELLY_PROXY_STREAM_TIMEOUT_MS = 6_000;
 
 const createKellyProxyCircuitTracker = (): KellyProxyCircuitTracker => ({
@@ -415,6 +419,46 @@ const loadDashboardTafSnapshot = async (
     return await service.getTafSnapshot(locationId);
   } catch {
     return EMPTY_DASHBOARD_TAF_SNAPSHOT;
+  }
+};
+
+const loadDashboardSupplementalEvidence = async (
+  service: Awaited<ReturnType<typeof getService>>,
+  locationId: LocationInfo["id"],
+): Promise<SupplementalEvidenceSnapshot> => {
+  const location = LOCATION_REGISTRY[locationId];
+  const fallback = (warning: string) =>
+    buildEmptySupplementalEvidence(
+      {
+        id: location.id,
+        name: location.name,
+        timezone: location.timezone,
+        latitude: location.latitude,
+        longitude: location.longitude,
+      },
+      warning,
+    );
+
+  if (!service.getSupplementalEvidence) {
+    return fallback("Supplemental evidence service is not exposed.");
+  }
+
+  try {
+    return await withHandledTimeout(
+      service.getSupplementalEvidence(locationId),
+      DASHBOARD_SUPPLEMENTAL_TIMEOUT_MS,
+      () =>
+        new AppError(
+          504,
+          "SUPPLEMENTAL_EVIDENCE_TIMEOUT",
+          `Supplemental evidence dashboard load exceeded ${DASHBOARD_SUPPLEMENTAL_TIMEOUT_MS}ms.`,
+          {
+            retryable: true,
+          },
+        ),
+    );
+  } catch (error) {
+    return fallback(`Supplemental evidence unavailable: ${error instanceof Error ? error.message : String(error)}`);
   }
 };
 
@@ -1353,12 +1397,13 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
         ctx,
         EDGE_CACHE_TTL_SECONDS.dashboard,
         async () => {
-        const [hourly, multimodel, report, metar, taf] = await Promise.all([
+        const [hourly, multimodel, report, metar, taf, supplementalEvidence] = await Promise.all([
           service.getHourly(locationId, mode, limit),
           service.getMultiModelStatus(locationId),
           service.getWeatherReport(locationId),
           loadDashboardMetarSnapshot(service, locationId),
           loadDashboardTafSnapshot(service, locationId),
+          loadDashboardSupplementalEvidence(service, locationId),
         ]);
           const dashboardEnhancements = buildDashboardEnhancements({
             locationId,
@@ -1388,6 +1433,7 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
           report,
           metar,
           taf,
+          supplementalEvidence,
           ...dashboardEnhancements,
           multimodel: {
               ...multimodel,

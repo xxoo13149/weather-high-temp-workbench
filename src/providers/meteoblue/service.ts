@@ -27,6 +27,7 @@ import type {
   MultiModelStatusResponse,
   RuntimeCacheBucketStatus,
   ServiceRuntimeStatus,
+  SupplementalEvidenceSnapshot,
   UserFavoritesResponse,
   WeatherReportResponse,
   WeatherService,
@@ -49,6 +50,11 @@ import { FavoritesStore, type FavoritesStoreLike } from "../../lib/favorites-sto
 import { fetchBinary, fetchText } from "../../lib/http.js";
 import { withHandledTimeout as withTimeout } from "../../lib/with-timeout.js";
 import { fetchMetarSnapshot } from "../metar/service.js";
+import {
+  applySupplementalRuntimeState,
+  buildEmptySupplementalEvidence,
+  fetchSupplementalEvidence,
+} from "../supplemental/service.js";
 import { fetchTafSnapshot } from "../taf/service.js";
 import { resolveLocation } from "./location-registry.js";
 import {
@@ -91,6 +97,8 @@ const METEOBLUE_WEEK_METEOGRAM_TOTAL_TIMEOUT_MS = METEOBLUE_WEEK_METEOGRAM_LOADE
 const METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS = METEOBLUE_MULTIMODEL_LOADER_TIMEOUT_MS + 1_500;
 const METEOBLUE_METAR_TOTAL_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 10_000);
 const METEOBLUE_TAF_TOTAL_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 10_000);
+const SUPPLEMENTAL_EVIDENCE_TTL_MS = 2 * 60_000;
+const SUPPLEMENTAL_EVIDENCE_TOTAL_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 3_000);
 const POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 15_000);
 const POLYMARKET_ORDERBOOK_TOTAL_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 15_000);
 const KELLY_MARKET_DISCOVERY_STAGE_TIMEOUT_MS = Math.min(POLYMARKET_DISCOVERY_TOTAL_TIMEOUT_MS, 3_500);
@@ -881,6 +889,10 @@ export class MeteoblueWeatherService implements WeatherService {
   >();
   private readonly metarCaches = new Map<LocationInfo["id"], RefreshableCache<MetarCacheValue>>();
   private readonly tafCaches = new Map<LocationInfo["id"], RefreshableCache<TafCacheValue>>();
+  private readonly supplementalEvidenceCaches = new Map<
+    LocationInfo["id"],
+    RefreshableCache<SupplementalEvidenceSnapshot>
+  >();
   private readonly kellyMarketCaches = new Map<string, RefreshableCache<PolymarketDiscoveryResult>>();
   private readonly kellyOrderBookCaches = new Map<string, RefreshableCache<Map<string, NormalizedOrderBook>>>();
   private readonly kellyOrderBookRefreshInFlight = new Map<string, Promise<Map<string, NormalizedOrderBook>>>();
@@ -1511,6 +1523,41 @@ export class MeteoblueWeatherService implements WeatherService {
     return cache;
   }
 
+  private getSupplementalEvidenceCache(locationId: LocationInfo["id"]) {
+    const existing = this.supplementalEvidenceCaches.get(locationId);
+    if (existing) {
+      return existing;
+    }
+
+    const location = this.requireLocation(locationId);
+    const cache = new RefreshableCache<SupplementalEvidenceSnapshot>(
+      SUPPLEMENTAL_EVIDENCE_TTL_MS,
+      async () =>
+        await withTimeout(
+          fetchSupplementalEvidence({
+            id: location.id,
+            name: location.name,
+            timezone: location.timezone,
+            latitude: location.latitude,
+            longitude: location.longitude,
+          }),
+          SUPPLEMENTAL_EVIDENCE_TOTAL_TIMEOUT_MS,
+          () =>
+            new AppError(
+              504,
+              "SUPPLEMENTAL_EVIDENCE_TIMEOUT",
+              `Supplemental evidence fetch exceeded ${SUPPLEMENTAL_EVIDENCE_TOTAL_TIMEOUT_MS}ms.`,
+              {
+                retryable: true,
+              },
+            ),
+        ),
+    );
+
+    this.supplementalEvidenceCaches.set(locationId, cache);
+    return cache;
+  }
+
   private getKellyMarketCache(locationId: LocationInfo["id"], targetDate: string) {
     const key = buildKellyCacheKey(locationId, targetDate);
     const existing = this.kellyMarketCaches.get(key);
@@ -2053,6 +2100,34 @@ export class MeteoblueWeatherService implements WeatherService {
         forecast: null,
         forecasts: [],
       };
+    }
+  }
+
+  async getSupplementalEvidence(locationId: LocationInfo["id"]): Promise<SupplementalEvidenceSnapshot> {
+    const location = this.requireLocation(locationId);
+
+    try {
+      const result = await this.getSupplementalEvidenceCache(locationId).get({
+        allowStaleOnError: true,
+        staleWhileRevalidate: true,
+      });
+
+      return applySupplementalRuntimeState(result.value, {
+        stale: result.stale,
+        freshness: result.freshness,
+        cacheHit: result.cacheHit,
+      });
+    } catch (error) {
+      return buildEmptySupplementalEvidence(
+        {
+          id: location.id,
+          name: location.name,
+          timezone: location.timezone,
+          latitude: location.latitude,
+          longitude: location.longitude,
+        },
+        `Supplemental evidence fallback used: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 

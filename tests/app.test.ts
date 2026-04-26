@@ -251,6 +251,93 @@ const createService = (): WeatherService => {
     ],
   }));
 
+  const getSupplementalEvidence = vi.fn().mockImplementation(async (locationId: keyof typeof locationMap) => ({
+    location: buildLocationInfo(locationId),
+    fetchedAt: "2026-03-27T15:30:00.000Z",
+    stale: false,
+    freshness: "fresh" as const,
+    cacheHit: true,
+    radar: {
+      provider: "RainViewer" as const,
+      frameTime: "2026-03-27T15:20:00.000Z",
+      generatedAt: "2026-03-27T15:21:00.000Z",
+      tileUrl: `https://example.com/radar/${locationId}.png`,
+      sourceUrl: "https://www.rainviewer.com/api/weather-maps-api.html",
+      viewerUrl: "https://www.rainviewer.com/",
+      latitude: locationId === "miami_mia" ? 25.7934494 : 31.1426792,
+      longitude: locationId === "miami_mia" ? -80.2905556 : 121.8052144,
+      zoom: 7,
+      x: 35,
+      y: 55,
+      size: 512 as const,
+      colorScheme: 2,
+      options: "1_1",
+      signal: "frame_available" as const,
+      statusLabelZh: "雷达帧已读取",
+      interpretationZh: "测试雷达解释",
+    },
+    satellite: {
+      provider: "NASA GIBS" as const,
+      layer: "VIIRS_SNPP_CorrectedReflectance_TrueColor",
+      date: "2026-03-26",
+      imageUrl: `https://example.com/gibs/${locationId}.jpg`,
+      sourceUrl: "https://www.earthdata.nasa.gov/engage/open-data-services-software/earthdata-developer-portal/gibs-api",
+      viewerUrl: "https://worldview.earthdata.nasa.gov/",
+      latitude: locationId === "miami_mia" ? 25.7934494 : 31.1426792,
+      longitude: locationId === "miami_mia" ? -80.2905556 : 121.8052144,
+      bbox: {
+        west: -82,
+        south: 24,
+        east: -78,
+        north: 28,
+      },
+      width: 512,
+      height: 512,
+      statusLabelZh: "全球卫星快照",
+      interpretationZh: "测试卫星解释",
+    },
+    sourceStatuses: [
+      {
+        key: "rainviewer-radar" as const,
+        label: "雷达快照",
+        provider: "RainViewer",
+        website: "rainviewer.com",
+        status: "production" as const,
+        runtimeStatus: "ready" as const,
+        freshness: "fresh" as const,
+        hasRuntimeData: true,
+        observedAt: "2026-03-27T15:20:00.000Z",
+        readAt: "2026-03-27T15:30:00.000Z",
+        sourceUrl: "https://www.rainviewer.com/api/weather-maps-api.html",
+        detail: "test",
+        runtimeNote: "test",
+      },
+      {
+        key: "nasa-gibs-satellite" as const,
+        label: "卫星云图",
+        provider: "NASA GIBS",
+        website: "earthdata.nasa.gov",
+        status: "production" as const,
+        runtimeStatus: "ready" as const,
+        freshness: "fresh" as const,
+        hasRuntimeData: true,
+        observedAt: "2026-03-26",
+        readAt: "2026-03-27T15:30:00.000Z",
+        sourceUrl: "https://www.earthdata.nasa.gov/engage/open-data-services-software/earthdata-developer-portal/gibs-api",
+        detail: "test",
+        runtimeNote: "test",
+      },
+    ],
+    interpretation: {
+      headlineZh: "雷达看降水接近，卫星看云带遮光",
+      radarSignalZh: "测试雷达解释",
+      satelliteSignalZh: "测试卫星解释",
+      temperatureImpactTone: "mixed" as const,
+      notes: [],
+    },
+    warnings: [],
+  }));
+
   const getMultiModelImage = vi.fn().mockResolvedValue({
     contentType: "image/png",
     body: Buffer.from("png"),
@@ -535,6 +622,7 @@ const createService = (): WeatherService => {
     getWeatherReport,
     getMetarSnapshot,
     getTafSnapshot,
+    getSupplementalEvidence,
     getMultiModelImage,
     getMultiModelStatus,
     getMultiModelDistribution,
@@ -779,6 +867,7 @@ describe("createApp", () => {
     expect(service.getWeatherReport).toHaveBeenCalledWith("miami_mia");
     expect(service.getMetarSnapshot).toHaveBeenCalledWith("miami_mia");
     expect(service.getTafSnapshot).toHaveBeenCalledWith("miami_mia");
+    expect(service.getSupplementalEvidence).toHaveBeenCalledWith("miami_mia");
     expect(service.getMultiModelDistribution).not.toHaveBeenCalled();
     expect(response.json()).toMatchObject({
       locationDirectory: expect.arrayContaining([
@@ -827,6 +916,26 @@ describe("createApp", () => {
             flightCategory: "VFR",
           },
         },
+      },
+      supplementalEvidence: {
+        radar: {
+          provider: "RainViewer",
+          tileUrl: "https://example.com/radar/miami_mia.png",
+        },
+        satellite: {
+          provider: "NASA GIBS",
+          layer: "VIIRS_SNPP_CorrectedReflectance_TrueColor",
+        },
+        sourceStatuses: [
+          expect.objectContaining({
+            key: "rainviewer-radar",
+            hasRuntimeData: true,
+          }),
+          expect.objectContaining({
+            key: "nasa-gibs-satellite",
+            hasRuntimeData: true,
+          }),
+        ],
       },
       multimodel: {
         location: {

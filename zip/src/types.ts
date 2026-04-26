@@ -39,6 +39,8 @@ import type {
   MultiModelImageAvailability,
   MultiModelStatusResponse,
   MarketReferenceSummary,
+  SupplementalEvidenceSnapshot,
+  SupplementalSourceStatus,
   SystemStatusResponse,
   TafForecastSegment,
   TafForecastOverview,
@@ -89,6 +91,8 @@ export type {
   MultiModelImageAvailability,
   MultiModelStatusResponse,
   MarketReferenceSummary,
+  SupplementalEvidenceSnapshot,
+  SupplementalSourceStatus,
   SystemStatusResponse,
   TafCloudLayerDetail,
   TafDailySummary,
@@ -124,6 +128,7 @@ export interface DashboardResponse {
   report: WeatherReportResponse;
   metar: DashboardMetarSnapshot;
   taf: DashboardTafSnapshot;
+  supplementalEvidence: SupplementalEvidenceSnapshot;
   sourceMetadata: DashboardSourceMetadata;
   intradaySignals: IntradaySignalsSummary;
   marketReference: MarketReferenceSummary;
