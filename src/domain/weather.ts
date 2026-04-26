@@ -378,87 +378,6 @@ export interface DashboardTafSnapshot {
   forecasts: TafForecastSegment[];
 }
 
-export type SupplementalSourceKey = "rainviewer-radar" | "nasa-gibs-satellite";
-export type SupplementalRuntimeStatus = "ready" | "unavailable";
-export type SupplementalRadarSignal = "frame_available" | "no_frame" | "unknown";
-export type SupplementalTemperatureImpactTone = "warming" | "cooling" | "mixed" | "unknown";
-
-export interface RadarSnapshotFrame {
-  provider: "RainViewer";
-  frameTime: string;
-  generatedAt: string | null;
-  tileUrl: string;
-  sourceUrl: string;
-  viewerUrl: string;
-  latitude: number;
-  longitude: number;
-  zoom: number;
-  x: number;
-  y: number;
-  size: 256 | 512;
-  colorScheme: number;
-  options: string;
-  signal: SupplementalRadarSignal;
-  statusLabelZh: string;
-  interpretationZh: string;
-}
-
-export interface SatelliteSnapshotFrame {
-  provider: "NASA GIBS";
-  layer: string;
-  date: string;
-  imageUrl: string;
-  sourceUrl: string;
-  viewerUrl: string;
-  latitude: number;
-  longitude: number;
-  bbox: {
-    west: number;
-    south: number;
-    east: number;
-    north: number;
-  };
-  width: number;
-  height: number;
-  statusLabelZh: string;
-  interpretationZh: string;
-}
-
-export interface SupplementalSourceStatus {
-  key: SupplementalSourceKey;
-  label: string;
-  provider: string;
-  website: string;
-  status: LocationCapabilityStatus;
-  runtimeStatus: SupplementalRuntimeStatus;
-  freshness: DataFreshnessState | null;
-  hasRuntimeData: boolean;
-  observedAt: string | null;
-  readAt: string | null;
-  sourceUrl: string;
-  detail: string;
-  runtimeNote: string;
-}
-
-export interface SupplementalEvidenceSnapshot {
-  location: LocationInfo;
-  fetchedAt: string;
-  stale: boolean;
-  freshness: DataFreshnessState;
-  cacheHit: boolean;
-  radar: RadarSnapshotFrame | null;
-  satellite: SatelliteSnapshotFrame | null;
-  sourceStatuses: SupplementalSourceStatus[];
-  interpretation: {
-    headlineZh: string;
-    radarSignalZh: string;
-    satelliteSignalZh: string;
-    temperatureImpactTone: SupplementalTemperatureImpactTone;
-    notes: string[];
-  };
-  warnings: string[];
-}
-
 export interface MultiModelImageResponse {
   contentType: string;
   body: Buffer;
@@ -1114,7 +1033,6 @@ export interface WeatherService {
   getWeatherReport(locationId: LocationInfo["id"]): Promise<WeatherReportResponse>;
   getMetarSnapshot?(locationId: LocationInfo["id"]): Promise<DashboardMetarSnapshot>;
   getTafSnapshot?(locationId: LocationInfo["id"]): Promise<DashboardTafSnapshot>;
-  getSupplementalEvidence?(locationId: LocationInfo["id"]): Promise<SupplementalEvidenceSnapshot>;
   getMultiModelImage(locationId: LocationInfo["id"], allowStale: boolean): Promise<MultiModelImageResponse>;
   getMultiModelStatus(locationId: LocationInfo["id"]): Promise<MultiModelStatusResponse>;
   getMultiModelDistribution(

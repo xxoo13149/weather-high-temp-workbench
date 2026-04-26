@@ -12,14 +12,11 @@ import type {
   HourlyMode,
   LocationDirectoryEntry,
   LocationInfo,
-  SupplementalEvidenceSnapshot,
   WeatherService,
 } from "./domain/weather.js";
 import { normalizeDashboardMetarSnapshot } from "./domain/weather.js";
-import { withHandledTimeout } from "./lib/with-timeout.js";
 import { buildDashboardEnhancements, buildLocationDirectory, buildMetricsText, buildSystemStatusResponse } from "./operational-metadata.js";
 import { MeteoblueWeatherService } from "./providers/meteoblue/service.js";
-import { buildEmptySupplementalEvidence } from "./providers/supplemental/service.js";
 import { registerKellyRoutes } from "./server/kelly-routes.js";
 
 interface CreateAppOptions {
@@ -153,7 +150,6 @@ const EMPTY_DASHBOARD_TAF_SNAPSHOT: DashboardTafSnapshot = {
   forecast: null,
   forecasts: [],
 };
-const DASHBOARD_SUPPLEMENTAL_TIMEOUT_MS = 3_500;
 
 const staticContentTypes: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
@@ -220,46 +216,6 @@ const loadDashboardTafSnapshot = async (
     return await service.getTafSnapshot(locationId);
   } catch {
     return EMPTY_DASHBOARD_TAF_SNAPSHOT;
-  }
-};
-
-const loadDashboardSupplementalEvidence = async (
-  service: WeatherService,
-  locationId: LocationInfo["id"],
-): Promise<SupplementalEvidenceSnapshot> => {
-  const location = LOCATION_REGISTRY[locationId];
-  const fallback = (warning: string) =>
-    buildEmptySupplementalEvidence(
-      {
-        id: location.id,
-        name: location.name,
-        timezone: location.timezone,
-        latitude: location.latitude,
-        longitude: location.longitude,
-      },
-      warning,
-    );
-
-  if (!service.getSupplementalEvidence) {
-    return fallback("Supplemental evidence service is not exposed.");
-  }
-
-  try {
-    return await withHandledTimeout(
-      service.getSupplementalEvidence(locationId),
-      DASHBOARD_SUPPLEMENTAL_TIMEOUT_MS,
-      () =>
-        new AppError(
-          504,
-          "SUPPLEMENTAL_EVIDENCE_TIMEOUT",
-          `Supplemental evidence dashboard load exceeded ${DASHBOARD_SUPPLEMENTAL_TIMEOUT_MS}ms.`,
-          {
-            retryable: true,
-          },
-        ),
-    );
-  } catch (error) {
-    return fallback(`Supplemental evidence unavailable: ${error instanceof Error ? error.message : String(error)}`);
   }
 };
 
@@ -353,13 +309,12 @@ export const createApp = (
     const mode = parseMode(query.mode);
     const limit = parseLimit(query.limit);
 
-    const [hourly, multimodel, report, metar, taf, supplementalEvidence] = await Promise.all([
+    const [hourly, multimodel, report, metar, taf] = await Promise.all([
       service.getHourly(locationId, mode, limit),
       service.getMultiModelStatus(locationId),
       service.getWeatherReport(locationId),
       loadDashboardMetarSnapshot(service, locationId),
       loadDashboardTafSnapshot(service, locationId),
-      loadDashboardSupplementalEvidence(service, locationId),
     ]);
     const dashboardEnhancements = buildDashboardEnhancements({
       locationId,
@@ -391,7 +346,6 @@ export const createApp = (
       report,
       metar,
       taf,
-      supplementalEvidence,
       ...dashboardEnhancements,
       multimodel: {
         ...multimodel,

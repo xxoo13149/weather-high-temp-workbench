@@ -12,7 +12,6 @@ import type {
   HourlyWeatherResponse,
   KellyTemperatureUnit,
   MultiModelInsightResponse,
-  SupplementalEvidenceSnapshot,
   WeatherReportResponse,
 } from "../types";
 import { formatTemperature } from "../utils";
@@ -94,7 +93,6 @@ export const HomeReferenceCard = ({
   taf,
   report,
   multimodel,
-  supplementalEvidence,
   insight,
   sourceMetadata,
   pageUrl,
@@ -109,7 +107,6 @@ export const HomeReferenceCard = ({
     DashboardResponse["multimodel"],
     "displayUpdatedAt" | "freshness" | "imageFetchedAt" | "pageFetchedAt" | "pageUrl"
   >;
-  supplementalEvidence?: SupplementalEvidenceSnapshot | null;
   insight: Pick<
     MultiModelInsightResponse,
     "fetchedAt" | "freshness" | "modelCount" | "pageUrl" | "rankedModels" | "sourceProof"
@@ -126,25 +123,6 @@ export const HomeReferenceCard = ({
   const hasMultiModelInsight = Boolean(insight && (insight.modelCount > 0 || insight.rankedModels.length > 0));
   const multimodelReadAt = insight?.fetchedAt ?? multimodel.pageFetchedAt ?? multimodel.imageFetchedAt ?? null;
   const multimodelObservedAt = insight?.sourceProof.pageFetchedAt ?? multimodel.displayUpdatedAt ?? null;
-  const supplementalRows = useMemo<SourceRow[]>(
-    () =>
-      (supplementalEvidence?.sourceStatuses ?? []).map((source) => ({
-        id: source.key,
-        label: source.label,
-        provider: source.provider,
-        website: source.website,
-        stationCode: null,
-        status: source.status,
-        freshness: source.freshness,
-        hasRuntimeData: source.hasRuntimeData,
-        observedAt: source.observedAt,
-        readAt: source.readAt,
-        sourceUrl: source.sourceUrl,
-        detail: source.detail,
-        runtimeNote: source.runtimeNote,
-      })),
-    [supplementalEvidence?.sourceStatuses],
-  );
 
   const rows = useMemo<SourceRow[]>(
     () => [
@@ -223,7 +201,6 @@ export const HomeReferenceCard = ({
           ? `本报发布了 TX 最高温组：${formatTemperature(tafForecast.dailySummary.maxTemperatureC, displayUnit)}`
           : "若原始 TAF 未发布 TX/TN 极值组，这里只显示风、云和天气现象信号。",
       },
-      ...supplementalRows,
     ],
     [
       contract,
@@ -238,7 +215,6 @@ export const HomeReferenceCard = ({
       observation,
       pageUrl,
       report,
-      supplementalRows,
       tafForecast,
     ],
   );

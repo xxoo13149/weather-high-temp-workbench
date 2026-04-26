@@ -32,7 +32,6 @@ import type {
   KellyTemperatureUnit,
   MarketReferenceSummary,
   MetarRecentReport,
-  SupplementalEvidenceSnapshot,
   TafCloudLayerDetail,
   TafForecastOverview,
   TafForecastSegment,
@@ -186,7 +185,7 @@ const summarizeHour = (item: HourlyWeatherItem | null) => {
   return item.summaryZh.replace(/\s+/g, " ").trim();
 };
 
-type AviationDetailPanelKey = "metar" | "taf" | "environment";
+type AviationDetailPanelKey = "metar" | "taf";
 type AviationImpactTone = "positive" | "negative" | "neutral";
 
 type AviationImpactItem = {
@@ -831,48 +830,6 @@ const AviationModalSection = ({
   </section>
 );
 
-const EnvironmentalImagePanel = ({
-  title,
-  subtitle,
-  imageUrl,
-  sourceUrl,
-  alt,
-}: {
-  title: string;
-  subtitle: string;
-  imageUrl: string | null | undefined;
-  sourceUrl: string | null | undefined;
-  alt: string;
-}) => (
-  <div className="overflow-hidden rounded-[22px] border border-white/8 bg-[rgba(7,12,18,0.94)]">
-    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
-      <div>
-        <div className="text-sm font-semibold text-white">{title}</div>
-        <div className="mt-1 text-xs leading-5 text-white/48">{subtitle}</div>
-      </div>
-      {sourceUrl ? (
-        <a
-          href={sourceUrl}
-          target="_blank"
-          rel="noreferrer"
-          className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/62 transition hover:border-white/18 hover:bg-white/[0.06] hover:text-white"
-          onClick={(event) => event.stopPropagation()}
-        >
-          来源
-          <ExternalLink className="h-3.5 w-3.5" />
-        </a>
-      ) : null}
-    </div>
-    {imageUrl ? (
-      <img src={imageUrl} alt={alt} className="aspect-square w-full bg-black/30 object-cover" loading="lazy" />
-    ) : (
-      <div className="flex aspect-square items-center justify-center px-4 text-center text-sm leading-6 text-white/48">
-        暂时没有可展示的快照。
-      </div>
-    )}
-  </div>
-);
-
 const getTemperatureTone = (ratio: number) => {
   if (ratio <= 0.18) {
     return {
@@ -1020,7 +977,6 @@ export const WeatherOverview = ({
   items,
   metar,
   taf,
-  supplementalEvidence,
   displayUnit,
   locationTimezone,
   selectedTimestamp,
@@ -1037,7 +993,6 @@ export const WeatherOverview = ({
   items: HourlyWeatherItem[];
   metar: DashboardMetarSnapshot;
   taf: DashboardTafSnapshot;
-  supplementalEvidence?: SupplementalEvidenceSnapshot | null;
   displayUnit: KellyTemperatureUnit;
   locationTimezone?: string;
   selectedTimestamp: string | null;
@@ -1280,30 +1235,6 @@ export const WeatherOverview = ({
   const tafWeatherItems = tafActiveForecast?.weather?.length
     ? tafActiveForecast.weather
     : tafDailySummary?.dominantWeather ?? [];
-  const radarSnapshot = supplementalEvidence?.radar ?? null;
-  const satelliteSnapshot = supplementalEvidence?.satellite ?? null;
-  const environmentalHeadline = supplementalEvidence?.interpretation.headlineZh ?? "等待雷达 / 卫星增强证据";
-  const environmentalRadarSignal =
-    supplementalEvidence?.interpretation.radarSignalZh ?? "雷达快照暂未读取，不把缺图误判成无雨。";
-  const environmentalSatelliteSignal =
-    supplementalEvidence?.interpretation.satelliteSignalZh ?? "卫星快照暂未生成，先继续使用 METAR/TAF 和主预测。";
-  const environmentalNotes = supplementalEvidence?.interpretation.notes ?? [];
-  const environmentalTone = supplementalEvidence?.interpretation.temperatureImpactTone ?? "unknown";
-  const environmentalToneLabel =
-    environmentalTone === "cooling"
-      ? "偏抑制升温"
-      : environmentalTone === "warming"
-        ? "偏利于升温"
-        : environmentalTone === "mixed"
-          ? "看图核对"
-          : "旁路参考";
-  const environmentalToneClassName =
-    environmentalTone === "cooling"
-      ? "border-[rgba(255,107,107,0.26)] bg-[rgba(255,107,107,0.1)] text-[var(--danger)]"
-      : environmentalTone === "warming"
-        ? "border-[rgba(138,240,194,0.28)] bg-[rgba(138,240,194,0.12)] text-[var(--success)]"
-        : "border-[rgba(114,229,255,0.22)] bg-[rgba(114,229,255,0.08)] text-[var(--accent-secondary)]";
-  const environmentalUpdatedAt = radarSnapshot?.frameTime ?? supplementalEvidence?.fetchedAt ?? null;
   const heroPanels = {
     intraday: {
       label: "今天怎么看",
@@ -1472,26 +1403,16 @@ export const WeatherOverview = ({
     </div>
   );
 
-  const aviationModalTitle =
-    openAviationPanel === "metar"
-      ? "温度 / 露点实况"
-      : openAviationPanel === "taf"
-        ? "TAF 对温度的影响"
-        : "雷达 / 卫星环境证据";
+  const aviationModalTitle = openAviationPanel === "metar" ? "温度 / 露点实况" : "TAF 对温度的影响";
   const aviationModalDescription =
     openAviationPanel === "metar"
       ? "把最新一报的温度、露点放大显示，同时保留最近 4 小时的 METAR 原始报文，方便你直接回看。"
-      : openAviationPanel === "taf"
-        ? "先把真正影响当天升温的量摆到最前面，再把风、云、天气现象和原始 TAF 一起展开。"
-        : "用全球统一可用的雷达和卫星快照，看机场附近是否有降水回波、厚云或大范围遮光背景。";
+      : "先把真正影响当天升温的量摆到最前面，再把风、云、天气现象和原始 TAF 一起展开。";
   const aviationModalSourceUrl =
     openAviationPanel === "metar"
       ? metarObservation?.sourceUrl ?? null
-      : openAviationPanel === "taf"
-        ? tafForecast?.sourceUrl ?? tafForecast?.officialSourceUrl ?? null
-        : satelliteSnapshot?.viewerUrl ?? radarSnapshot?.viewerUrl ?? null;
-  const aviationModalSourceLabel =
-    openAviationPanel === "metar" ? "打开 METAR 原文" : openAviationPanel === "taf" ? "打开 TAF 原文" : "打开环境来源";
+      : tafForecast?.sourceUrl ?? tafForecast?.officialSourceUrl ?? null;
+  const aviationModalSourceLabel = openAviationPanel === "metar" ? "打开 METAR 原文" : "打开 TAF 原文";
 
   const metarModalContent = (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]">
@@ -1758,59 +1679,6 @@ export const WeatherOverview = ({
     </div>
   );
 
-  const environmentModalContent = (
-    <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
-      <AviationModalSection eyebrow="全城市增强" title={environmentalHeadline}>
-        <div className="grid gap-3 md:grid-cols-2">
-          <AviationMetric
-            label="雷达帧"
-            value={radarSnapshot ? radarSnapshot.statusLabelZh : "暂未读取"}
-            hint={radarSnapshot ? formatDateTime(radarSnapshot.frameTime, locationTimezone) : "RainViewer 缺帧时不影响主预测链。"}
-          />
-          <AviationMetric
-            label="卫星日期"
-            value={satelliteSnapshot?.date ?? "--"}
-            hint="NASA GIBS 真彩色通常有近实时延迟，适合看云系背景。"
-          />
-        </div>
-
-        <div className="mt-4 grid gap-3">
-          <div className="rounded-[20px] border border-white/8 bg-[rgba(10,15,23,0.98)] px-4 py-4 text-sm leading-6 text-white/66">
-            {environmentalRadarSignal}
-          </div>
-          <div className="rounded-[20px] border border-white/8 bg-[rgba(10,15,23,0.98)] px-4 py-4 text-sm leading-6 text-white/66">
-            {environmentalSatelliteSignal}
-          </div>
-        </div>
-
-        {environmentalNotes.length > 0 ? (
-          <div className="mt-4 space-y-2 text-sm leading-6 text-white/56">
-            {environmentalNotes.map((note) => (
-              <div key={note}>· {note}</div>
-            ))}
-          </div>
-        ) : null}
-      </AviationModalSection>
-
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-1">
-        <EnvironmentalImagePanel
-          title="RainViewer 雷达 tile"
-          subtitle={radarSnapshot ? `z${radarSnapshot.zoom}/${radarSnapshot.x}/${radarSnapshot.y}` : "当前没有可用雷达帧"}
-          imageUrl={radarSnapshot?.tileUrl}
-          sourceUrl={radarSnapshot?.sourceUrl}
-          alt="RainViewer radar snapshot near the selected airport"
-        />
-        <EnvironmentalImagePanel
-          title="NASA GIBS 真彩色卫星"
-          subtitle={satelliteSnapshot ? `${satelliteSnapshot.date} / ${satelliteSnapshot.layer}` : "全球卫星快照暂不可用"}
-          imageUrl={satelliteSnapshot?.imageUrl}
-          sourceUrl={satelliteSnapshot?.sourceUrl}
-          alt="NASA GIBS true color satellite snapshot near the selected airport"
-        />
-      </div>
-    </div>
-  );
-
   const aviationModal =
     typeof document !== "undefined"
       ? createPortal(
@@ -1850,18 +1718,13 @@ export const WeatherOverview = ({
                               <Radar className="h-4 w-4 text-[var(--accent)]" />
                               <Droplets className="h-4 w-4 text-[var(--accent-secondary)]" />
                             </>
-                          ) : openAviationPanel === "taf" ? (
+                          ) : (
                             <>
                               <Wind className="h-4 w-4 text-[var(--warning)]" />
                               <Cloudy className="h-4 w-4 text-[var(--accent-secondary)]" />
                             </>
-                          ) : (
-                            <>
-                              <Radar className="h-4 w-4 text-[var(--accent)]" />
-                              <CloudRain className="h-4 w-4 text-[var(--accent-secondary)]" />
-                            </>
                           )}
-                          {openAviationPanel === "metar" ? "METAR 细看" : openAviationPanel === "taf" ? "TAF 细看" : "环境证据"}
+                          {openAviationPanel === "metar" ? "METAR 细看" : "TAF 细看"}
                         </div>
                         <div className="mt-2 text-[1.75rem] font-semibold leading-tight text-white">{aviationModalTitle}</div>
                         <div className="mt-3 max-w-3xl text-sm leading-6 text-white/62">{aviationModalDescription}</div>
@@ -1894,11 +1757,7 @@ export const WeatherOverview = ({
 
                     <ScrollArea className="min-h-0 flex-1">
                       <ScrollViewport className="px-4 py-4 sm:px-5 sm:py-5">
-                        {openAviationPanel === "metar"
-                          ? metarModalContent
-                          : openAviationPanel === "taf"
-                            ? tafModalContent
-                            : environmentModalContent}
+                        {openAviationPanel === "metar" ? metarModalContent : tafModalContent}
                       </ScrollViewport>
                       <ScrollBar />
                     </ScrollArea>
@@ -2417,7 +2276,7 @@ export const WeatherOverview = ({
             </a>
           </div>
 
-          <div className="mt-4 grid gap-3 xl:grid-cols-3">
+          <div className="mt-4 grid gap-3 xl:grid-cols-2">
             <motion.button
               type="button"
               whileHover={{ y: -4, scale: 1.006 }}
@@ -2478,68 +2337,6 @@ export const WeatherOverview = ({
 
               <div className="relative z-[1] mt-4 inline-flex items-center gap-2 text-sm font-medium text-white/82 transition group-hover:text-white">
                 点开看最近 4 小时 METAR 报文
-                <ExternalLink className="h-4 w-4" />
-              </div>
-            </motion.button>
-
-            <motion.button
-              type="button"
-              whileHover={{ y: -4, scale: 1.006 }}
-              whileTap={{ scale: 0.995 }}
-              transition={{ duration: 0.2, ease: "easeOut" }}
-              onClick={() => setOpenAviationPanel("environment")}
-              className="group relative overflow-hidden rounded-[26px] border border-white/8 bg-[linear-gradient(160deg,rgba(12,28,38,0.95),rgba(8,14,23,0.96))] p-5 text-left"
-            >
-              <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(114,229,255,0.16),transparent_42%)] opacity-80" />
-
-              <div className="relative z-[1] flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <div className="eyebrow flex items-center gap-2">
-                    <Radar className="h-4 w-4 text-[var(--accent)]" />
-                    <CloudRain className="h-4 w-4 text-[var(--accent-secondary)]" />
-                    雷达 / 卫星
-                  </div>
-                  <div className="mt-2 text-lg font-semibold text-white">{environmentalHeadline}</div>
-                </div>
-
-                <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] ${environmentalToneClassName}`}>
-                  {environmentalToneLabel}
-                </span>
-              </div>
-
-              <div className="relative z-[1] mt-4 overflow-hidden rounded-[20px] border border-white/8 bg-black/25">
-                {radarSnapshot?.tileUrl ? (
-                  <img
-                    src={radarSnapshot.tileUrl}
-                    alt="RainViewer radar preview"
-                    className="aspect-[16/9] w-full bg-black/30 object-cover opacity-90"
-                    loading="lazy"
-                  />
-                ) : (
-                  <div className="flex aspect-[16/9] items-center justify-center px-4 text-center text-sm leading-6 text-white/48">
-                    雷达暂缺，点开看卫星云图。
-                  </div>
-                )}
-              </div>
-
-              <div className="relative z-[1] mt-4 flex flex-wrap gap-2">
-                <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
-                  雷达 {radarSnapshot ? "已读取" : "暂缺"}
-                </span>
-                <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
-                  卫星 {satelliteSnapshot?.date ?? "--"}
-                </span>
-                <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
-                  更新 {formatDateTime(environmentalUpdatedAt, locationTimezone)}
-                </span>
-              </div>
-
-              <div className="relative z-[1] mt-4 text-sm leading-6 text-white/64">
-                {radarSnapshot ? environmentalRadarSignal : environmentalSatelliteSignal}
-              </div>
-
-              <div className="relative z-[1] mt-4 inline-flex items-center gap-2 text-sm font-medium text-white/82 transition group-hover:text-white">
-                点开看雷达 tile、卫星快照和来源说明
                 <ExternalLink className="h-4 w-4" />
               </div>
             </motion.button>
