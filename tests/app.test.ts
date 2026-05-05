@@ -130,6 +130,37 @@ const runtimeStatus: ServiceRuntimeStatus = {
     },
   },
   kelly: null,
+  prewarm: {
+    state: "scheduled",
+    enabled: true,
+    startedAt: "2026-03-27T15:00:00.000Z",
+    heartbeatAt: "2026-03-27T15:31:00.000Z",
+    nextScheduledAt: "2026-03-27T15:45:00.000Z",
+    inFlight: false,
+    config: {
+      delayMs: 2_000,
+      intervalMs: 900_000,
+      concurrency: 4,
+      locationIds: ["shanghai_pvg"],
+      forceRefreshCount: 6,
+      nextDayWarmCount: 8,
+      nextDayWarmAfterLocalHour: 15,
+    },
+    lastPass: {
+      passIndex: 2,
+      startedAt: "2026-03-27T15:30:00.000Z",
+      completedAt: "2026-03-27T15:30:01.200Z",
+      durationMs: 1_200,
+      total: 1,
+      succeeded: 1,
+      failed: 0,
+      forceRefreshLocationIds: ["shanghai_pvg"],
+      nextDayLocationIds: [],
+      failures: [],
+    },
+    consecutiveFailurePasses: 0,
+    lastCrash: null,
+  },
 };
 
 const createService = (): WeatherService => {
@@ -685,14 +716,28 @@ describe("createApp", () => {
           "tier-1": expect.any(Number),
         }),
       },
-      runtime: {
-        caches: {
-          week: expect.objectContaining({
-            entryCount: 2,
+        runtime: {
+          caches: {
+            week: expect.objectContaining({
+              entryCount: 2,
+            }),
+          },
+          kelly: null,
+          prewarm: expect.objectContaining({
+            state: "scheduled",
+            enabled: true,
+            heartbeatAt: "2026-03-27T15:31:00.000Z",
+            config: expect.objectContaining({
+              concurrency: 4,
+              forceRefreshCount: 6,
+            }),
+            lastPass: expect.objectContaining({
+              total: 1,
+              succeeded: 1,
+              failed: 0,
+            }),
           }),
         },
-        kelly: null,
-      },
       sourceCoverage: expect.arrayContaining([
         expect.objectContaining({
           scope: "current",
@@ -716,13 +761,15 @@ describe("createApp", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.headers["content-type"]).toContain("text/plain");
-    expect(response.body).toContain("weather_runtime_info");
-    expect(response.body).toContain("weather_location_rollout_tier_total");
-    expect(response.body).toContain('weather_source_contract_total{scope="target",source="open-meteo-multi-model"');
-    expect(response.body).toContain('weather_runtime_cache_entries{cache="week"} 2');
+      expect(response.body).toContain("weather_runtime_info");
+      expect(response.body).toContain("weather_location_rollout_tier_total");
+      expect(response.body).toContain('weather_source_contract_total{scope="target",source="open-meteo-multi-model"');
+      expect(response.body).toContain('weather_runtime_cache_entries{cache="week"} 2');
+      expect(response.body).toContain("weather_prewarm_enabled 1");
+      expect(response.body).toContain("weather_prewarm_last_pass_total 1");
 
-    await app.close();
-  });
+      await app.close();
+    });
 
   test("serves the built frontend html with utf-8 headers", async () => {
     const app = createApp(createService(), { frontendDistDir });
@@ -866,7 +913,7 @@ describe("createApp", () => {
 
   test("keeps dashboard available when TAF fetch fails cold", async () => {
     const service = createService();
-    vi.mocked(service.getTafSnapshot).mockRejectedValueOnce(new Error("taf upstream down"));
+    vi.mocked(service.getTafSnapshot!).mockRejectedValueOnce(new Error("taf upstream down"));
     const app = createApp(service, { frontendDistDir });
 
     const response = await app.inject({

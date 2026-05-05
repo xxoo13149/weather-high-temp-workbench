@@ -18,3 +18,7 @@ KELLY_STREAM_PROXY_MODE = "canary"
 [[routes]]
 pattern = "lukaluka.fun"
 custom_domain = true
+
+[[routes]]
+pattern = "www.lukaluka.fun"
+custom_domain = true

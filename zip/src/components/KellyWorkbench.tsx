@@ -112,8 +112,33 @@ const KellySourceContractPanel = ({
   const referenceStation = describeKellyReferenceStation(sourceMetadata);
 
   return (
-    <section className="terminal-panel kelly-source-contract-panel">
-      <div className="panel-section kelly-shell__inner">
+    <details className="terminal-panel kelly-source-contract-panel">
+      <summary className="panel-section kelly-source-contract-panel__summary">
+        <div className="kelly-source-contract-panel__summary-main">
+          <div className="eyebrow flex items-center gap-2">
+            <ShieldCheck className="h-4 w-4 text-[var(--accent)]" />
+            天气依据
+          </div>
+          <strong>{intradaySignals.headline}</strong>
+          <span>{marketReference.summary}</span>
+        </div>
+        <div className="kelly-source-contract-panel__summary-facts">
+          <span>
+            <b>站点</b>
+            {referenceStation}
+          </span>
+          <span>
+            <b>小时</b>
+            {sourceMetadata.contract.currentSources.baselineForecast.label}
+          </span>
+          <span>
+            <b>补充</b>
+            {officialEnhancement?.label ?? sourceMetadata.contract.targetUpgrades.taf.label}
+          </span>
+        </div>
+        <span className="kelly-source-contract-panel__summary-toggle" aria-hidden="true" />
+      </summary>
+      <div className="panel-section kelly-shell__inner kelly-source-contract-panel__details">
         <div className="kelly-shell__header">
           <div className="kelly-shell__hero">
             <div className="eyebrow flex items-center gap-2">
@@ -176,7 +201,7 @@ const KellySourceContractPanel = ({
           </div>
         </div>
       </div>
-    </section>
+    </details>
   );
 };
 

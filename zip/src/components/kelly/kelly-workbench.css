@@ -154,10 +154,10 @@
 
 .kelly-sync-card__label {
   color: rgba(243, 247, 255, 0.48);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  text-transform: none;
 }
 
 .kelly-sync-card__value {
@@ -1106,8 +1106,56 @@
   font-size: 14px;
 }
 
+.kelly-opportunity-card__reason-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 10px;
+  color: rgba(243, 247, 255, 0.58);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.kelly-opportunity-card__reason-summary.is-active {
+  color: rgba(243, 247, 255, 0.7);
+}
+
+.kelly-opportunity-card__reason-summary-text {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.kelly-opportunity-card__reason-summary-text span {
+  min-width: 0;
+}
+
+.kelly-opportunity-card__reason-summary-count {
+  flex-shrink: 0;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 4px 8px;
+  color: rgba(243, 247, 255, 0.56);
+  font-size: 11px;
+}
+
 .kelly-opportunity-card__reasons {
-  display: none;
+  display: grid;
+  gap: 7px;
+  overflow: hidden;
+  padding-top: 4px;
+}
+
+.kelly-opportunity-card__reasons div {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: rgba(243, 247, 255, 0.6);
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .kelly-market-panel__header {
@@ -1210,10 +1258,10 @@
 
 .kelly-market-card__eyebrow {
   color: rgba(243, 247, 255, 0.44);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  text-transform: none;
 }
 
 .kelly-market-card__title-row {
@@ -1255,9 +1303,9 @@
 
 .kelly-market-card__decision-label,
 .kelly-market-card__decision-sub {
-  color: rgba(243, 247, 255, 0.58);
+  color: rgba(243, 247, 255, 0.62);
   font-size: 12px;
-  line-height: 1.45;
+  line-height: 1.5;
 }
 
 .kelly-market-card__decision strong {
@@ -1285,11 +1333,11 @@
 }
 
 .kelly-market-card__temperature-label {
-  color: rgba(243, 247, 255, 0.56);
+  color: rgba(243, 247, 255, 0.6);
   font-size: 12px;
   grid-column: 1 / -1;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+  text-transform: none;
+  letter-spacing: 0.02em;
 }
 
 .kelly-market-card__temperature-value {
@@ -1318,9 +1366,9 @@
 }
 
 .kelly-market-table__block-title {
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.08em;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .kelly-market-table__block-row {
@@ -1357,6 +1405,49 @@
   flex-wrap: wrap;
   gap: 10px;
   align-items: flex-start;
+}
+
+.kelly-market-card__meta-rail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+  color: rgba(243, 247, 255, 0.54);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.kelly-market-card__meta-rail span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kelly-market-card__expanded-meta {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.kelly-market-card__expanded-chip {
+  display: grid;
+  gap: 4px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 9px 10px;
+}
+
+.kelly-market-card__expanded-chip span {
+  color: rgba(243, 247, 255, 0.48);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+.kelly-market-card__expanded-chip strong {
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.4;
 }
 
 .kelly-market-card__remark {
@@ -1475,8 +1566,8 @@
 }
 
 .kelly-market-card__eyebrow {
-  font-size: 10px;
-  letter-spacing: 0.1em;
+  font-size: 11px;
+  letter-spacing: 0.08em;
 }
 
 .kelly-market-card__title-row {
@@ -1533,7 +1624,8 @@
 
 @media (max-width: 720px) {
   .kelly-market-table__rules,
-  .kelly-market-card__meta-grid {
+  .kelly-market-card__meta-grid,
+  .kelly-market-card__expanded-meta {
     grid-template-columns: 1fr;
   }
 
@@ -1676,10 +1768,10 @@
 
 .kelly-side-sync-card__label {
   color: rgba(243, 247, 255, 0.5);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.08em;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .kelly-side-sync-card__value {
@@ -1798,10 +1890,10 @@
 
 .kelly-loading-panel__eyebrow {
   color: rgba(243, 247, 255, 0.5);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  text-transform: none;
 }
 
 .kelly-skeleton {
@@ -2050,5 +2142,785 @@
   .kelly-loading-market-card__meta,
   .kelly-side-sync-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+.kelly-summary-strip__list {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 14px;
+}
+
+.kelly-summary-strip__item {
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: rgba(0, 0, 0, 0.16);
+  padding: 14px;
+}
+
+.kelly-summary-strip__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: rgba(243, 247, 255, 0.56);
+  font-size: 12px;
+}
+
+.kelly-summary-strip__value {
+  margin-top: 12px;
+  color: var(--foreground);
+  font-size: clamp(1.14rem, 1.6vw, 1.4rem);
+  font-weight: 600;
+}
+
+.kelly-summary-strip__detail {
+  margin-top: 8px;
+  color: rgba(243, 247, 255, 0.5);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.kelly-priority-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 14px;
+}
+
+.kelly-priority-card {
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  background: rgba(0, 0, 0, 0.16);
+  padding: 14px;
+}
+
+.kelly-priority-card.is-primary {
+  border-color: rgba(154, 230, 110, 0.22);
+  background:
+    linear-gradient(180deg, rgba(154, 230, 110, 0.08), rgba(255, 255, 255, 0.015)),
+    rgba(0, 0, 0, 0.16);
+}
+
+.kelly-priority-card__eyebrow {
+  color: rgba(243, 247, 255, 0.44);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: none;
+}
+
+.kelly-priority-card__title {
+  display: block;
+  margin-top: 10px;
+  color: var(--foreground);
+  font-size: 1.02rem;
+  line-height: 1.45;
+}
+
+.kelly-priority-card__copy {
+  margin: 10px 0 0;
+  color: rgba(243, 247, 255, 0.68);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.kelly-priority-card__metrics {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
+.kelly-priority-card__metrics > div,
+.kelly-opportunity-tier__summary-metrics > div {
+  min-width: 0;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 10px 11px;
+}
+
+.kelly-priority-card__metrics span,
+.kelly-opportunity-tier__summary-metrics span {
+  display: block;
+  color: rgba(243, 247, 255, 0.58);
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
+.kelly-priority-card__metrics strong,
+.kelly-opportunity-tier__summary-metrics strong {
+  display: block;
+  margin-top: 6px;
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.kelly-priority-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.kelly-priority-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 9px 12px;
+  color: rgba(243, 247, 255, 0.8);
+  font-size: 12px;
+  transition:
+    border-color 180ms ease,
+    background-color 180ms ease;
+}
+
+.kelly-priority-toggle:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.kelly-priority-note {
+  flex: 1;
+  min-width: min(100%, 260px);
+  color: rgba(243, 247, 255, 0.54);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.kelly-opportunity-stack {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.kelly-opportunity-tier {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 12px;
+}
+
+.kelly-opportunity-tier:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.kelly-opportunity-tier__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.kelly-opportunity-tier__copy {
+  min-width: 0;
+}
+
+.kelly-opportunity-tier__count,
+.kelly-opportunity-tier__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 7px 10px;
+  color: rgba(243, 247, 255, 0.72);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.kelly-opportunity-tier__summary {
+  display: grid;
+  gap: 12px;
+  width: 100%;
+  margin-top: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: rgba(0, 0, 0, 0.16);
+  padding: 12px;
+  text-align: left;
+}
+
+.kelly-opportunity-tier__summary-main {
+  display: grid;
+  gap: 6px;
+}
+
+.kelly-opportunity-tier__summary-main strong {
+  color: var(--foreground);
+  font-size: 14px;
+}
+
+.kelly-opportunity-tier__summary-main span {
+  color: rgba(243, 247, 255, 0.64);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.kelly-opportunity-tier__summary-metrics {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.kelly-opportunity-tier__body {
+  overflow: hidden;
+}
+
+.kelly-market-card__expanded {
+  display: grid;
+  gap: 10px;
+  overflow: hidden;
+}
+
+.kelly-watch-block {
+  margin-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 14px;
+}
+
+.kelly-watch-block__header {
+  display: flex;
+  width: 100%;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.kelly-watch-block__header::marker,
+.kelly-watch-block__header::-webkit-details-marker {
+  display: none;
+}
+
+.kelly-watch-block__header h4 {
+  margin: 8px 0 0;
+  color: var(--foreground);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.kelly-watch-block.is-open .kelly-watch-block__header h4 {
+  color: #f3f7ff;
+}
+
+.kelly-evidence-card--compact {
+  padding: 0;
+  overflow: hidden;
+}
+
+.kelly-evidence-card__toggle {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 16px;
+  text-align: left;
+}
+
+.kelly-evidence-card__summary {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  color: rgba(243, 247, 255, 0.58);
+  font-size: 12px;
+}
+
+.kelly-evidence-card__summary strong {
+  font-size: 13px;
+}
+
+@media (max-width: 1180px) {
+  .kelly-summary-strip__list,
+  .kelly-priority-grid,
+  .kelly-priority-card__metrics {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .kelly-summary-strip__list,
+  .kelly-priority-grid,
+  .kelly-priority-card__metrics,
+  .kelly-opportunity-tier__summary-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .kelly-priority-actions,
+  .kelly-evidence-card__header {
+    align-items: flex-start;
+  }
+
+  .kelly-opportunity-tier__header,
+  .kelly-evidence-card__header {
+    flex-direction: column;
+  }
+
+  .kelly-evidence-card__summary {
+    align-items: flex-start;
+  }
+}
+
+/* Kelly workspace density pass: keep old global Kelly styles from squeezing the new shell. */
+.kelly-shell.terminal-panel,
+.kelly-market-panel {
+  overflow: visible;
+}
+
+.kelly-workbench-shell,
+.kelly-shell,
+.kelly-block,
+.kelly-market-card,
+.kelly-priority-card,
+.kelly-summary-strip__item,
+.kelly-side-sync-card,
+.kelly-evidence-card {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  line-break: auto;
+}
+
+.kelly-shell__inner {
+  gap: 14px;
+  padding: 18px;
+}
+
+.kelly-shell__title {
+  font-size: clamp(1.45rem, 2.15vw, 2.05rem);
+  line-height: 1.08;
+}
+
+.kelly-shell__subtitle {
+  max-width: 54rem;
+  margin-top: 8px;
+  line-height: 1.55;
+}
+
+.kelly-block {
+  padding: 14px;
+}
+
+.kelly-block__header {
+  gap: 10px;
+}
+
+.kelly-block__title {
+  font-size: 1.06rem;
+  line-height: 1.36;
+}
+
+.kelly-summary-strip {
+  display: block;
+  margin-top: 0;
+}
+
+.kelly-summary-strip > .kelly-block__header,
+.kelly-summary-strip > .kelly-summary-strip__list {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.kelly-summary-strip__list {
+  grid-template-columns: repeat(auto-fit, minmax(172px, 1fr));
+}
+
+.kelly-summary-strip__item {
+  display: grid;
+  min-height: 0;
+  gap: 6px;
+  border-style: solid;
+  padding: 12px;
+  text-align: left;
+  transition:
+    border-color 160ms ease,
+    background-color 160ms ease,
+    transform 160ms ease;
+}
+
+.kelly-summary-strip__item:hover,
+.kelly-summary-strip__item.is-expanded {
+  border-color: rgba(154, 230, 110, 0.24);
+  background: rgba(154, 230, 110, 0.06);
+  transform: translateY(-1px);
+}
+
+.kelly-summary-strip__label {
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.kelly-summary-strip__value {
+  margin-top: 2px;
+  font-size: clamp(1.04rem, 1.25vw, 1.24rem);
+  line-height: 1.2;
+}
+
+.kelly-summary-strip__detail {
+  margin-top: 2px;
+  line-height: 1.55;
+}
+
+.kelly-priority-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+}
+
+.kelly-priority-card {
+  padding: 13px;
+}
+
+.kelly-priority-card__title {
+  margin-top: 8px;
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+.kelly-priority-card__copy {
+  margin-top: 8px;
+  line-height: 1.55;
+}
+
+.kelly-priority-card__metrics,
+.kelly-opportunity-card__metrics,
+.kelly-opportunity-tier__summary-metrics,
+.kelly-market-card__meta-grid {
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+}
+
+.kelly-priority-card__metrics > div,
+.kelly-opportunity-tier__summary-metrics > div,
+.kelly-market-card__metric {
+  padding: 9px 10px;
+}
+
+.kelly-layout {
+  gap: 14px;
+  grid-template-columns: minmax(0, 1.6fr) minmax(320px, 0.58fr);
+}
+
+@media (min-width: 1281px) {
+  .kelly-side-column {
+    position: sticky;
+    top: 16px;
+  }
+}
+
+.kelly-market-rules-toggle,
+.kelly-evidence-card__mini-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 7px 10px;
+  color: rgba(243, 247, 255, 0.72);
+  font-size: 12px;
+  line-height: 1;
+  transition:
+    border-color 160ms ease,
+    background-color 160ms ease;
+}
+
+.kelly-market-rules-toggle {
+  margin-top: 10px;
+}
+
+.kelly-market-rules-toggle:hover,
+.kelly-evidence-card__mini-toggle:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.kelly-market-card {
+  padding: 11px 12px;
+}
+
+.kelly-market-card__top {
+  gap: 10px;
+  grid-template-columns: minmax(0, 1.12fr) minmax(220px, 0.88fr);
+}
+
+.kelly-market-card__title {
+  line-height: 1.25;
+}
+
+.kelly-market-card__decision {
+  min-width: 0;
+  padding: 9px 10px;
+}
+
+.kelly-market-card__decision-sub {
+  line-height: 1.45;
+}
+
+.kelly-market-card__expanded,
+.kelly-market-card__meta-rail {
+  overflow: visible;
+}
+
+.kelly-side-sync-grid {
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+}
+
+.kelly-side-sync-card {
+  padding: 10px;
+}
+
+.kelly-evidence-card {
+  padding: 13px;
+}
+
+.kelly-evidence-card--compact {
+  padding: 0;
+}
+
+.kelly-evidence-card__toggle {
+  padding: 13px;
+}
+
+.kelly-evidence-card__header {
+  gap: 10px;
+}
+
+.kelly-evidence-card__header p {
+  display: -webkit-box;
+  margin-top: 7px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-height: 1.55;
+}
+
+.kelly-evidence-card__summary {
+  flex: 0 0 auto;
+}
+
+.kelly-source-contract-panel {
+  overflow: visible;
+}
+
+.kelly-source-contract-panel__summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(280px, 0.9fr) auto;
+  gap: 14px;
+  align-items: center;
+  cursor: pointer;
+  list-style: none;
+}
+
+.kelly-source-contract-panel__summary::marker,
+.kelly-source-contract-panel__summary::-webkit-details-marker {
+  display: none;
+}
+
+.kelly-source-contract-panel__summary-main {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.kelly-source-contract-panel__summary-main strong {
+  color: var(--foreground);
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+.kelly-source-contract-panel__summary-main span {
+  color: rgba(243, 247, 255, 0.56);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.kelly-source-contract-panel__summary-facts {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.kelly-source-contract-panel__summary-facts span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.16);
+  padding: 9px 10px;
+  color: rgba(243, 247, 255, 0.78);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.kelly-source-contract-panel__summary-facts b {
+  color: rgba(243, 247, 255, 0.46);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.kelly-source-contract-panel__summary-toggle {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 8px 11px;
+  color: rgba(243, 247, 255, 0.72);
+  font-size: 0;
+  white-space: nowrap;
+}
+
+.kelly-source-contract-panel__summary-toggle::before {
+  content: "展开天气来源";
+  font-size: 12px;
+}
+
+.kelly-source-contract-panel[open] .kelly-source-contract-panel__summary-toggle::before {
+  content: "收起天气来源";
+}
+
+.kelly-source-contract-panel__details {
+  padding-top: 0;
+}
+
+@media (max-width: 1280px) {
+  .kelly-layout,
+  .kelly-market-card__top,
+  .kelly-source-contract-panel__summary {
+    grid-template-columns: 1fr;
+  }
+
+  .kelly-side-column {
+    position: static;
+  }
+}
+
+@media (max-width: 720px) {
+  .kelly-shell__inner {
+    padding: 14px;
+  }
+
+  .kelly-summary-strip__list,
+  .kelly-source-contract-panel__summary-facts {
+    grid-template-columns: 1fr;
+  }
+
+  .kelly-market-rules-toggle {
+    width: 100%;
+    justify-content: center;
+  }
+}
+
+/* Kelly responsive cleanup: collapse earlier under zoom and reduce hard min-width pressure. */
+.kelly-date-strip {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+}
+
+.kelly-control-actions {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+}
+
+.kelly-layout {
+  grid-template-columns: minmax(0, 1.48fr) minmax(min(100%, 280px), 0.72fr);
+}
+
+.kelly-source-contract-panel__summary {
+  grid-template-columns: minmax(0, 1.15fr) minmax(min(100%, 240px), 0.85fr) auto;
+}
+
+.kelly-source-contract-panel__summary-facts {
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+}
+
+.kelly-market-card__top {
+  grid-template-columns: minmax(0, 1.08fr) minmax(min(100%, 216px), 0.92fr);
+}
+
+.kelly-priority-note,
+.kelly-market-card__remark,
+.kelly-evidence-card__summary,
+.kelly-market-table__recommendation {
+  min-width: 0;
+}
+
+.kelly-market-table,
+.kelly-market-table-shell table {
+  min-width: 960px;
+}
+
+.kelly-market-table__recommendation {
+  max-width: 16rem;
+}
+
+@media (max-width: 1440px) {
+  .kelly-layout,
+  .kelly-market-card__top,
+  .kelly-source-contract-panel__summary {
+    grid-template-columns: 1fr;
+  }
+
+  .kelly-side-column {
+    position: static;
+  }
+}
+
+@media (max-width: 1080px) {
+  .kelly-opportunity-tier__header,
+  .kelly-evidence-card__header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .kelly-evidence-card__summary {
+    align-items: flex-start;
+  }
+
+  .kelly-market-card__range {
+    grid-template-columns: 1fr;
+  }
+
+  .kelly-market-card__temperature-date {
+    justify-self: start;
+    text-align: left;
+  }
+
+  .kelly-priority-note,
+  .kelly-market-card__remark {
+    flex-basis: 100%;
+  }
+}
+
+@media (max-width: 820px) {
+  .kelly-summary-strip__list,
+  .kelly-market-card__temp-grid,
+  .kelly-market-card__expanded-meta,
+  .kelly-side-sync-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .kelly-market-panel__meta span,
+  .kelly-market-table__rule,
+  .kelly-opportunity-tier__count,
+  .kelly-opportunity-tier__toggle {
+    white-space: normal;
+  }
+}
+
+@media (max-width: 640px) {
+  .kelly-market-table,
+  .kelly-market-table-shell table {
+    min-width: 720px;
   }
 }

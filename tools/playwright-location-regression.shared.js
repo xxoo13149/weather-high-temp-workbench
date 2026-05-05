@@ -537,13 +537,25 @@ export const waitForKellyReady = async (page, tracker, expectedLocationId) => {
 };
 
 export const switchLocationBySearch = async (page, location) => {
-  await page.locator(".command-header-rail-toggle").click();
-  await waitFor(async () => (await page.locator(".location-rail-search input").count()) > 0, 10_000, "rail search", 250);
-  const search = page.locator(".location-rail-search input");
+  await page.locator(".command-header-rail-toggle").first().click();
+  const railCanvas = page.locator(".location-rail-canvas:visible").first();
+  await railCanvas.waitFor({ state: "visible", timeout: 10_000 });
+  const search = railCanvas.locator(".location-rail-search input").first();
+  await search.waitFor({ state: "visible", timeout: 10_000 });
+  await search.fill("");
   await search.fill(location.code);
-  const card = page.locator(`[data-location-card="true"][data-location-id="${location.id}"]`).first();
-  await waitFor(async () => (await card.count()) > 0, 15_000, `location card ${location.id}`, 250);
-  await card.click();
+  const selectButton = railCanvas
+    .getByRole("button", {
+      name: `${location.code} ${location.displayName}`,
+    })
+    .first();
+  await waitFor(
+    async () => ((await selectButton.count()) > 0 && (await selectButton.isVisible().catch(() => false)) ? true : null),
+    15_000,
+    `location card ${location.id}`,
+    250,
+  );
+  await selectButton.click();
   await waitForLocationTitle(page, location);
   await waitFor(async () => {
     const current = new URL(page.url()).searchParams.get("locationId");

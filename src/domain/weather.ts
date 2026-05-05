@@ -985,6 +985,52 @@ export interface RuntimeCacheBucketStatus {
   lastSuccessAt: string | null;
 }
 
+export type KellyPrewarmRuntimeState = "disabled" | "skipped" | "scheduled" | "running" | "idle" | "stopped";
+
+export interface KellyPrewarmRuntimeConfig {
+  delayMs: number;
+  intervalMs: number;
+  concurrency: number;
+  locationIds: LocationInfo["id"][];
+  forceRefreshCount: number;
+  nextDayWarmCount: number;
+  nextDayWarmAfterLocalHour: number;
+}
+
+export interface KellyPrewarmPassFailure {
+  locationId: LocationInfo["id"];
+  error: string;
+}
+
+export interface KellyPrewarmLastPassStatus {
+  passIndex: number;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
+  total: number;
+  succeeded: number;
+  failed: number;
+  forceRefreshLocationIds: LocationInfo["id"][];
+  nextDayLocationIds: LocationInfo["id"][];
+  failures: KellyPrewarmPassFailure[];
+}
+
+export interface KellyPrewarmRuntimeStatus {
+  state: KellyPrewarmRuntimeState;
+  enabled: boolean;
+  startedAt: string | null;
+  heartbeatAt: string | null;
+  nextScheduledAt: string | null;
+  inFlight: boolean;
+  config: KellyPrewarmRuntimeConfig | null;
+  lastPass: KellyPrewarmLastPassStatus | null;
+  consecutiveFailurePasses: number;
+  lastCrash: {
+    at: string;
+    error: string;
+  } | null;
+}
+
 export interface ServiceRuntimeStatus {
   caches: {
     week: RuntimeCacheBucketStatus;
@@ -992,6 +1038,7 @@ export interface ServiceRuntimeStatus {
     multiModelDistribution: RuntimeCacheBucketStatus;
   };
   kelly: KellyRuntimeHealth | null;
+  prewarm: KellyPrewarmRuntimeStatus | null;
 }
 
 export interface SystemStatusSourceCoverage {

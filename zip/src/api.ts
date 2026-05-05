@@ -63,11 +63,11 @@ const isApiErrorPayload = (value: unknown): value is ApiErrorPayload =>
 
 const isGetRequest = (init?: RequestInit) => (init?.method ?? "GET").toUpperCase() === "GET";
 
-const isAbortError = (error: unknown) =>
+export const isAbortLikeError = (error: unknown) =>
   error instanceof DOMException
-    ? error.name === "AbortError"
+    ? error.name === "AbortError" || /aborted?/i.test(error.message)
     : error instanceof Error
-      ? error.name === "AbortError"
+      ? error.name === "AbortError" || /signal is aborted without reason|operation was aborted|aborted?/i.test(error.message)
       : false;
 
 const isGenericFetchFailure = (error: unknown) =>
@@ -103,7 +103,7 @@ const requestJson = async <T>(
     try {
       response = await executeFetch();
     } catch (error) {
-      if (!isGetRequest(init) || isAbortError(error) || !isGenericFetchFailure(error) || attempt > 0) {
+      if (!isGetRequest(init) || isAbortLikeError(error) || !isGenericFetchFailure(error) || attempt > 0) {
         throw error;
       }
 

@@ -1,5 +1,7 @@
 import {
   BadgeCheck,
+  ChevronDown,
+  ChevronUp,
   Clock3,
   CloudRain,
   Cloudy,
@@ -18,12 +20,13 @@ import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { ScrollArea, ScrollBar, ScrollViewport } from "@/components/ui/scroll-area";
 import { translatePredictabilityLabel, UI_TEXT } from "../display-text";
+import { HOME_TIMELINE_MOBILE_MAX_WIDTH, SHELL_MOBILE_MAX_WIDTH } from "../layout";
 import {
-  buildMetarDetail,
   buildMetarHeadline,
   buildTafDetail,
   buildTafHeadline,
 } from "../lib/aviation-display";
+import { HOME_DETAIL_ID, HOME_DETAIL_SLOT, HOME_DETAIL_SOURCE, HOME_DETAIL_TRIGGER_KIND } from "../lib/home-detail-contract";
 import type {
   DashboardMetarSnapshot,
   DashboardTafSnapshot,
@@ -141,11 +144,11 @@ const TIMELINE_LAYOUT_PRESETS: Record<TimelineLayoutPreset["key"], TimelineLayou
 const detectViewportWidth = () => (typeof window !== "undefined" ? window.innerWidth : 1280);
 
 const resolveTimelineLayoutPreset = (viewportWidth: number): TimelineLayoutPreset => {
-  if (viewportWidth <= 900) {
+  if (viewportWidth <= HOME_TIMELINE_MOBILE_MAX_WIDTH) {
     return TIMELINE_LAYOUT_PRESETS.mobile;
   }
 
-  if (viewportWidth <= 1180) {
+  if (viewportWidth <= SHELL_MOBILE_MAX_WIDTH) {
     return TIMELINE_LAYOUT_PRESETS.compact;
   }
 
@@ -183,6 +186,20 @@ const summarizeHour = (item: HourlyWeatherItem | null) => {
   }
 
   return item.summaryZh.replace(/\s+/g, " ").trim();
+};
+
+const buildSummaryPreview = (text: string) => {
+  const normalized = text.replace(/^判断要点[:：]\s*/, "").trim();
+  if (!normalized) {
+    return UI_TEXT.weatherOverview.summarySyncing;
+  }
+
+  const firstSentence = normalized
+    .split(/[。！？]/)
+    .map((segment) => segment.trim())
+    .find(Boolean);
+
+  return firstSentence ? `${firstSentence}。` : normalized;
 };
 
 type AviationDetailPanelKey = "metar" | "taf";
@@ -756,6 +773,47 @@ const buildMetarTrendSummary = (reports: MetarRecentReport[], displayUnit: Kelly
     : "最近 4 小时报文已列出，可以重点对比温度、露点和风况有没有连续变化。";
 };
 
+const buildMetarRawPreviewReports = (
+  observation: DashboardMetarSnapshot["observation"],
+  reports: MetarRecentReport[],
+): MetarRecentReport[] => {
+  const normalizedReports = reports
+    .map((report) => ({
+      ...report,
+      rawReport: report.rawReport?.trim() ?? null,
+    }))
+    .filter((report): report is MetarRecentReport => Boolean(report.rawReport));
+
+  const observationPreview =
+    observation?.rawReport && observation.rawReport.trim().length > 0
+      ? {
+          stationId: observation.stationId,
+          stationName: observation.stationName,
+          observedAt: observation.observedAt,
+          temperatureC: observation.temperatureC,
+          dewpointC: observation.dewpointC,
+          windDirectionDegrees: observation.windDirectionDegrees,
+          windSpeedKts: observation.windSpeedKts,
+          rawReport: observation.rawReport.trim(),
+        }
+      : null;
+
+  if (!observationPreview) {
+    return normalizedReports.slice(0, 4);
+  }
+
+  return [
+    observationPreview,
+    ...normalizedReports.filter(
+      (report) =>
+        !(
+          report.observedAt === observationPreview.observedAt &&
+          report.rawReport === observationPreview.rawReport
+        ),
+    ),
+  ].slice(0, 4);
+};
+
 const EffectToneBadge = ({ tone }: { tone: AviationImpactTone }) => (
   <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] ${AVIATION_EFFECT_STYLES[tone]}`}>
     {AVIATION_EFFECT_LABELS[tone]}
@@ -818,12 +876,17 @@ const AviationModalSection = ({
   eyebrow,
   title,
   children,
+  detailSlot,
 }: {
   eyebrow: string;
   title: string;
   children: ReactNode;
+  detailSlot?: string;
 }) => (
-  <section className="rounded-[24px] border border-white/8 bg-[rgba(13,19,30,0.98)] px-4 py-4">
+  <section
+    className="rounded-[24px] border border-white/8 bg-[rgba(13,19,30,0.98)] px-4 py-4"
+    data-home-detail-slot={detailSlot}
+  >
     <div className="eyebrow text-white/40">{eyebrow}</div>
     <div className="mt-2 text-lg font-semibold text-white">{title}</div>
     <div className="mt-4">{children}</div>
@@ -916,7 +979,7 @@ const ConfidenceCard = ({
   label: string;
   detail?: string | null;
 }) => (
-  <div className="min-w-[220px] rounded-[20px] border border-white/8 bg-black/20 px-4 py-3">
+  <div className="min-w-0 rounded-[20px] border border-white/8 bg-black/20 px-4 py-3 sm:min-w-[220px]">
     <div className="eyebrow">{title}</div>
     <div className="mt-3">
       <PredictabilityDots score={score} label={label} />
@@ -1049,6 +1112,17 @@ export const WeatherOverview = ({
   }));
   const [activeHeroPanel, setActiveHeroPanel] = useState<HeroPanelKey>("intraday");
   const [openAviationPanel, setOpenAviationPanel] = useState<AviationDetailPanelKey | null>(null);
+  const [showDecisionDetails, setShowDecisionDetails] = useState(false);
+  const [showHeroQuickPanel, setShowHeroQuickPanel] = useState(false);
+  const [showTimelineGuide, setShowTimelineGuide] = useState(false);
+  const [showQuickIntradayDetails, setShowQuickIntradayDetails] = useState(false);
+  const [showKellyNotes, setShowKellyNotes] = useState(false);
+  const [showDetailedEvidence, setShowDetailedEvidence] = useState(false);
+  const [showSecondaryEvidence, setShowSecondaryEvidence] = useState(false);
+  const [showMobileIntradayDetail, setShowMobileIntradayDetail] = useState(false);
+  const [showMobileHourDetail, setShowMobileHourDetail] = useState(false);
+  const pendingIntradayDetailScrollRef = useRef(false);
+  const intradayDetailScrollFrameRef = useRef<number | null>(null);
 
   useEffect(() => {
     const handleResize = () => {
@@ -1061,7 +1135,7 @@ export const WeatherOverview = ({
   }, []);
 
   useEffect(() => {
-    if (!openAviationPanel) {
+    if (!openAviationPanel && !showMobileHourDetail) {
       return;
     }
 
@@ -1069,6 +1143,7 @@ export const WeatherOverview = ({
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setOpenAviationPanel(null);
+        setShowMobileHourDetail(false);
       }
     };
 
@@ -1079,7 +1154,7 @@ export const WeatherOverview = ({
       document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [openAviationPanel]);
+  }, [openAviationPanel, showMobileHourDetail]);
 
   useEffect(() => {
     if (typeof predictabilityScoreInput === "number" && Number.isFinite(predictabilityScoreInput)) {
@@ -1097,6 +1172,18 @@ export const WeatherOverview = ({
     }
     setStablePredictabilityLabel(nextLabel);
   }, [predictabilityLabelInput]);
+
+  useEffect(() => {
+    setOpenAviationPanel(null);
+    setShowDecisionDetails(false);
+    setShowHeroQuickPanel(false);
+    setShowTimelineGuide(false);
+    setShowQuickIntradayDetails(false);
+    setShowKellyNotes(false);
+    setShowDetailedEvidence(false);
+    setShowMobileIntradayDetail(false);
+    setShowMobileHourDetail(false);
+  }, [pageUrl]);
 
   useEffect(() => {
     const nextScore =
@@ -1152,6 +1239,7 @@ export const WeatherOverview = ({
     items.find((item) => item.timestamp === hoveredTimestamp) ?? selectedItem ?? currentItem ?? items[0] ?? null;
   const isMobileTimeline = timelineLayout.key === "mobile";
   const isStackedTimeline = timelineLayout.key !== "desktop";
+  const shouldCollapseSecondaryEvidence = timelineLayout.key !== "desktop";
   const timelineStep = timelineLayout.itemWidth + timelineLayout.itemGap;
 
   const temperatures = items
@@ -1166,6 +1254,7 @@ export const WeatherOverview = ({
   );
 
   const summaryText = reportText.trim() || UI_TEXT.weatherOverview.summarySyncing;
+  const summaryPreview = buildSummaryPreview(summaryText);
   const inspectorSummary = summarizeHour(selectedOrHoveredItem);
   const timelineContentSignature =
     items.length > 0 ? `${items[0]?.timestamp ?? ""}|${items[items.length - 1]?.timestamp ?? ""}|${items.length}` : "empty";
@@ -1202,13 +1291,19 @@ export const WeatherOverview = ({
   const metarObservation = metar.observation;
   const tafForecast = taf.forecast;
   const metarPrimary = metarObservation ? buildMetarHeadline(metarObservation, displayUnit) : "暂未拿到最新实况";
-  const metarSecondary = buildMetarDetail(metarObservation, locationTimezone);
   const tafPrimary = buildTafHeadline(tafForecast, displayUnit);
   const tafSecondary = buildTafDetail(tafForecast, locationTimezone, displayUnit);
   const metarReports = metar.recentReports ?? metar.recentObservations ?? [];
   const metarWindowLabel = buildMetarWindowLabel(metarReports, locationTimezone);
   const metarTrendSummary = buildMetarTrendSummary(metarReports, displayUnit);
+  const metarRawPreviewReports = buildMetarRawPreviewReports(metarObservation, metarReports);
+  const metarTemperatureC = metarObservation?.temperatureC ?? metarReports[0]?.temperatureC ?? null;
+  const metarDewpointC = metarObservation?.dewpointC ?? metarReports[0]?.dewpointC ?? null;
+  const metarWindDirectionDegrees = metarObservation?.windDirectionDegrees ?? metarReports[0]?.windDirectionDegrees ?? null;
+  const metarWindSpeedKts = metarObservation?.windSpeedKts ?? metarReports[0]?.windSpeedKts ?? null;
   const tafImpactItems = buildTafImpactItems(tafForecast);
+  const tafPreviewItems = tafImpactItems.slice(0, 3);
+  const tafSidebarItems = tafPreviewItems.slice(0, 2);
   const tafActiveForecast = tafForecast?.activeForecast ?? taf.forecasts[0] ?? null;
   const tafDailySummary = tafForecast?.dailySummary ?? null;
   const tafMaxExtreme = findTafExtreme(tafForecast, "max");
@@ -1235,16 +1330,109 @@ export const WeatherOverview = ({
   const tafWeatherItems = tafActiveForecast?.weather?.length
     ? tafActiveForecast.weather
     : tafDailySummary?.dominantWeather ?? [];
+  const tafSidebarExtraCount = Math.max(tafImpactItems.length - tafSidebarItems.length, 0);
+  const metarObservedAt = metarObservation?.observedAt ?? metarReports[0]?.observedAt ?? null;
+  const metarStationLabel =
+    metarObservation?.stationName ?? metarObservation?.stationId ?? metarReports[0]?.stationId ?? "机场站点";
+  const metarWindDirectionLabel = formatWindDirectionLabel(metarWindDirectionDegrees);
+  const metarWindSpeedLabel = formatWindSpeedLabel(metarWindSpeedKts);
+  const metarRawPreviewCount = metarRawPreviewReports.length;
+  const tafLeadImpact = tafSidebarItems[0] ?? null;
+  const tafPreviewCount = tafSidebarItems.length + tafSidebarExtraCount;
+  const tafActiveWindowLabel = formatTafWindow(tafActiveForecast?.timeFrom, tafActiveForecast?.timeTo, locationTimezone);
+  const tafActiveFlightCategory = buildFlightCategoryLabel(tafActiveForecast?.flightCategory ?? null);
+  const tafActiveCloudLabel = findKeyTafCloudLayer(tafActiveForecast)?.raw ?? null;
+  const tafWeatherSummaryLabel = tafWeatherItems.length
+    ? `${tafWeatherItems
+        .slice(0, 2)
+        .map((item) => item.labelZh)
+        .join("、")}${tafWeatherItems.length > 2 ? ` +${tafWeatherItems.length - 2}` : ""}`
+    : "无显著天气";
+  const quickEvidence = intradaySignals.evidence.slice(0, 3);
+  const detailedEvidence = showDetailedEvidence ? intradaySignals.evidence : intradaySignals.evidence.slice(0, 2);
+  const highlightedKellyNotes = showKellyNotes ? marketReference.notes.slice(0, 4) : marketReference.notes.slice(0, 1);
   const heroPanels = {
     intraday: {
-      label: "今天怎么看",
+      label: "天气主线",
       hint: intradaySignals.headline,
     },
     kelly: {
-      label: "Kelly 机会",
+      label: "错价机会",
       hint: marketReference.summary,
     },
   } satisfies Record<HeroPanelKey, { label: string; hint: string }>;
+
+  const scrollIntradayDetailIntoView = (behavior: ScrollBehavior = "smooth") => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (intradayDetailScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(intradayDetailScrollFrameRef.current);
+      intradayDetailScrollFrameRef.current = null;
+    }
+
+    intradayDetailScrollFrameRef.current = window.requestAnimationFrame(() => {
+      intradayDetailScrollFrameRef.current = window.requestAnimationFrame(() => {
+        document.getElementById("home-intraday-detail")?.scrollIntoView({
+          behavior,
+          block: "start",
+        });
+        intradayDetailScrollFrameRef.current = null;
+      });
+    });
+  };
+
+  const handleOpenIntradayDetail = () => {
+    if (!shouldCollapseSecondaryEvidence) {
+      scrollIntradayDetailIntoView();
+      return;
+    }
+
+    if (showMobileIntradayDetail) {
+      scrollIntradayDetailIntoView();
+      return;
+    }
+
+    pendingIntradayDetailScrollRef.current = true;
+    setShowSecondaryEvidence(true);
+    setShowMobileIntradayDetail(true);
+  };
+
+  const toggleMobilePostlude = () => {
+    if (showHeroQuickPanel) {
+      setShowHeroQuickPanel(false);
+      if (shouldCollapseSecondaryEvidence) {
+        setShowSecondaryEvidence(false);
+      }
+      setShowMobileIntradayDetail(false);
+      return;
+    }
+
+    setShowHeroQuickPanel(true);
+  };
+
+  useEffect(() => {
+    setShowSecondaryEvidence(!shouldCollapseSecondaryEvidence);
+  }, [pageUrl, shouldCollapseSecondaryEvidence]);
+
+  useEffect(() => {
+    if (!showMobileIntradayDetail || !pendingIntradayDetailScrollRef.current) {
+      return;
+    }
+
+    pendingIntradayDetailScrollRef.current = false;
+    scrollIntradayDetailIntoView();
+  }, [showMobileIntradayDetail]);
+
+  useEffect(
+    () => () => {
+      if (typeof window !== "undefined" && intradayDetailScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(intradayDetailScrollFrameRef.current);
+      }
+    },
+    [],
+  );
 
   const trackGradient = useMemo(() => {
     if (!items.length) {
@@ -1354,12 +1542,184 @@ export const WeatherOverview = ({
     return stopMomentum;
   }, [defaultSelectionFollowsCurrent, items.length, selectedIndex, timelineContentSignature, timelineLayout.key]);
 
-  const selectedHourInspector = (
-    <div className="rounded-[24px] border border-white/8 bg-black/20 p-4">
+  const heroQuickPanel = (
+    <div className="overview-hero-quick-panel rounded-[24px] border border-white/8 bg-black/20 p-3.5">
       <div className="flex items-center justify-between gap-3">
-        <div>
+        <div className="eyebrow">快速切换</div>
+        <div className="text-[11px] text-white/42">主线 / 错价</div>
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        {(Object.keys(heroPanels) as HeroPanelKey[]).map((panelKey) => {
+          const active = activeHeroPanel === panelKey;
+          return (
+            <button
+              key={panelKey}
+              type="button"
+              onClick={() => setActiveHeroPanel(panelKey)}
+              onFocus={() => setActiveHeroPanel(panelKey)}
+              onMouseEnter={() => setActiveHeroPanel(panelKey)}
+              title={heroPanels[panelKey].hint}
+              className={`rounded-full border px-2.5 py-2 text-center text-xs font-medium transition ${
+                active
+                  ? "border-[rgba(143,246,217,0.28)] bg-[rgba(56,214,180,0.12)] text-white"
+                  : "border-white/8 bg-white/[0.03] text-white/72 hover:border-white/16 hover:bg-white/[0.05]"
+              }`}
+            >
+              {heroPanels[panelKey].label}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="mt-4 rounded-[22px] border border-white/8 bg-[rgba(255,255,255,0.03)] p-3">
+        {activeHeroPanel === "intraday" ? (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="eyebrow flex items-center gap-2">
+                  <Radar className="h-4 w-4 text-[var(--accent)]" />
+                  天气主线
+                </div>
+                <div className="mt-2 text-base font-semibold text-white">{intradaySignals.headline}</div>
+              </div>
+
+              <StatusPill label={`把握度 ${CONFIDENCE_LABEL[intradaySignals.confidence]}`} tone="good" />
+            </div>
+
+            <div className="max-h-[5.25rem] overflow-hidden rounded-[18px] border border-white/8 bg-black/20 px-4 py-3 text-sm leading-6 text-white/74 sm:max-h-[7rem]">
+              <div className="eyebrow">当前主线</div>
+              <div className="mt-2">{intradaySignals.baseCase}</div>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setShowQuickIntradayDetails((current) => !current)}
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
+                aria-expanded={showQuickIntradayDetails}
+              >
+                {showQuickIntradayDetails ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                {showQuickIntradayDetails ? "收起证据" : "展开证据"}
+              </button>
+
+              {shouldCollapseSecondaryEvidence ? (
+                <button
+                  type="button"
+                  onClick={handleOpenIntradayDetail}
+                  aria-controls="home-intraday-detail"
+                  aria-expanded={showMobileIntradayDetail}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
+                >
+                  看完整判断
+                </button>
+              ) : (
+                <a
+                  href="#home-intraday-detail"
+                  className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
+                >
+                  看完整判断
+                </a>
+              )}
+            </div>
+
+            <AnimatePresence initial={false}>
+              {showQuickIntradayDetails ? (
+                <motion.div
+                  initial={{ opacity: 0, height: 0, y: -6 }}
+                  animate={{ opacity: 1, height: "auto", y: 0 }}
+                  exit={{ opacity: 0, height: 0, y: -6 }}
+                  transition={{ duration: 0.2, ease: "easeOut" }}
+                  className="grid gap-2 overflow-hidden"
+                >
+                  {quickEvidence.length > 0 ? (
+                    <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3 text-sm leading-6 text-white/68">
+                      <div className="eyebrow">关键证据</div>
+                      <div className="mt-2 space-y-1.5">
+                        {quickEvidence.map((item) => (
+                          <div key={item}>• {item}</div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3 text-xs leading-6 text-white/56">
+                    下一次重点观察：
+                    {intradaySignals.nextObservationAt
+                      ? ` ${formatDateTime(intradaySignals.nextObservationAt, locationTimezone)}`
+                      : " 等待下一轮小时刷新"}
+                  </div>
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+          </div>
+        ) : null}
+
+        {activeHeroPanel === "kelly" ? (
+          <div className="space-y-3">
+            <div className="eyebrow flex items-center gap-2">
+              <Thermometer className="h-4 w-4 text-[var(--warning)]" />
+              错价机会
+            </div>
+            <div className="text-base font-semibold text-white">{marketReference.summary}</div>
+            <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3 text-sm leading-6 text-white/68">
+              {highlightedKellyNotes[0] ?? "等待市场错价线索补充。"}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {marketReference.notes.length > 1 ? (
+                <button
+                  type="button"
+                  onClick={() => setShowKellyNotes((current) => !current)}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
+                  aria-expanded={showKellyNotes}
+                >
+                  {showKellyNotes ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                  {showKellyNotes ? "收起线索" : "展开线索"}
+                </button>
+              ) : null}
+
+              <a
+                href={currentKellyRoute}
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
+              >
+                打开 Kelly 页面
+                <ExternalLink className="h-4 w-4" />
+              </a>
+            </div>
+
+            <AnimatePresence initial={false}>
+              {showKellyNotes && marketReference.notes.length > 1 ? (
+                <motion.div
+                  initial={{ opacity: 0, height: 0, y: -6 }}
+                  animate={{ opacity: 1, height: "auto", y: 0 }}
+                  exit={{ opacity: 0, height: 0, y: -6 }}
+                  transition={{ duration: 0.2, ease: "easeOut" }}
+                  className="space-y-2 overflow-hidden text-sm leading-6 text-white/68"
+                >
+                  {highlightedKellyNotes.slice(1).map((note) => (
+                    <div key={note}>• {note}</div>
+                  ))}
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+
+  const selectedHourInspector = (
+    <div
+      className="timeline-selected-inspector rounded-[24px] border border-white/8 bg-black/20 p-4"
+      data-home-detail-source={HOME_DETAIL_SOURCE.hourInspector}
+    >
+      <div
+        className="timeline-selected-header flex items-center justify-between gap-3"
+        data-home-detail-slot={HOME_DETAIL_SLOT.summary}
+      >
+        <div className="timeline-selected-copy">
           <div className="eyebrow">{UI_TEXT.weatherOverview.selectedHour}</div>
-          <div className={`mt-2 font-semibold text-white ${timelineLayout.inspectorValueClassName}`}>
+          <div className={`timeline-selected-value mt-2 font-semibold text-white ${timelineLayout.inspectorValueClassName}`}>
             {selectedOrHoveredItem
               ? `${formatTime(selectedOrHoveredItem.timestamp, locationTimezone)} · ${formatTemperature(selectedOrHoveredItem.temperatureC, displayUnit)}`
               : "--"}
@@ -1369,16 +1729,17 @@ export const WeatherOverview = ({
         <WindGlyph direction={selectedOrHoveredItem?.windDirection} />
       </div>
 
-      <div className="mt-3 text-sm leading-6 text-white/60">{inspectorSummary}</div>
+      <div className="timeline-selected-summary mt-3 text-sm leading-6 text-white/60">{inspectorSummary}</div>
 
       <div
-        className={`mt-4 grid gap-3 ${
+        className={`timeline-selected-stats mt-4 grid gap-3 ${
           isMobileTimeline
             ? "grid-cols-1 sm:grid-cols-3"
             : isStackedTimeline
               ? "grid-cols-1 sm:grid-cols-3"
               : "grid-cols-1"
         }`}
+        data-home-detail-slot={HOME_DETAIL_SLOT.timelineDetail}
       >
         <InspectorStat
           label={UI_TEXT.weatherOverview.precipitationProbability}
@@ -1403,6 +1764,32 @@ export const WeatherOverview = ({
     </div>
   );
 
+  const selectedHourQuickPeek =
+    isMobileTimeline && selectedOrHoveredItem ? (
+      <button
+        type="button"
+        data-home-detail-trigger={HOME_DETAIL_ID.hourDetailModal}
+        data-home-detail-source={HOME_DETAIL_SOURCE.hourSummary}
+        onClick={() => setShowMobileHourDetail(true)}
+        className="flex w-full flex-col rounded-[20px] border border-white/8 bg-[rgba(255,255,255,0.022)] px-4 py-3 text-left transition hover:border-white/14 hover:bg-white/[0.04]"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="eyebrow text-white/38">选中小时 / 细查</div>
+            <div className="mt-1 text-base font-semibold leading-6 text-white">
+              {formatTime(selectedOrHoveredItem.timestamp, locationTimezone)} ·{" "}
+              {formatTemperature(selectedOrHoveredItem.temperatureC, displayUnit)}
+            </div>
+          </div>
+          <span className="inline-flex shrink-0 items-center rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-[11px] text-white/68">
+            小时细查
+          </span>
+        </div>
+
+        <div className="mt-2 line-clamp-2 text-sm leading-6 text-white/58">{inspectorSummary}</div>
+      </button>
+    ) : null;
+
   const aviationModalTitle = openAviationPanel === "metar" ? "温度 / 露点实况" : "TAF 对温度的影响";
   const aviationModalDescription =
     openAviationPanel === "metar"
@@ -1416,7 +1803,7 @@ export const WeatherOverview = ({
 
   const metarModalContent = (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]">
-      <AviationModalSection eyebrow="最新一报" title={metarPrimary}>
+      <AviationModalSection eyebrow="最新一报" title={metarPrimary} detailSlot={HOME_DETAIL_SLOT.summary}>
         <div className="grid gap-3 sm:grid-cols-2">
           <AviationMetric
             label="当前气温"
@@ -1451,7 +1838,7 @@ export const WeatherOverview = ({
         </div>
       </AviationModalSection>
 
-      <AviationModalSection eyebrow="最近 4 小时" title="METAR 原始报文">
+      <AviationModalSection eyebrow="最近 4 小时" title="METAR 原始报文" detailSlot={HOME_DETAIL_SLOT.rawSource}>
         {metarReports.length > 0 ? (
           <div className="space-y-3">
             {metarReports.map((report, index) => (
@@ -1494,7 +1881,7 @@ export const WeatherOverview = ({
   const tafModalContent = (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
       <div className="space-y-4">
-        <AviationModalSection eyebrow="TAF 关键信号" title={tafPrimary}>
+        <AviationModalSection eyebrow="TAF 关键信号" title={tafPrimary} detailSlot={HOME_DETAIL_SLOT.summary}>
           {tafHasTemperatureExtremes ? (
             <div className="grid gap-3 sm:grid-cols-2">
               {tafMaxExtreme ? (
@@ -1547,7 +1934,7 @@ export const WeatherOverview = ({
           ) : null}
         </AviationModalSection>
 
-        <AviationModalSection eyebrow="变化节点" title="这份 TAF 后面怎么变">
+        <AviationModalSection eyebrow="变化节点" title="这份 TAF 后面怎么变" detailSlot={HOME_DETAIL_SLOT.changeList}>
           <div className="space-y-3">
             {tafChangeImpacts.length > 0 ? (
               tafChangeImpacts.map(({ highlight, impact }, index) => (
@@ -1591,7 +1978,7 @@ export const WeatherOverview = ({
       </div>
 
       <div className="space-y-4">
-        <AviationModalSection eyebrow="当前生效段" title={tafSecondary}>
+        <AviationModalSection eyebrow="当前生效段" title={tafSecondary} detailSlot={HOME_DETAIL_SLOT.evidence}>
           <div className="grid gap-3">
             <AviationMetric
               label="时段"
@@ -1611,7 +1998,7 @@ export const WeatherOverview = ({
           </div>
         </AviationModalSection>
 
-        <AviationModalSection eyebrow="云层 / 天空术语" title="保留原始代码，但先给你解释">
+        <AviationModalSection eyebrow="云层 / 天空术语" title="保留原始代码，但先给你解释" detailSlot={HOME_DETAIL_SLOT.evidence}>
           {tafCloudLayers.length > 0 ? (
             <div className="space-y-3">
               {tafCloudLayers.map((layer, index) => (
@@ -1646,7 +2033,7 @@ export const WeatherOverview = ({
           )}
         </AviationModalSection>
 
-        <AviationModalSection eyebrow="天气现象" title="为什么这里不直接写雨量">
+        <AviationModalSection eyebrow="天气现象" title="为什么这里不直接写雨量" detailSlot={HOME_DETAIL_SLOT.evidence}>
           {tafWeatherItems.length > 0 ? (
             <div className="space-y-3">
               {tafWeatherItems.map((item, index) => (
@@ -1670,7 +2057,7 @@ export const WeatherOverview = ({
           )}
         </AviationModalSection>
 
-        <AviationModalSection eyebrow="原始报文" title="完整 TAF">
+        <AviationModalSection eyebrow="原始报文" title="完整 TAF" detailSlot={HOME_DETAIL_SLOT.rawSource}>
           <div className="data-mono overflow-x-auto rounded-[18px] border border-white/8 bg-[rgba(7,12,18,0.92)] px-3 py-3 text-[12px] leading-6 text-[#dff7ff]">
             {tafForecast?.rawTaf ?? "当前没有可展示的原始 TAF 报文。"}
           </div>
@@ -1702,6 +2089,7 @@ export const WeatherOverview = ({
                     role="dialog"
                     aria-modal="true"
                     aria-label={aviationModalTitle}
+                    data-home-detail-layer={HOME_DETAIL_ID.aviationModal}
                     initial={{ opacity: 0, y: 24, scale: 0.985 }}
                     animate={{ opacity: 1, y: 0, scale: 1 }}
                     exit={{ opacity: 0, y: 18, scale: 0.99 }}
@@ -1709,7 +2097,10 @@ export const WeatherOverview = ({
                     className="mx-auto flex h-[calc(100dvh-1.5rem)] w-full max-w-6xl flex-col overflow-hidden rounded-[30px] border border-[var(--border-strong)] bg-[#101722] shadow-[0_40px_140px_rgba(0,0,0,0.56)] sm:h-[calc(100dvh-2.5rem)]"
                     onClick={(event) => event.stopPropagation()}
                   >
-                    <div className="shrink-0 border-b border-white/8 px-4 py-4 sm:px-5 sm:py-5">
+                    <div
+                      className="shrink-0 border-b border-white/8 px-4 py-4 sm:px-5 sm:py-5"
+                      data-home-detail-slot={HOME_DETAIL_SLOT.summary}
+                    >
                       <div className="flex flex-wrap items-start justify-between gap-4">
                       <div className="max-w-3xl">
                         <div className="eyebrow flex items-center gap-2">
@@ -1756,8 +2147,72 @@ export const WeatherOverview = ({
                     </div>
 
                     <ScrollArea className="min-h-0 flex-1">
-                      <ScrollViewport className="px-4 py-4 sm:px-5 sm:py-5">
+                      <ScrollViewport
+                        className="px-4 py-4 sm:px-5 sm:py-5"
+                        data-home-detail-slot={openAviationPanel === "metar" ? HOME_DETAIL_SLOT.rawSource : HOME_DETAIL_SLOT.evidence}
+                      >
                         {openAviationPanel === "metar" ? metarModalContent : tafModalContent}
+                      </ScrollViewport>
+                      <ScrollBar />
+                    </ScrollArea>
+                  </motion.div>
+                </div>
+              </div>
+            ) : null}
+          </AnimatePresence>,
+          document.body,
+        )
+      : null;
+
+  const mobileHourDetailModal =
+    typeof document !== "undefined"
+      ? createPortal(
+          <AnimatePresence>
+            {showMobileHourDetail && isMobileTimeline ? (
+              <div className="fixed inset-0 z-[88]">
+                <motion.div
+                  className="absolute inset-0 bg-[rgba(3,8,14,0.74)] backdrop-blur-md"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.18, ease: "easeOut" }}
+                  onClick={() => setShowMobileHourDetail(false)}
+                />
+
+                <div className="absolute inset-0 flex items-end" onClick={() => setShowMobileHourDetail(false)}>
+                  <motion.div
+                    role="dialog"
+                    aria-modal="true"
+                    aria-label="小时细查"
+                    data-home-detail-layer={HOME_DETAIL_ID.hourDetailModal}
+                    initial={{ opacity: 0, y: 28 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 18 }}
+                    transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+                    className="flex max-h-[86dvh] w-full flex-col overflow-hidden rounded-t-[30px] border border-white/10 bg-[#101722] shadow-[0_-18px_60px_rgba(0,0,0,0.42)]"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <div className="flex items-start justify-between gap-4 border-b border-white/8 px-4 py-4">
+                      <div className="min-w-0">
+                        <div className="eyebrow text-white/40">时间轴下沉阅读层</div>
+                        <div className="mt-1 text-lg font-semibold text-white">小时细查</div>
+                        <div className="mt-1 text-sm leading-6 text-white/58">
+                          首页先看轨道和判断，细节放到这里单独读。
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setShowMobileHourDetail(false)}
+                        className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.03] text-white/66 transition hover:border-white/18 hover:bg-white/[0.06] hover:text-white"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+
+                    <ScrollArea className="min-h-0 flex-1">
+                      <ScrollViewport className="px-4 py-4" data-home-detail-slot={HOME_DETAIL_SLOT.timelineDetail}>
+                        {selectedHourInspector}
                       </ScrollViewport>
                       <ScrollBar />
                     </ScrollArea>
@@ -1773,12 +2228,23 @@ export const WeatherOverview = ({
   return (
     <section className="overview-panel terminal-panel self-start flex min-h-0 flex-col p-5">
       <div className="panel-section flex min-h-0 flex-col gap-4">
-        <div className="rounded-[28px] border border-white/8 bg-[linear-gradient(160deg,rgba(18,24,38,0.96),rgba(15,20,30,0.92))] p-5">
-          <div className="grid gap-5 sm:grid-cols-[minmax(0,1fr)_230px] xl:grid-cols-[minmax(0,1fr)_240px]">
+        <div className="overview-hero rounded-[28px] border border-white/8 p-5">
+          <div className="grid gap-5 xl:grid-cols-[minmax(0,1.16fr)_minmax(280px,0.84fr)] 2xl:grid-cols-[minmax(0,1.2fr)_minmax(300px,0.8fr)]">
             <div className="min-w-0">
-              <div className="eyebrow flex items-center gap-2">
-                <Thermometer className="h-4 w-4 text-[var(--accent)]" />
-                {UI_TEXT.weatherOverview.currentDecision}
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="eyebrow flex items-center gap-2">
+                    <Thermometer className="h-4 w-4 text-[var(--accent)]" />
+                    {UI_TEXT.weatherOverview.currentDecision}
+                  </div>
+
+                  <div className="mt-2 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-[11px] text-white/66">
+                    <span className="inline-flex h-2 w-2 rounded-full bg-[var(--accent)]" />
+                    从客观天气先确认，再去找价格错位
+                  </div>
+                </div>
+
+                <StatusPill label="持续搜索全球天气错价" tone="muted" />
               </div>
 
               <div className="mt-4 flex flex-wrap items-end gap-4">
@@ -1793,9 +2259,38 @@ export const WeatherOverview = ({
                 </div>
               </div>
 
-              <p className="mt-4 max-h-[5.25rem] max-w-2xl overflow-hidden text-[15px] leading-7 text-white/82 sm:max-h-[7rem]">
-                {summaryText}
-              </p>
+              <div className="overview-hero-metric mt-4 rounded-[24px] border p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="eyebrow">Alpha 视角</div>
+                    <div className="mt-2 text-[15px] leading-7 text-white/82">{summaryPreview}</div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowDecisionDetails((current) => !current)}
+                    className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/68 transition hover:border-white/18 hover:bg-white/[0.05] hover:text-white"
+                    aria-expanded={showDecisionDetails}
+                  >
+                    {showDecisionDetails ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                    {showDecisionDetails ? "收起完整判断" : "展开完整判断"}
+                  </button>
+                </div>
+
+                <AnimatePresence initial={false}>
+                  {showDecisionDetails ? (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0, y: -6 }}
+                      animate={{ opacity: 1, height: "auto", y: 0 }}
+                      exit={{ opacity: 0, height: 0, y: -6 }}
+                      transition={{ duration: 0.2, ease: "easeOut" }}
+                      className="mt-3 overflow-hidden border-t border-white/8 pt-3 text-sm leading-7 text-white/68"
+                    >
+                      {summaryText}
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
+              </div>
 
               <div className="mt-4 flex flex-wrap gap-3">
                 <ConfidenceCard
@@ -1804,6 +2299,7 @@ export const WeatherOverview = ({
                   detail={isMobileTimeline ? null : predictabilityDetail}
                   label={predictabilityLabel ?? "--"}
                 />
+                <StatusPill label={`已校准 ${availableTemperatureHours}/${totalHours} 小时`} tone="muted" />
               </div>
 
               <div className="mt-4 flex flex-wrap items-center gap-2.5">
@@ -1823,8 +2319,11 @@ export const WeatherOverview = ({
 
             </div>
 
-            <div className="rounded-[24px] border border-white/8 bg-black/20 p-3">
-              <div className="eyebrow">快捷查看</div>
+            <div className="overview-hero-quick-panel-desktop rounded-[24px] border border-white/8 bg-black/20 p-3.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="eyebrow">快速切换</div>
+                <div className="text-[11px] text-white/42">主线 / 错价</div>
+              </div>
 
               <div className="mt-3 grid grid-cols-2 gap-2">
                 {(Object.keys(heroPanels) as HeroPanelKey[]).map((panelKey) => {
@@ -1856,7 +2355,7 @@ export const WeatherOverview = ({
                       <div>
                         <div className="eyebrow flex items-center gap-2">
                           <Radar className="h-4 w-4 text-[var(--accent)]" />
-                          今天怎么看
+                          天气主线
                         </div>
                         <div className="mt-2 text-base font-semibold text-white">{intradaySignals.headline}</div>
                       </div>
@@ -1869,12 +2368,54 @@ export const WeatherOverview = ({
                       <div className="mt-2">{intradaySignals.baseCase}</div>
                     </div>
 
-                    <a
-                      href="#home-intraday-detail"
-                      className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
-                    >
-                      看完整判断
-                    </a>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowQuickIntradayDetails((current) => !current)}
+                        className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
+                        aria-expanded={showQuickIntradayDetails}
+                      >
+                        {showQuickIntradayDetails ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                        {showQuickIntradayDetails ? "收起证据" : "展开证据"}
+                      </button>
+
+                      <a
+                        href="#home-intraday-detail"
+                        className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
+                      >
+                        看完整判断
+                      </a>
+                    </div>
+
+                    <AnimatePresence initial={false}>
+                      {showQuickIntradayDetails ? (
+                        <motion.div
+                          initial={{ opacity: 0, height: 0, y: -6 }}
+                          animate={{ opacity: 1, height: "auto", y: 0 }}
+                          exit={{ opacity: 0, height: 0, y: -6 }}
+                          transition={{ duration: 0.2, ease: "easeOut" }}
+                          className="grid gap-2 overflow-hidden"
+                        >
+                          {quickEvidence.length > 0 ? (
+                            <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3 text-sm leading-6 text-white/68">
+                              <div className="eyebrow">关键证据</div>
+                              <div className="mt-2 space-y-1.5">
+                                {quickEvidence.map((item) => (
+                                  <div key={item}>• {item}</div>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
+
+                          <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3 text-xs leading-6 text-white/56">
+                            下一次重点观察：
+                            {intradaySignals.nextObservationAt
+                              ? ` ${formatDateTime(intradaySignals.nextObservationAt, locationTimezone)}`
+                              : " 等待下一轮小时刷新"}
+                          </div>
+                        </motion.div>
+                      ) : null}
+                    </AnimatePresence>
                   </div>
                 ) : null}
 
@@ -1882,21 +2423,49 @@ export const WeatherOverview = ({
                   <div className="space-y-3">
                     <div className="eyebrow flex items-center gap-2">
                       <Thermometer className="h-4 w-4 text-[var(--warning)]" />
-                      Kelly 机会
+                      错价机会
                     </div>
                     <div className="text-base font-semibold text-white">{marketReference.summary}</div>
-                    <div className="hidden space-y-2 text-sm leading-6 text-white/68 xl:block">
-                      {marketReference.notes.slice(0, 2).map((note) => (
-                        <div key={note}>• {note}</div>
-                      ))}
+                    <div className="rounded-[18px] border border-white/8 bg-black/20 px-4 py-3 text-sm leading-6 text-white/68">
+                      {highlightedKellyNotes[0] ?? "等待市场错价线索补充。"}
                     </div>
-                    <a
-                      href={currentKellyRoute}
-                      className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
-                    >
-                      打开 Kelly 页面
-                      <ExternalLink className="h-4 w-4" />
-                    </a>
+                    <div className="flex flex-wrap gap-2">
+                      {marketReference.notes.length > 1 ? (
+                        <button
+                          type="button"
+                          onClick={() => setShowKellyNotes((current) => !current)}
+                          className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
+                          aria-expanded={showKellyNotes}
+                        >
+                          {showKellyNotes ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                          {showKellyNotes ? "收起线索" : "展开线索"}
+                        </button>
+                      ) : null}
+
+                      <a
+                        href={currentKellyRoute}
+                        className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/72 transition hover:border-white/18 hover:bg-white/[0.05]"
+                      >
+                        打开 Kelly 页面
+                        <ExternalLink className="h-4 w-4" />
+                      </a>
+                    </div>
+
+                    <AnimatePresence initial={false}>
+                      {showKellyNotes && marketReference.notes.length > 1 ? (
+                        <motion.div
+                          initial={{ opacity: 0, height: 0, y: -6 }}
+                          animate={{ opacity: 1, height: "auto", y: 0 }}
+                          exit={{ opacity: 0, height: 0, y: -6 }}
+                          transition={{ duration: 0.2, ease: "easeOut" }}
+                          className="space-y-2 overflow-hidden text-sm leading-6 text-white/68"
+                        >
+                          {highlightedKellyNotes.slice(1).map((note) => (
+                            <div key={note}>• {note}</div>
+                          ))}
+                        </motion.div>
+                      ) : null}
+                    </AnimatePresence>
                   </div>
                 ) : null}
               </div>
@@ -1906,14 +2475,38 @@ export const WeatherOverview = ({
 
         <div className="timeline-card flex min-h-0 flex-col overflow-hidden rounded-[28px] border border-white/8 bg-[rgba(255,255,255,0.025)]">
           <div className="px-5 py-5">
-            <div className="eyebrow">{UI_TEXT.weatherOverview.timelineTitle}</div>
-            <div className="mt-2 text-sm leading-6 text-white/58">{timelineDescription}</div>
-
-            <div className="mt-4 flex flex-wrap items-center gap-2">
-              <div className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/60">
-                {timelineCoverageLabel}
+            <div className="timeline-header-row flex flex-wrap items-start justify-between gap-3">
+              <div className="timeline-header-copy">
+                <div className="eyebrow">{UI_TEXT.weatherOverview.timelineTitle}</div>
+                <div className="timeline-coverage-label mt-2 text-sm leading-6 text-white/58">{timelineCoverageLabel}</div>
               </div>
 
+              <button
+                type="button"
+                onClick={() => setShowTimelineGuide((current) => !current)}
+                className="timeline-guide-button inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/66 transition hover:border-white/18 hover:bg-white/[0.05] hover:text-white"
+                aria-expanded={showTimelineGuide}
+              >
+                {showTimelineGuide ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                {showTimelineGuide ? "收起轨道说明" : "轨道说明"}
+              </button>
+            </div>
+
+            <AnimatePresence initial={false}>
+              {showTimelineGuide ? (
+                <motion.div
+                  initial={{ opacity: 0, height: 0, y: -6 }}
+                  animate={{ opacity: 1, height: "auto", y: 0 }}
+                  exit={{ opacity: 0, height: 0, y: -6 }}
+                  transition={{ duration: 0.2, ease: "easeOut" }}
+                  className="timeline-guide-panel mt-3 overflow-hidden rounded-[18px] border border-white/8 bg-black/20 px-4 py-3 text-sm leading-6 text-white/62"
+                >
+                  {timelineDescription}
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+
+            <div className="timeline-action-row mt-4 flex flex-wrap items-center gap-2">
               <Button
                 type="button"
                 variant="ghost"
@@ -1948,11 +2541,11 @@ export const WeatherOverview = ({
                 {UI_TEXT.weatherOverview.peak}
               </Button>
 
-              <div className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/60">
+              <div className="timeline-meta-pill rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/60">
                 {UI_TEXT.weatherOverview.currentHour} {currentItem ? formatTime(currentItem.timestamp, locationTimezone) : "--"}
               </div>
 
-              <div className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/60">
+              <div className="timeline-meta-pill rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/60">
                 {UI_TEXT.weatherOverview.range}{" "}
                 {temperatures.length
                   ? `${formatTemperature(minTemperature, displayUnit)} - ${formatTemperature(maxTemperature, displayUnit)}`
@@ -2252,10 +2845,84 @@ export const WeatherOverview = ({
             </div>
 
             {!isStackedTimeline ? selectedHourInspector : null}
-            {isStackedTimeline ? <div className="px-4">{selectedHourInspector}</div> : null}
+            {isStackedTimeline ? (
+              <div className="timeline-selected-inspector-shell px-4">
+                {isMobileTimeline ? selectedHourQuickPeek ?? selectedHourInspector : selectedHourInspector}
+              </div>
+            ) : null}
           </div>
         </div>
 
+        <div className={isMobileTimeline ? "timeline-postlude-stack" : undefined}>
+          {isMobileTimeline ? (
+            <div className="rounded-[20px] border border-white/8 bg-[rgba(255,255,255,0.018)] px-4 py-3">
+            <button
+              type="button"
+              onClick={toggleMobilePostlude}
+              className="inline-flex w-full items-center justify-between gap-3 text-left"
+              aria-expanded={showHeroQuickPanel}
+            >
+              <div>
+                <div className="eyebrow text-white/40">更多判断依据</div>
+                <div className="mt-1 text-sm leading-5 text-white/64">
+                  主线、错价和证据解释都后置到这里，按需再展开。
+                </div>
+              </div>
+              <span className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-[11px] text-white/68">
+                {showHeroQuickPanel ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                {showHeroQuickPanel ? "收起" : "展开"}
+              </span>
+            </button>
+
+            <AnimatePresence initial={false}>
+              {showHeroQuickPanel ? (
+                <motion.div
+                  initial={{ opacity: 0, height: 0, y: -6 }}
+                  animate={{ opacity: 1, height: "auto", y: 0 }}
+                  exit={{ opacity: 0, height: 0, y: -6 }}
+                  transition={{ duration: 0.18, ease: "easeOut" }}
+                  className="mt-3 overflow-hidden"
+                >
+                  {heroQuickPanel}
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+            </div>
+          ) : null}
+
+        {isMobileTimeline && !showHeroQuickPanel ? null : (
+        <div className={shouldCollapseSecondaryEvidence ? "rounded-[24px] border border-white/8 bg-[rgba(255,255,255,0.018)] px-4 py-4" : ""}>
+          {shouldCollapseSecondaryEvidence ? (
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="eyebrow text-white/36">证据与解释层</div>
+                <div className="mt-1 text-sm leading-6 text-white/54">
+                  METAR、TAF 和 Alpha 的解释先收起来，首页先看判断和时间轴，需要时再展开细看。
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowSecondaryEvidence((current) => !current)}
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/66 transition hover:border-white/18 hover:bg-white/[0.05] hover:text-white"
+                aria-expanded={showSecondaryEvidence}
+              >
+                {showSecondaryEvidence ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                {showSecondaryEvidence ? "收起证据层" : "展开证据层"}
+              </button>
+            </div>
+          ) : null}
+
+          <AnimatePresence initial={false} mode="wait">
+            {shouldCollapseSecondaryEvidence && !showSecondaryEvidence ? null : (
+              <motion.div
+                key={shouldCollapseSecondaryEvidence ? "overview-secondary-collapsed" : "overview-secondary-expanded"}
+                initial={shouldCollapseSecondaryEvidence ? { opacity: 0, height: 0, y: -6 } : false}
+                animate={{ opacity: 1, height: "auto", y: 0 }}
+                exit={{ opacity: 0, height: 0, y: -6 }}
+                transition={{ duration: 0.2, ease: "easeOut" }}
+                className={shouldCollapseSecondaryEvidence ? "mt-4 grid gap-4 overflow-hidden" : "grid gap-4"}
+              >
         <div className="rounded-[24px] border border-white/8 bg-[rgba(255,255,255,0.018)] px-4 py-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
@@ -2276,25 +2943,30 @@ export const WeatherOverview = ({
             </a>
           </div>
 
-          <div className="mt-4 grid gap-3 xl:grid-cols-2">
+          <div className="mt-4 grid gap-3 2xl:grid-cols-[minmax(0,1.72fr)_minmax(320px,0.88fr)]">
             <motion.button
               type="button"
+              data-home-detail-trigger={HOME_DETAIL_ID.aviationModal}
+              data-home-detail-trigger-kind={HOME_DETAIL_TRIGGER_KIND.metar}
+              data-home-detail-source={HOME_DETAIL_SOURCE.metarSummary}
               whileHover={{ y: -4, scale: 1.006 }}
               whileTap={{ scale: 0.995 }}
               transition={{ duration: 0.2, ease: "easeOut" }}
               onClick={() => setOpenAviationPanel("metar")}
-              className="group relative overflow-hidden rounded-[26px] border border-white/8 bg-[linear-gradient(160deg,rgba(17,26,38,0.94),rgba(10,16,24,0.96))] p-5 text-left"
+              className="group relative flex h-full min-w-0 flex-col overflow-hidden rounded-[28px] border border-white/8 bg-[linear-gradient(160deg,rgba(17,26,38,0.94),rgba(10,16,24,0.96))] p-5 text-left sm:p-6"
             >
               <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(114,229,255,0.14),transparent_44%)] opacity-80" />
 
               <div className="relative z-[1] flex flex-wrap items-start justify-between gap-3">
-                <div>
+                <div className="min-w-0">
                   <div className="eyebrow flex items-center gap-2">
                     <Radar className="h-4 w-4 text-[var(--accent)]" />
                     <Droplets className="h-4 w-4 text-[var(--accent-secondary)]" />
-                    温度 / 露点
+                    METAR 主证据
                   </div>
-                  <div className="mt-2 text-lg font-semibold text-white">最新一报先看大字，再点进去回看近 4 小时报文</div>
+                  <div className="mt-2 max-w-2xl text-[clamp(1.1rem,1.6vw,1.45rem)] font-semibold leading-8 text-white">
+                    首页直接看最近 4 条 METAR 原文，点开再看解释版细看
+                  </div>
                 </div>
 
                 <span
@@ -2308,114 +2980,210 @@ export const WeatherOverview = ({
                 </span>
               </div>
 
-              <div className="relative z-[1] mt-5 grid gap-3 sm:grid-cols-2">
-                <AviationMetric
-                  label="当前气温"
-                  value={formatTemperature(metarObservation?.temperatureC ?? metarReports[0]?.temperatureC ?? null, displayUnit)}
-                  hint={metarPrimary}
-                />
-                <AviationMetric
-                  label="当前露点"
-                  value={formatTemperature(metarObservation?.dewpointC ?? metarReports[0]?.dewpointC ?? null, displayUnit)}
-                  hint="露点直接和湿度、云底、体感一起影响白天升温判断。"
-                />
+              <div
+                className="relative z-[1] mt-5 rounded-[26px] border border-[rgba(114,229,255,0.18)] bg-[linear-gradient(180deg,rgba(7,13,21,0.82),rgba(7,13,21,0.62))] p-4 sm:p-5"
+                data-home-detail-slot={HOME_DETAIL_SLOT.summary}
+              >
+                <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_18%,rgba(114,229,255,0.14),transparent_40%)]" />
+
+                <div className="relative flex flex-wrap items-end justify-between gap-4">
+                  <div>
+                    <div className="eyebrow text-white/42">当前实况</div>
+                    <div className="data-mono mt-3 text-[clamp(2.8rem,10vw,4rem)] font-semibold leading-none text-white">
+                      {formatTemperature(metarTemperatureC, displayUnit)}
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    <span className="inline-flex items-center rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/72">
+                      露点 {formatTemperature(metarDewpointC, displayUnit)}
+                    </span>
+                    <span className="inline-flex items-center rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/60">
+                      {metarStationLabel}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="relative mt-4 line-clamp-3 text-sm leading-7 text-white/76">{metarPrimary}</div>
+
+                <div className="relative mt-4 flex flex-wrap gap-2 text-xs text-white/64">
+                  <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5">
+                    {metarObservedAt ? formatDateTime(metarObservedAt, locationTimezone) : "--"}
+                  </span>
+                  <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5">{metarWindowLabel}</span>
+                  <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5">
+                    风况 {metarWindDirectionLabel} · {metarWindSpeedLabel}
+                  </span>
+                </div>
               </div>
 
-              <div className="relative z-[1] mt-4 flex flex-wrap gap-2">
-                <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
-                  {metarWindowLabel}
-                </span>
-                <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
-                  风况 {formatWindDirectionLabel(metarObservation?.windDirectionDegrees ?? metarReports[0]?.windDirectionDegrees ?? null)}
-                </span>
-                <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
-                  风速 {formatWindSpeedLabel(metarObservation?.windSpeedKts ?? metarReports[0]?.windSpeedKts ?? null)}
-                </span>
+              <div
+                className="relative z-[1] mt-4 rounded-[22px] border border-white/8 bg-[rgba(8,12,20,0.52)] px-4 py-3"
+                data-home-detail-slot={HOME_DETAIL_SLOT.rawSource}
+              >
+                <div className="eyebrow text-white/36">原始报文已下沉到细看层</div>
+                <div className="mt-2 text-sm leading-6 text-white/62">
+                  {metarRawPreviewCount > 0
+                    ? `最近 ${metarRawPreviewCount} 条 METAR 原文和逐条解释都保留在细看层，首页只留结论摘要。`
+                    : "当前没有可直接回看的原始 METAR 报文，细看层会优先展示最新实况与趋势解释。"}
+                </div>
+                <div className="mt-3 text-xs leading-6 text-white/48">{metarTrendSummary}</div>
               </div>
 
-              <div className="relative z-[1] mt-4 text-sm leading-6 text-white/64">{metarTrendSummary}</div>
-
-              <div className="relative z-[1] mt-4 inline-flex items-center gap-2 text-sm font-medium text-white/82 transition group-hover:text-white">
-                点开看最近 4 小时 METAR 报文
+              <div className="relative z-[1] mt-5 inline-flex items-center gap-2 text-sm font-medium text-white/82 transition group-hover:text-white">
+                点开看逐条解释、趋势判断和完整 METAR 原文
                 <ExternalLink className="h-4 w-4" />
               </div>
             </motion.button>
 
             <motion.button
               type="button"
+              data-home-detail-trigger={HOME_DETAIL_ID.aviationModal}
+              data-home-detail-trigger-kind={HOME_DETAIL_TRIGGER_KIND.taf}
+              data-home-detail-source={HOME_DETAIL_SOURCE.tafSummary}
               whileHover={{ y: -4, scale: 1.006 }}
               whileTap={{ scale: 0.995 }}
               transition={{ duration: 0.2, ease: "easeOut" }}
               onClick={() => setOpenAviationPanel("taf")}
-              className="group relative overflow-hidden rounded-[26px] border border-white/8 bg-[linear-gradient(160deg,rgba(21,24,35,0.95),rgba(12,15,22,0.96))] p-5 text-left"
+              className="group relative flex h-full min-w-0 flex-col overflow-hidden rounded-[26px] border border-white/8 bg-[linear-gradient(160deg,rgba(21,24,35,0.95),rgba(12,15,22,0.96))] p-5 text-left sm:p-6"
             >
               <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(242,183,109,0.12),transparent_38%)] opacity-80" />
 
               <div className="relative z-[1] flex flex-wrap items-start justify-between gap-3">
-                <div>
+                <div className="min-w-0">
                   <div className="eyebrow flex items-center gap-2">
                     <Clock3 className="h-4 w-4 text-[var(--warning)]" />
                     <Cloudy className="h-4 w-4 text-[var(--accent-secondary)]" />
-                    TAF 影响温度
+                    TAF 次级解释
                   </div>
-                  <div className="mt-2 text-lg font-semibold text-white">把专业术语先翻译成“利于升温还是压温”</div>
                 </div>
 
-                <span className="rounded-full border border-white/10 bg-black/20 px-2.5 py-1 text-[11px] text-white/68">
-                  点开看原始 TAF
+                <span
+                  className={`rounded-full border px-2.5 py-1 text-[11px] ${
+                    tafHasTemperatureExtremes
+                      ? "border-[rgba(138,240,194,0.24)] bg-[rgba(138,240,194,0.1)] text-[var(--success)]"
+                      : "border-[rgba(242,183,109,0.24)] bg-[rgba(242,183,109,0.1)] text-[var(--warning)]"
+                  }`}
+                >
+                  {tafHasTemperatureExtremes ? "含 TX/TN" : "无 TX/TN"}
                 </span>
               </div>
 
-              <div className="relative z-[1] mt-5 grid gap-2">
-                {tafImpactItems.map((item) => (
-                  <div key={item.id}>
-                    <AviationImpactCard item={item} compact />
-                  </div>
-                ))}
+              <div
+                className="relative z-[1] mt-5 rounded-[24px] border border-[rgba(242,183,109,0.14)] bg-[rgba(11,15,24,0.56)] px-4 py-4"
+                data-home-detail-slot={HOME_DETAIL_SLOT.summary}
+              >
+                <div className="eyebrow text-white/42">TAF 结论</div>
+                <div className="mt-3 text-[1.05rem] font-semibold leading-7 text-white">{tafPrimary}</div>
+                <div className="mt-2 line-clamp-2 text-sm leading-6 text-white/58">{tafSecondary}</div>
+                <div className="mt-4 rounded-[18px] border border-white/8 bg-black/20 px-4 py-3 text-sm leading-7 text-white/68">
+                  {buildTafTemperatureNotice(tafForecast)}
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
+                    {tafActiveWindowLabel}
+                  </span>
+                  <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
+                    {tafActiveFlightCategory}
+                  </span>
+                  {tafActiveCloudLabel ? (
+                    <span className="data-mono rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
+                      云层 {tafActiveCloudLabel}
+                    </span>
+                  ) : null}
+                  <span className="rounded-full border border-white/10 bg-black/20 px-3 py-1.5 text-xs text-white/68">
+                    天气 {tafWeatherSummaryLabel}
+                  </span>
+                </div>
               </div>
 
-              <div className="relative z-[1] mt-4 text-sm leading-6 text-white/64">
-                {buildTafTemperatureNotice(tafForecast)}
+              <div
+                className="relative z-[1] mt-4 rounded-[22px] border border-white/8 bg-[rgba(8,12,20,0.52)] px-4 py-3"
+                data-home-detail-slot={HOME_DETAIL_SLOT.evidence}
+              >
+                <div className="eyebrow text-white/36">为什么这么看</div>
+                <div className="mt-2 text-sm leading-6 text-white/64">
+                  {tafLeadImpact
+                    ? `${tafLeadImpact.label}：${tafLeadImpact.summary}`
+                    : "变化节点、云层和天气现象解释都已下沉到细看层。"}
+                </div>
+                <div className="mt-3 text-xs leading-6 text-white/48">
+                  {tafPreviewCount > 0
+                    ? `细看层还保留 ${tafPreviewCount} 组变化节点与完整报文，不再在首页展开长解释。`
+                    : "细看层会保留完整 TAF 报文与后续变化节点。"}
+                </div>
               </div>
 
-              <div className="relative z-[1] mt-4 inline-flex items-center gap-2 text-sm font-medium text-white/82 transition group-hover:text-white">
-                点开看变化节点、TX/TN（如有）和完整 TAF
-                <ExternalLink className="h-4 w-4" />
+              <div
+                className="relative z-[1] mt-4 flex flex-wrap items-center justify-between gap-3"
+                data-home-detail-slot={HOME_DETAIL_SLOT.changeList}
+              >
+                <div className="text-xs leading-6 text-white/50">
+                  {tafSidebarExtraCount > 0
+                    ? `展开后还能继续看 ${tafSidebarExtraCount} 条后续变化和完整报文。`
+                    : "点开后可以回看变化节点和完整报文。"}
+                </div>
+
+                <div className="inline-flex items-center gap-2 text-sm font-medium text-white/82 transition group-hover:text-white">
+                  点开看变化节点、TX/TN（如有）和完整 TAF
+                  <ExternalLink className="h-4 w-4" />
+                </div>
               </div>
             </motion.button>
           </div>
         </div>
 
+        <AnimatePresence initial={false}>
+          {!shouldCollapseSecondaryEvidence || showMobileIntradayDetail ? (
+            <motion.div
+              initial={shouldCollapseSecondaryEvidence ? { opacity: 0, height: 0, y: -6 } : false}
+              animate={{ opacity: 1, height: "auto", y: 0 }}
+              exit={{ opacity: 0, height: 0, y: -6 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+              className={shouldCollapseSecondaryEvidence ? "mt-4 overflow-hidden" : undefined}
+            >
         <div id="home-intraday-detail" className="rounded-[28px] border border-white/8 bg-[rgba(255,255,255,0.025)] p-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <div className="eyebrow flex items-center gap-2">
                 <Radar className="h-4 w-4 text-[var(--accent)]" />
-                今天怎么看
+                天气主线 / Alpha 路径
               </div>
               <div className="mt-2 text-lg font-semibold text-white">{intradaySignals.headline}</div>
             </div>
 
-            <StatusPill label={`把握度 ${CONFIDENCE_LABEL[intradaySignals.confidence]}`} tone="good" />
+            <StatusPill label={`Alpha 监测 ${CONFIDENCE_LABEL[intradaySignals.confidence]}`} tone="good" />
           </div>
 
-          <div className="mt-4 grid gap-3 lg:grid-cols-3">
-            <SignalPathCard title="大致判断" body={intradaySignals.baseCase} />
-            <SignalPathCard title="偏高的话" body={intradaySignals.upsideCase} />
-            <SignalPathCard title="偏低的话" body={intradaySignals.downsideCase} />
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            <SignalPathCard title="基准路径" body={intradaySignals.baseCase} />
+            <SignalPathCard title="偏暖路径" body={intradaySignals.upsideCase} />
+            <SignalPathCard title="偏冷路径" body={intradaySignals.downsideCase} />
           </div>
 
-          <div className="mt-4 grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(260px,0.88fr)]">
+          <div className="mt-4 grid gap-3 2xl:grid-cols-[minmax(0,1fr)_minmax(260px,0.88fr)]">
             <div className="rounded-[20px] border border-white/8 bg-black/20 px-4 py-3">
               <div className="eyebrow flex items-center gap-2">
                 <BadgeCheck className="h-4 w-4 text-[var(--success)]" />
                 这次主要参考
               </div>
               <div className="mt-3 space-y-2 text-sm leading-6 text-white/72">
-                {intradaySignals.evidence.slice(0, 3).map((item) => (
+                {detailedEvidence.map((item) => (
                   <div key={item}>• {item}</div>
                 ))}
               </div>
+              {intradaySignals.evidence.length > 2 ? (
+                <button
+                  type="button"
+                  onClick={() => setShowDetailedEvidence((current) => !current)}
+                  className="mt-3 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-white/66 transition hover:border-white/18 hover:bg-white/[0.05] hover:text-white"
+                  aria-expanded={showDetailedEvidence}
+                >
+                  {showDetailedEvidence ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                  {showDetailedEvidence ? "收起证据" : "展开更多证据"}
+                </button>
+              ) : null}
             </div>
 
             <div className="rounded-[20px] border border-white/8 bg-black/20 px-4 py-3">
@@ -2437,7 +3205,17 @@ export const WeatherOverview = ({
             </div>
           </div>
         </div>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+        )}
+        </div>
         {aviationModal}
+        {mobileHourDetailModal}
       </div>
     </section>
   );

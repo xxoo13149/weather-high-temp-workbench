@@ -9,9 +9,14 @@ import { AppError, isAppError } from "./domain/errors.js";
 import type {
   DashboardMetarSnapshot,
   DashboardTafSnapshot,
+  HourlyFieldCoverage,
   HourlyMode,
+  HourlySourceType,
+  HourlyWeatherResponse,
   LocationDirectoryEntry,
   LocationInfo,
+  WeatherReportMetrics,
+  WeatherReportResponse,
   WeatherService,
 } from "./domain/weather.js";
 import { normalizeDashboardMetarSnapshot } from "./domain/weather.js";
@@ -149,6 +154,120 @@ const EMPTY_DASHBOARD_METAR_SNAPSHOT: DashboardMetarSnapshot = normalizeDashboar
 const EMPTY_DASHBOARD_TAF_SNAPSHOT: DashboardTafSnapshot = {
   forecast: null,
   forecasts: [],
+};
+
+const buildEmptyHourlyFieldCoverage = (sourceType: HourlySourceType): HourlyFieldCoverage => ({
+  precipitationProbabilityPct: {
+    availableHours: 0,
+    totalHours: 0,
+    source: sourceType,
+    completeness: "missing",
+    missingReasons: {
+      "source-unpublished": 0,
+      "parser-unrecognized": 0,
+      "fallback-unavailable": 0,
+    },
+  },
+  feelsLikeC: {
+    availableHours: 0,
+    totalHours: 0,
+    source: sourceType,
+    completeness: "missing",
+    missingReasons: {
+      "source-unpublished": 0,
+      "parser-unrecognized": 0,
+      "fallback-unavailable": 0,
+    },
+  },
+  windDirection: {
+    availableHours: 0,
+    totalHours: 0,
+    source: sourceType,
+    completeness: "missing",
+    missingReasons: {
+      "source-unpublished": 0,
+      "parser-unrecognized": 0,
+      "fallback-unavailable": 0,
+    },
+  },
+  mixedSources: [],
+});
+
+const buildDashboardHourlyFallback = (
+  locationId: LocationInfo["id"],
+  mode: HourlyMode,
+  reason: unknown,
+): HourlyWeatherResponse => {
+  const location = LOCATION_REGISTRY[locationId];
+  const sourceType: HourlySourceType = mode === "1h" ? "week-table-1h" : "week-table-3h";
+  const detail = reason instanceof Error ? reason.message : String(reason);
+
+  return {
+    location: {
+      id: location.id,
+      name: location.name,
+      timezone: location.timezone,
+    },
+    fetchedAt: new Date().toISOString(),
+    sourceObservedAt: null,
+    mode,
+    periodHours: mode === "1h" ? 1 : 3,
+    sourceType,
+    stale: true,
+    freshness: "fallback_error",
+    pageUrl: location.weekPageUrl,
+    parserVersion: "unavailable",
+    items: [],
+    fieldCoverage: buildEmptyHourlyFieldCoverage(sourceType),
+    partial: true,
+    warnings: [`Week page hourly data is temporarily unavailable. ${detail}`.trim()],
+    cacheHit: false,
+    current: null,
+  };
+};
+
+const EMPTY_WEATHER_REPORT_METRICS: WeatherReportMetrics = {
+  forecastDayLabel: null,
+  maxTemperatureC: null,
+  uvIndex: null,
+  overnightWindKphMin: null,
+  overnightWindKphMax: null,
+  daytimeWindKphMin: null,
+  daytimeWindKphMax: null,
+  overnightWindDirection: null,
+  daytimeWindDirection: null,
+  confidence: null,
+  predictability: null,
+  predictabilityScore: null,
+};
+
+const buildDashboardReportFallback = (
+  locationId: LocationInfo["id"],
+  reason: unknown,
+): WeatherReportResponse => {
+  const location = LOCATION_REGISTRY[locationId];
+  const detail = reason instanceof Error ? reason.message : String(reason);
+
+  return {
+    location: {
+      id: location.id,
+      name: location.name,
+      timezone: location.timezone,
+    },
+    fetchedAt: new Date().toISOString(),
+    sourceObservedAt: null,
+    stale: true,
+    freshness: "fallback_error",
+    cacheHit: false,
+    pageUrl: location.weekPageUrl,
+    parserVersion: "unavailable",
+    available: false,
+    titleEn: null,
+    sourceTextEn: null,
+    textZh: null,
+    metrics: EMPTY_WEATHER_REPORT_METRICS,
+    warnings: [`Week page weather report is temporarily unavailable. ${detail}`.trim()],
+  };
 };
 
 const staticContentTypes: Record<string, string> = {
@@ -309,13 +428,25 @@ export const createApp = (
     const mode = parseMode(query.mode);
     const limit = parseLimit(query.limit);
 
-    const [hourly, multimodel, report, metar, taf] = await Promise.all([
-      service.getHourly(locationId, mode, limit),
+    const [hourlyResult, multimodel, reportResult, metar, taf] = await Promise.all([
+      service.getHourly(locationId, mode, limit).then(
+        (value) => ({ ok: true as const, value }),
+        (error) => ({ ok: false as const, error }),
+      ),
       service.getMultiModelStatus(locationId),
-      service.getWeatherReport(locationId),
+      service.getWeatherReport(locationId).then(
+        (value) => ({ ok: true as const, value }),
+        (error) => ({ ok: false as const, error }),
+      ),
       loadDashboardMetarSnapshot(service, locationId),
       loadDashboardTafSnapshot(service, locationId),
     ]);
+    const hourly = hourlyResult.ok
+      ? hourlyResult.value
+      : buildDashboardHourlyFallback(locationId, mode, hourlyResult.error);
+    const report = reportResult.ok
+      ? reportResult.value
+      : buildDashboardReportFallback(locationId, reportResult.error);
     const dashboardEnhancements = buildDashboardEnhancements({
       locationId,
       hourly,

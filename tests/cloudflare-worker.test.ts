@@ -1165,6 +1165,112 @@ describe("cloudflare worker kelly routing", () => {
     });
   });
 
+  test("accepts lighter dashboard aviation payloads from the origin without forcing a local fallback", async () => {
+    const proxyUrl = "https://kelly-proxy.example";
+    const env = createEnv({ KELLY_SERVER_BASE_URL: proxyUrl });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          generatedAt: "2026-05-04T04:40:40.631Z",
+          sync: {
+            state: "fresh",
+            freshness: "fresh",
+          },
+          metar: {
+            observation: {
+              stationId: "KMIA",
+              temperatureC: 27,
+              rawReport: "METAR KMIA 040237Z 10008KT 10SM FEW025 27/22 A3004",
+            },
+            recentTemperatures: [
+              {
+                observedAt: "2026-05-04T04:37:00.000Z",
+                temperatureC: 27,
+              },
+            ],
+          },
+          taf: {
+            forecast: {
+              location: {
+                id: "miami_mia",
+                name: "Miami International Airport",
+                timezone: "America/New_York",
+              },
+              stationId: "KMIA",
+              issuedAt: "2026-05-04T02:37:00.000Z",
+              validFrom: "2026-05-04T03:00:00.000Z",
+              validTo: "2026-05-05T06:00:00.000Z",
+              rawTaf: "TAF KMIA 040237Z 0403/0506 VRB04KT P6SM VCSH FEW015 SCT025 BKN060",
+              sourceUrl: "https://example.com/taf",
+              officialSourceUrl: "https://example.com/taf-official",
+              activeForecast: {
+                changeLabel: "BASE",
+                plainEnglish: "VCSH with light cloud cover",
+                timeFrom: "2026-05-04T03:00:00.000Z",
+                timeTo: "2026-05-04T09:00:00.000Z",
+                visibilityKm: 10,
+                clouds: ["FEW015", "SCT025", "BKN060"],
+                windDirectionDegrees: null,
+                windSpeedKts: 4,
+                windGustKts: null,
+                flightCategory: "VFR",
+              },
+              fetchedAt: "2026-05-04T04:40:40.000Z",
+              stale: false,
+              freshness: "fresh",
+              cacheHit: true,
+            },
+            forecasts: [],
+          },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    const worker = await loadWorker();
+    const response = await worker.fetch(
+      new Request("https://lukaluka.fun/api/weather/dashboard?locationId=miami_mia"),
+      env,
+      createContext(),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      metar: {
+        observation: {
+          stationId: "KMIA",
+        },
+        recentTemperatures: [
+          expect.objectContaining({
+            temperatureC: 27,
+          }),
+        ],
+      },
+      taf: {
+        forecast: {
+          stationId: "KMIA",
+          rawTaf: expect.stringContaining("TAF KMIA"),
+          activeForecast: {
+            flightCategory: "VFR",
+          },
+        },
+      },
+    });
+
+    const health = await worker.fetch(new Request("https://lukaluka.fun/healthz"), env, createContext());
+    await expect(health.json()).resolves.toMatchObject({
+      kellyProxy: expect.objectContaining({
+        dashboardCircuitState: "closed",
+        dashboardLastOriginSuccessAt: expect.any(String),
+        dashboardLocalFallbackActive: false,
+      }),
+    });
+  });
+
   test("passes through dashboard responses when METAR is temporarily unavailable upstream", async () => {
     const proxyUrl = "https://kelly-proxy.example";
     const env = createEnv({ KELLY_SERVER_BASE_URL: proxyUrl });
@@ -1607,12 +1713,12 @@ describe("cloudflare worker kelly routing", () => {
     const payload = await response.json();
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(response.headers.get("cache-control")).toContain("s-maxage=90");
     expect(payload).toMatchObject({
       stale: true,
       freshness: "fallback_error",
     });
-    expect(edgeCache.put).not.toHaveBeenCalled();
+    expect(edgeCache.put).toHaveBeenCalledTimes(1);
   });
 
   test("does not edge-cache revalidating multimodel status responses", async () => {
@@ -1657,6 +1763,52 @@ describe("cloudflare worker kelly routing", () => {
     expect(payload).toMatchObject({
       freshness: "revalidating",
       analysisStatus: "revalidating",
+    });
+    expect(edgeCache.put).not.toHaveBeenCalled();
+  });
+
+  test("does not edge-cache unavailable multimodel status responses even if freshness is marked fresh", async () => {
+    const edgeCache = createEdgeCache();
+    vi.stubGlobal("caches", { default: edgeCache });
+    vi.doMock("../src/providers/meteoblue/service.js", () => {
+      class MockMeteoblueWeatherService {
+        async getMultiModelStatus() {
+          return {
+            location: { id: "toronto_yyz", name: "Toronto Pearson International Airport", timezone: "America/Toronto" },
+            displayUnit: "C",
+            fallbackDisplayUnit: "C",
+            pageFetchedAt: null,
+            imageFetchedAt: null,
+            imageUrlFound: false,
+            cacheHit: false,
+            stale: false,
+            freshness: "fresh",
+            imageStatus: "unavailable",
+            analysisStatus: "unavailable",
+            lastError: "cache cold",
+            lastSuccessAt: null,
+            imageUrl: null,
+            pageUrl: "https://example.com/multimodel",
+          };
+        }
+      }
+
+      return { MeteoblueWeatherService: MockMeteoblueWeatherService };
+    });
+
+    const worker = await loadWorker();
+    const response = await worker.fetch(
+      new Request("https://lukaluka.fun/api/weather/multimodel/status?locationId=toronto_yyz"),
+      createEnv(),
+      createContext(),
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(payload).toMatchObject({
+      freshness: "fresh",
+      imageStatus: "unavailable",
+      analysisStatus: "unavailable",
     });
     expect(edgeCache.put).not.toHaveBeenCalled();
   });

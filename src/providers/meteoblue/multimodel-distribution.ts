@@ -78,6 +78,11 @@ export interface MultiModelDistributionCacheValue {
   warnings: string[];
 }
 
+export interface MultiModelDistributionLoaders {
+  loadPageHtml?: (url: string, init?: RequestInit) => Promise<string>;
+  loadHighchartsText?: (url: string, init?: RequestInit) => Promise<string>;
+}
+
 const TEMPERATURE_AXIS_INDEX = 0;
 const modelDisplayNameMap: Record<string, string> = {
   AIFS025: "AIFS 0.25°",
@@ -1071,13 +1076,15 @@ export const buildMultiModelInsightResponse = (
 export const loadMultiModelDistribution = async (
   pageUrl: string,
   timeZone: string,
-  signal?: AbortSignal,
+  loaders: MultiModelDistributionLoaders = {},
   fallbackTemperatureUnit: ParsedTemperatureUnit = "C",
 ): Promise<MultiModelDistributionCacheValue> => {
-  const pageHtml = await fetchText(pageUrl, signal ? { signal } : undefined);
+  const loadPageHtml = loaders.loadPageHtml ?? ((url: string, init?: RequestInit) => fetchText(url, init));
+  const loadHighchartsText = loaders.loadHighchartsText ?? ((url: string, init?: RequestInit) => fetchText(url, init));
+  const pageHtml = await loadPageHtml(pageUrl);
   const pageFetchedAt = new Date().toISOString();
   const highchartsUrl = extractMultiModelHighchartsUrl(pageHtml);
-  const highchartsText = await fetchText(highchartsUrl, signal ? { signal } : undefined);
+  const highchartsText = await loadHighchartsText(highchartsUrl);
   const sourceTemperatureUnit = resolveMultiModelTemperatureUnit(highchartsUrl, fallbackTemperatureUnit);
   const parsedDataset = parseMultiModelHighcharts(highchartsText, timeZone, sourceTemperatureUnit);
   const pageInventory = extractMultiModelPageInventory(pageHtml);

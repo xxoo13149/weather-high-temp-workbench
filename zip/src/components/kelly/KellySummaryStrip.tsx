@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { ActivitySquare, Flag, GaugeCircle, Sparkles } from "lucide-react";
 
 import type { KellySummaryMetric } from "@/lib/kelly";
@@ -20,6 +21,7 @@ const toneClassMap = {
 
 export const KellySummaryStrip = ({ metrics, variant = "main" }: KellySummaryStripProps) => {
   const isSide = variant === "side";
+  const [expandedMetricId, setExpandedMetricId] = useState<string | null>(null);
 
   return (
     <section className={cn("kelly-block kelly-summary-strip", isSide && "kelly-summary-strip--side")}>
@@ -37,21 +39,27 @@ export const KellySummaryStrip = ({ metrics, variant = "main" }: KellySummaryStr
           const tone = metric.tone ?? "neutral";
 
           return (
-            <article
+            <button
+              type="button"
               key={metric.id}
               className={cn(
                 "kelly-summary-strip__item",
                 toneClassMap[tone],
                 isSide && "kelly-summary-strip__item--side",
+                expandedMetricId === metric.id && "is-expanded",
               )}
+              aria-expanded={expandedMetricId === metric.id}
+              onClick={() => setExpandedMetricId((current) => (current === metric.id ? null : metric.id))}
             >
               <div className="kelly-summary-strip__label">
                 <Icon className="h-4 w-4 text-[var(--accent)]" />
                 <span>{metric.label}</span>
               </div>
               <div className="kelly-summary-strip__value data-mono">{metric.value}</div>
-              {metric.detail ? <div className="kelly-summary-strip__detail">{metric.detail}</div> : null}
-            </article>
+              {metric.detail && expandedMetricId === metric.id ? (
+                <div className="kelly-summary-strip__detail">{metric.detail}</div>
+              ) : null}
+            </button>
           );
         })}
       </div>

@@ -4,17 +4,22 @@ import { formatTime } from "./utils";
 
 export const UI_TEXT = {
   app: {
-    loadingEyebrow: "初始化中",
-    loadingTitle: "正在读取天气与多模型数据",
-    loadingDescription: "首次加载会同步小时预报、中文摘要与多模型判断，请稍候。",
+    loadingEyebrow: "全局天气 Alpha 引擎",
+    loadingTitle: "正在同步全球天气错价线索",
+    loadingDescription: "系统会先校准客观天气，再串联小时预报、实况、TAF 与多模型证据，持续寻找全球实时错价。",
     closeRail: "关闭地点侧轨",
   },
   header: {
-    productName: "首页决策台",
+    productName: "天气 Alpha 决策台",
+    philosophyLabel: "系统主线",
+    philosophyCompact: "从客观天气出发，持续搜索全球实时错价与失灵 Alpha",
+    philosophyExpanded: "整个系统的核心理念：从客观天气角度不间断寻找全球实时错价、市场错配、失灵的Alpha机会。",
+    philosophyHint: "先确认天气事实，再寻找价格与市场认知的偏差。",
     synced: "已同步",
     stale: "缓存回退",
-    home: "首页决策台",
-    analysis: "分析工作区",
+    home: "错价总览",
+    analysis: "证据工作区",
+    kelly: "Kelly 执行台",
     refresh: "刷新",
     refreshIdle: "待命",
     refreshPending: "刷新中",
@@ -37,15 +42,15 @@ export const UI_TEXT = {
     unfavorite: "取消收藏",
   },
   weatherOverview: {
-    currentDecision: "当前判断",
+    currentDecision: "天气主判断",
     currentMoment: "当前时刻",
     feelsLike: "体感",
     wind: "风",
     currentPrecipitation: "当前降水",
     currentWind: "当前风速",
     sourcePage: "天气原页",
-    timelineTitle: "24 小时预测轨道",
-    timelineDescription: "轨道展示温度和降水变化，点选小时即可看清当前这一格的细项。",
+    timelineTitle: "当天温度轨道",
+    timelineDescription: "以当地时间展开当天小时温度轨道，先看主线，再点开单小时细项。",
     now: "现在",
     peak: "峰值",
     peakTemperature: "最高温",
@@ -56,16 +61,16 @@ export const UI_TEXT = {
     precipitationProbability: "降水概率",
     apparentTemperature: "体感温度",
     waitingHourlyData: "等待小时数据",
-    summarySyncing: "天气摘要同步中。",
+    summarySyncing: "天气主判断同步中。",
     nowBadge: "现在",
     hiddenAtSource: "该时段未公开",
-    topBandTitle: "当前选中时段",
+    topBandTitle: "当前锚定时段",
     peakWindow: "峰值时段",
   },
   insight: {
-    eyebrow: "多模型快速分析",
-    title: "最接近的前 3 个模型",
-    description: "按当前参考温度筛选最接近的前 3 个模型，只保留结构化判断。",
+    eyebrow: "错价校准",
+    title: "最贴近实况的模型",
+    description: "先用实时参考温度筛出最贴近客观天气的模型，再判断哪些价格与市场预期可能还没跟上。",
     openDetails: "查看详情",
     referenceTemperature: "参考温度",
     calculating: "计算中",
@@ -85,13 +90,13 @@ export const UI_TEXT = {
     peakTemperature: "当日最高温",
     peakWindow: "峰值时段",
     waitingResult: "正在等待多模型快速分析结果。",
-    footer: "首页只展示前 3 个模型，完整排序、分布与资料说明请进入分析工作区。",
+    footer: "这里只保留首页所需的快速错价校准结果；完整排序、分布和模型资料请进入分析工作区。",
     enterAnalysis: "进入分析",
   },
   analysis: {
-    eyebrow: "分析工作区",
-    title: "模型详情与官方原图",
-    description: "这里集中查看完整模型排序、三类分布、模型资料说明与官方原图。",
+    eyebrow: "证据工作区",
+    title: "模型证据与官方原图",
+    description: "这里集中核对模型排序、分布、机构资料与官方原图，用来确认天气判断能否转化成可执行的错价线索。",
     modelsTab: "模型详情",
     imageTab: "官方原图",
     referenceTemperature: "参考温度",
@@ -129,6 +134,7 @@ export const UI_TEXT = {
     predictabilityPrefix: "可信度",
     modelProfile: "模型资料",
     modelProfileHint: "悬停或点击模型，可联动查看机构背景、能力边界、优势局限与运行信息。",
+    modelProfileMobileHint: "点击模型，可联动查看机构背景、能力边界、优势局限与运行信息。",
     profileCoverage: "资料命中",
     dynamicJoinCaption: "动态模型集合会与静态资料表自动 join",
     interactionState: "联动状态",
@@ -178,6 +184,7 @@ export const UI_TEXT = {
     integrityIssue: "检测到模型列表与分布数据不一致，已暂停部分联动高亮。",
     interactionsDisabled: "已暂停部分联动",
     hoverHint: "悬停或点击模型可联动查看",
+    tapHint: "点击模型可联动查看",
     lockedPrefix: "已锁定",
     highlightedPrefix: "已高亮",
     peakPrefix: "峰值",
@@ -298,6 +305,47 @@ const isRequestedTimestampFallbackWarning = (warning: string) => {
   return normalized.includes("requested timestamp was unavailable") && normalized.includes("nearest available timestamp");
 };
 
+const isMeteogramEnrichmentWarning = (warning: string) => {
+  const normalized = normalizeWarning(warning);
+  return (
+    normalized.includes("embedded meteogram enrichment unavailable") &&
+    normalized.includes("using parsed week table data only")
+  );
+};
+
+const isBackgroundRefreshWarning = (warning: string) => {
+  const normalized = normalizeWarning(warning);
+  return normalized.includes("background refresh is in progress") && normalized.includes("showing the most recent cached");
+};
+
+const isStaleFallbackWarning = (warning: string) => {
+  const normalized = normalizeWarning(warning);
+  return normalized.includes("serving stale") && normalized.includes("latest") && normalized.includes("refresh failed");
+};
+
+const isPartialOneHourWindowWarning = (warning: string) => {
+  const normalized = normalizeWarning(warning);
+  return normalized.includes("did not expose a full 24-hour window") && normalized.includes("returned the available hours");
+};
+
+const isMeteogramFallbackWarning = (warning: string) => {
+  const normalized = normalizeWarning(warning);
+  return normalized.includes("1h data fell back to embedded meteogram");
+};
+
+const isWeatherReportFallbackWarning = (warning: string) => {
+  const normalized = normalizeWarning(warning);
+  return (
+    normalized.includes("weather report heading block not found") ||
+    normalized.includes("weather report translation fallback applied")
+  );
+};
+
+const isReferenceTemperatureAssumptionWarning = (warning: string) => {
+  const normalized = normalizeWarning(warning);
+  return normalized.includes("actualtemperaturec was not provided") && normalized.includes("realtime assumption");
+};
+
 const isFieldCoverageWarning = (warning: string) =>
   /^1h (feelslikec|precipitationprobabilitypct|winddirection) missing for \d+\/\d+ hours from source table\.$/i.test(
     warning.trim(),
@@ -319,8 +367,18 @@ const isSevereWarning = (warning: string) => {
   );
 };
 
+const isBenignOperationalWarning = (warning: string) =>
+  isMeteogramEnrichmentWarning(warning) ||
+  isBackgroundRefreshWarning(warning) ||
+  isStaleFallbackWarning(warning) ||
+  isPartialOneHourWindowWarning(warning) ||
+  isMeteogramFallbackWarning(warning) ||
+  isWeatherReportFallbackWarning(warning) ||
+  isReferenceTemperatureAssumptionWarning(warning) ||
+  isFieldCoverageWarning(warning);
+
 const shouldDisplayWarning = (warning: string) =>
-  !isInternalModelParseWarning(warning) && !isFavoritesRouteNoiseWarning(warning);
+  !isInternalModelParseWarning(warning) && !isFavoritesRouteNoiseWarning(warning) && !isBenignOperationalWarning(warning);
 
 const collectWarnings = ({
   dashboardWarnings,
@@ -328,12 +386,14 @@ const collectWarnings = ({
   insightWarnings,
   distributionWarnings,
   suppressRequestedTimestampFallback = false,
+  severeOnly = false,
 }: {
   dashboardWarnings?: string[];
   reportWarnings?: string[];
   insightWarnings?: string[];
   distributionWarnings?: string[];
   suppressRequestedTimestampFallback?: boolean;
+  severeOnly?: boolean;
 }) =>
   Array.from(
     new Set(
@@ -345,6 +405,7 @@ const collectWarnings = ({
       ]
         .filter((warning): warning is string => Boolean(warning) && shouldDisplayWarning(warning))
         .filter((warning) => !(suppressRequestedTimestampFallback && isRequestedTimestampFallbackWarning(warning)))
+        .filter((warning) => !severeOnly || isSevereWarning(warning))
         .map((warning) => translateWarning(warning)),
     ),
   );
@@ -368,6 +429,7 @@ export const collectDisplayWarnings = ({
     insightWarnings,
     distributionWarnings,
     suppressRequestedTimestampFallback,
+    severeOnly: true,
   });
 
 export const collectHomeDisplayWarnings = ({
@@ -383,20 +445,14 @@ export const collectHomeDisplayWarnings = ({
   distributionWarnings?: string[];
   suppressRequestedTimestampFallback?: boolean;
 }) =>
-  Array.from(
-    new Set(
-      [
-        ...(dashboardWarnings ?? []),
-        ...(reportWarnings ?? []),
-        ...(insightWarnings ?? []),
-        ...(distributionWarnings ?? []),
-      ]
-        .filter((warning): warning is string => Boolean(warning) && shouldDisplayWarning(warning))
-        .filter((warning) => !(suppressRequestedTimestampFallback && isRequestedTimestampFallbackWarning(warning)))
-        .filter((warning) => isSevereWarning(warning))
-        .map((warning) => translateWarning(warning)),
-    ),
-  );
+  collectWarnings({
+    dashboardWarnings,
+    reportWarnings,
+    insightWarnings,
+    distributionWarnings,
+    suppressRequestedTimestampFallback,
+    severeOnly: true,
+  });
 
 export const toDecisionSummaryText = (text: string) => {
   const normalized = text.trim();

@@ -72,6 +72,7 @@ import {
   WEEK_PARSER_VERSION,
 } from "./week.js";
 import { loadKellyStageCache } from "../../server/kelly-stage-cache.js";
+import { getKellyPrewarmRuntimeStatus } from "../../server/kelly-prewarm.js";
 
 const KELLY_STREAM_CLIENT_KEEPALIVE_MS = 20_000;
 const KELLY_STREAM_POLLING_INTERVAL_MS = 30_000;
@@ -85,6 +86,8 @@ const METEOBLUE_WEEK_PAGE_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 10_
 const METEOBLUE_WEEK_METEOGRAM_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 10_000);
 const METEOBLUE_WEEK_OPTIONAL_METEOGRAM_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 2_500);
 const METEOBLUE_MULTIMODEL_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 12_000);
+const METEOBLUE_MULTIMODEL_CACHE_LOAD_CONCURRENCY = 4;
+const METEOBLUE_MULTIMODEL_CACHE_SLOT_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 30_000);
 const METEOBLUE_WEEK_CACHE_SLOT_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 20_000);
 const METEOBLUE_WEEK_PAGE_TOTAL_TIMEOUT_MS = METEOBLUE_WEEK_PAGE_LOADER_TIMEOUT_MS + 1_500;
 const METEOBLUE_WEEK_METEOGRAM_TOTAL_TIMEOUT_MS = METEOBLUE_WEEK_METEOGRAM_LOADER_TIMEOUT_MS + 1_500;
@@ -179,6 +182,19 @@ const withWeekCacheLoadSlot = createGlobalLimiter(METEOBLUE_WEEK_CACHE_LOAD_CONC
       503,
       "WEEK_CACHE_LOAD_BUSY",
       `Week cache load queue exceeded ${METEOBLUE_WEEK_CACHE_SLOT_TIMEOUT_MS}ms.`,
+      {
+        retryable: true,
+      },
+    ),
+});
+
+const withMultiModelCacheLoadSlot = createGlobalLimiter(METEOBLUE_MULTIMODEL_CACHE_LOAD_CONCURRENCY, {
+  waitTimeoutMs: METEOBLUE_MULTIMODEL_CACHE_SLOT_TIMEOUT_MS,
+  createTimeoutError: () =>
+    new AppError(
+      503,
+      "MULTIMODEL_CACHE_LOAD_BUSY",
+      `Meteoblue multimodel cache load queue exceeded ${METEOBLUE_MULTIMODEL_CACHE_SLOT_TIMEOUT_MS}ms.`,
       {
         retryable: true,
       },
@@ -828,18 +844,27 @@ const buildFieldCoverage = ({
 const isFallbackErrorFreshness = (freshness: string) => freshness === "fallback_error";
 const isRevalidatingFreshness = (freshness: string) => freshness === "revalidating";
 
-const resolveSnapshotFreshness = <T,>(snapshot: ReturnType<RefreshableCache<T>["peek"]>) =>
-  snapshot.freshness ??
-  (snapshot.entry
-    ? snapshot.lastError
-      ? "fallback_error"
-      : snapshot.inFlight
-        ? "revalidating"
-        : "fresh"
-    : null);
+const isSnapshotMissingOrExpired = <T,>(snapshot: ReturnType<RefreshableCache<T>["peek"]>) =>
+  snapshot.entry === null || snapshot.entry.expiresAt <= Date.now();
+
+const resolveSnapshotFreshness = <T,>(snapshot: ReturnType<RefreshableCache<T>["peek"]>) => {
+  if (!snapshot.entry) {
+    return null;
+  }
+
+  if (snapshot.lastError) {
+    return "fallback_error";
+  }
+
+  if (snapshot.inFlight || snapshot.entry.expiresAt <= Date.now()) {
+    return "revalidating";
+  }
+
+  return "fresh";
+};
 
 const ensureCacheHasEntry = async <T>(cache: RefreshableCache<T>) => {
-  if (cache.peek().entry === null) {
+  if (isSnapshotMissingOrExpired(cache.peek())) {
     try {
       await cache.get({ allowStaleOnError: true });
     } catch {
@@ -1218,6 +1243,7 @@ export class MeteoblueWeatherService implements WeatherService {
         multiModelDistribution: summarizeCacheMap(this.multiModelDistributionCaches),
       },
       kelly: this.getKellyRuntimeHealth(),
+      prewarm: getKellyPrewarmRuntimeStatus(),
     };
   }
 
@@ -1432,23 +1458,48 @@ export class MeteoblueWeatherService implements WeatherService {
     const cache = new RefreshableCache<MultiModelDistributionCacheValue>(
       config.multimodelDistributionTtlMs,
       async () =>
-        await withTimeout(
-          loadMultiModelDistribution(
+        await withMultiModelCacheLoadSlot(async () =>
+          await loadMultiModelDistribution(
             location.multimodelPageUrl,
             location.timezone,
-            createMultiModelLoaderSignal(),
+            {
+              loadPageHtml: async (pageUrl, init) =>
+                await withTimeout(
+                  fetchText(pageUrl, {
+                    ...init,
+                    signal: createMultiModelLoaderSignal(),
+                  }),
+                  METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
+                  () =>
+                    new AppError(
+                      504,
+                      "MULTIMODEL_PAGE_TIMEOUT",
+                      `Meteoblue multimodel page fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
+                      {
+                        retryable: true,
+                      },
+                    ),
+                ),
+              loadHighchartsText: async (highchartsUrl, init) =>
+                await withTimeout(
+                  fetchText(highchartsUrl, {
+                    ...init,
+                    signal: createMultiModelLoaderSignal(),
+                  }),
+                  METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
+                  () =>
+                    new AppError(
+                      504,
+                      "MULTIMODEL_HIGHCHARTS_TIMEOUT",
+                      `Meteoblue multimodel highcharts fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
+                      {
+                        retryable: true,
+                      },
+                    ),
+                ),
+            },
             location.fallbackDisplayUnit,
           ),
-          METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
-          () =>
-            new AppError(
-              504,
-              "MULTIMODEL_LOAD_TIMEOUT",
-              `Meteoblue multimodel data fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
-              {
-                retryable: true,
-              },
-            ),
         ),
     );
     this.multiModelDistributionCaches.set(locationId, cache);
@@ -2100,35 +2151,49 @@ export class MeteoblueWeatherService implements WeatherService {
   async getMultiModelStatus(locationId: LocationInfo["id"]): Promise<MultiModelStatusResponse> {
     const location = this.requireLocation(locationId);
     const distributionCache = this.getMultiModelDistributionCache(locationId);
-    const snapshot = this.getMultiModelImageCache(locationId).peek();
-    const distributionSnapshot = distributionCache.peek();
+    const imageCache = this.getMultiModelImageCache(locationId);
+
+    await ensureCacheHasEntry(distributionCache);
+
+    let snapshot = imageCache.peek();
+    let distributionSnapshot = distributionCache.peek();
+
+    if (isSnapshotMissingOrExpired(snapshot) && (distributionSnapshot.entry?.value.pngUrl ?? null) === null) {
+      await ensureCacheHasEntry(imageCache);
+      snapshot = imageCache.peek();
+      distributionSnapshot = distributionCache.peek();
+    }
+
     const imageInFlight = snapshot.inFlight;
     const analysisInFlight = distributionSnapshot.inFlight;
     const resolvedImageUrl = snapshot.entry?.value.imageUrl ?? distributionSnapshot.entry?.value.pngUrl ?? null;
     const imageUrlFound = resolvedImageUrl !== null;
-    const imageFreshness = resolveSnapshotFreshness(snapshot) ?? (imageInFlight ? "revalidating" : "fresh");
+    const hasRenderableImage = snapshot.entry !== null || imageUrlFound;
+    const hasRenderableAnalysis = distributionSnapshot.entry !== null;
+    const imageFreshness =
+      resolveSnapshotFreshness(snapshot) ?? (hasRenderableImage ? (imageInFlight ? "revalidating" : "fresh") : "revalidating");
     const analysisFreshness =
-      resolveSnapshotFreshness(distributionSnapshot) ?? (analysisInFlight ? "revalidating" : "fresh");
-    const imageStatus = snapshot.entry || imageUrlFound
+      resolveSnapshotFreshness(distributionSnapshot) ??
+      (hasRenderableAnalysis ? (analysisInFlight ? "revalidating" : "fresh") : "revalidating");
+    const imageStatus = hasRenderableImage
       ? imageInFlight
         ? "revalidating"
         : "ready"
       : imageInFlight
         ? "revalidating"
         : "unavailable";
-    const hasAnalysisFallback = analysisFreshness === "fallback_error" && distributionSnapshot.entry !== null;
-    const analysisStatus = hasAnalysisFallback
-      ? "fallback_error"
-      : distributionSnapshot.entry
-        ? analysisInFlight
-          ? "revalidating"
-          : "ready"
-        : analysisInFlight
-          ? "revalidating"
-          : "unavailable";
+    const analysisStatus = hasRenderableAnalysis
+      ? analysisInFlight
+        ? "revalidating"
+        : "ready"
+      : analysisInFlight
+        ? "revalidating"
+        : "unavailable";
     const freshness =
       imageFreshness === "fallback_error" || analysisFreshness === "fallback_error"
         ? "fallback_error"
+        : !hasRenderableImage && !hasRenderableAnalysis
+          ? "revalidating"
         : imageInFlight || analysisInFlight
           ? "revalidating"
           : "fresh";
@@ -2167,6 +2232,7 @@ export class MeteoblueWeatherService implements WeatherService {
     try {
       const result = await this.getMultiModelDistributionCache(locationId).get({
         allowStaleOnError: true,
+        staleWhileRevalidate: true,
       });
       const fallbackOnError = isFallbackErrorFreshness(result.freshness);
       const response = buildMultiModelDistributionResponse(
@@ -2228,6 +2294,7 @@ export class MeteoblueWeatherService implements WeatherService {
     try {
       const result = await this.getMultiModelDistributionCache(locationId).get({
         allowStaleOnError: true,
+        staleWhileRevalidate: true,
       });
       const fallbackOnError = isFallbackErrorFreshness(result.freshness);
       const response = buildMultiModelInsightResponse(

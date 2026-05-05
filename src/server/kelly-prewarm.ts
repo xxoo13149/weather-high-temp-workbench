@@ -1,5 +1,11 @@
 import { LOCATION_DIRECTORY, type LocationId } from "../config.js";
-import type { WeatherService } from "../domain/weather.js";
+import type {
+  KellyPrewarmLastPassStatus,
+  KellyPrewarmPassFailure,
+  KellyPrewarmRuntimeConfig,
+  KellyPrewarmRuntimeStatus,
+  WeatherService,
+} from "../domain/weather.js";
 import { getLocationSourceContract } from "../operational-metadata.js";
 
 type KellyPrewarmLogger = Pick<Console, "info" | "warn" | "error">;
@@ -14,6 +20,80 @@ export interface KellyPrewarmConfig {
   nextDayWarmCount?: number;
   nextDayWarmAfterLocalHour?: number;
 }
+
+const cloneKellyPrewarmRuntimeConfig = (config: KellyPrewarmConfig): KellyPrewarmRuntimeConfig => ({
+  delayMs: config.delayMs,
+  intervalMs: config.intervalMs,
+  concurrency: config.concurrency,
+  locationIds: [...config.locationIds],
+  forceRefreshCount: config.forceRefreshCount ?? DEFAULT_KELLY_PREWARM_FORCE_REFRESH_COUNT,
+  nextDayWarmCount: config.nextDayWarmCount ?? DEFAULT_KELLY_PREWARM_NEXT_DAY_WARM_COUNT,
+  nextDayWarmAfterLocalHour:
+    config.nextDayWarmAfterLocalHour ?? DEFAULT_KELLY_PREWARM_NEXT_DAY_AFTER_LOCAL_HOUR,
+});
+
+const cloneKellyPrewarmPassFailure = (failure: KellyPrewarmPassFailure): KellyPrewarmPassFailure => ({
+  locationId: failure.locationId,
+  error: failure.error,
+});
+
+const cloneKellyPrewarmLastPassStatus = (
+  status: KellyPrewarmLastPassStatus | null,
+): KellyPrewarmLastPassStatus | null =>
+  status
+    ? {
+        passIndex: status.passIndex,
+        startedAt: status.startedAt,
+        completedAt: status.completedAt,
+        durationMs: status.durationMs,
+        total: status.total,
+        succeeded: status.succeeded,
+        failed: status.failed,
+        forceRefreshLocationIds: [...status.forceRefreshLocationIds],
+        nextDayLocationIds: [...status.nextDayLocationIds],
+        failures: status.failures.map(cloneKellyPrewarmPassFailure),
+      }
+    : null;
+
+const cloneKellyPrewarmRuntimeStatus = (
+  status: KellyPrewarmRuntimeStatus | null,
+): KellyPrewarmRuntimeStatus | null =>
+  status
+    ? {
+        state: status.state,
+        enabled: status.enabled,
+        startedAt: status.startedAt,
+        heartbeatAt: status.heartbeatAt,
+        nextScheduledAt: status.nextScheduledAt,
+        inFlight: status.inFlight,
+        config: status.config
+          ? {
+              ...status.config,
+              locationIds: [...status.config.locationIds],
+            }
+          : null,
+        lastPass: cloneKellyPrewarmLastPassStatus(status.lastPass),
+        consecutiveFailurePasses: status.consecutiveFailurePasses,
+        lastCrash: status.lastCrash ? { ...status.lastCrash } : null,
+      }
+    : null;
+
+const resolveScheduledAt = (delayMs: number) => new Date(Date.now() + Math.max(0, delayMs)).toISOString();
+
+let kellyPrewarmRuntimeStatus: KellyPrewarmRuntimeStatus | null = null;
+
+const updateKellyPrewarmRuntimeStatus = (
+  updater: (current: KellyPrewarmRuntimeStatus | null) => KellyPrewarmRuntimeStatus | null,
+) => {
+  kellyPrewarmRuntimeStatus = updater(kellyPrewarmRuntimeStatus);
+};
+
+export const getKellyPrewarmRuntimeStatus = (): KellyPrewarmRuntimeStatus | null =>
+  cloneKellyPrewarmRuntimeStatus(kellyPrewarmRuntimeStatus);
+
+export const resetKellyPrewarmRuntimeStatus = () => {
+  kellyPrewarmRuntimeStatus = null;
+};
 
 const DEFAULT_KELLY_PREWARM_DELAY_MS = 2_000;
 const DEFAULT_KELLY_PREWARM_INTERVAL_MS = 15 * 60_000;
@@ -287,21 +367,24 @@ export const runKellyPrewarmPass = async (
   },
 ) => {
   const getKellyWorkbench = service.getKellyWorkbench;
+  const passIndex = Math.max(0, options?.passIndex ?? 0);
   if (!getKellyWorkbench || !config.enabled || config.locationIds.length === 0) {
     return {
+      passIndex,
       startedAt: new Date().toISOString(),
       completedAt: new Date().toISOString(),
       durationMs: 0,
       total: 0,
       succeeded: 0,
       failed: 0,
-      failures: [] as Array<{ locationId: LocationId; error: string }>,
+      forceRefreshLocationIds: [] as LocationId[],
+      nextDayLocationIds: [] as LocationId[],
+      failures: [] as KellyPrewarmPassFailure[],
     };
   }
 
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
-  const passIndex = Math.max(0, options?.passIndex ?? 0);
   const now = options?.now ?? new Date();
   const { jobs, forceRefreshLocationIds, nextDayLocationIds } = buildKellyPrewarmJobs(config, passIndex, now);
   logger.info("[kelly-prewarm] starting background pass", {
@@ -360,12 +443,15 @@ export const runKellyPrewarmPass = async (
   }
   const completedAt = new Date().toISOString();
   const summary = {
+    passIndex,
     startedAt,
     completedAt,
     durationMs: Date.now() - startedMs,
     total: config.locationIds.length,
     succeeded: config.locationIds.length - failuresByLocation.size,
     failed: failuresByLocation.size,
+    forceRefreshLocationIds,
+    nextDayLocationIds,
     failures: [...failuresByLocation.entries()].map(([locationId, error]) => ({ locationId, error })),
   };
 
@@ -384,7 +470,21 @@ export const startKellyPrewarmLoop = (
   env: NodeJS.ProcessEnv = process.env,
 ) => {
   const config = resolveKellyPrewarmConfig(env);
+  const runtimeConfig = cloneKellyPrewarmRuntimeConfig(config);
+  const loopStartedAt = new Date().toISOString();
   if (!config.enabled) {
+    updateKellyPrewarmRuntimeStatus(() => ({
+      state: "disabled",
+      enabled: false,
+      startedAt: loopStartedAt,
+      heartbeatAt: loopStartedAt,
+      nextScheduledAt: null,
+      inFlight: false,
+      config: runtimeConfig,
+      lastPass: null,
+      consecutiveFailurePasses: 0,
+      lastCrash: null,
+    }));
     logger.info("[kelly-prewarm] disabled by env");
     return {
       stop() {},
@@ -393,6 +493,18 @@ export const startKellyPrewarmLoop = (
   }
 
   if (!service.getKellyWorkbench || config.locationIds.length === 0) {
+    updateKellyPrewarmRuntimeStatus(() => ({
+      state: "skipped",
+      enabled: true,
+      startedAt: loopStartedAt,
+      heartbeatAt: loopStartedAt,
+      nextScheduledAt: null,
+      inFlight: false,
+      config: runtimeConfig,
+      lastPass: null,
+      consecutiveFailurePasses: 0,
+      lastCrash: null,
+    }));
     logger.warn("[kelly-prewarm] skipped because no eligible locations are configured");
     return {
       stop() {},
@@ -405,10 +517,33 @@ export const startKellyPrewarmLoop = (
   let inFlight = false;
   let passIndex = 0;
 
+  updateKellyPrewarmRuntimeStatus(() => ({
+    state: "scheduled",
+    enabled: true,
+    startedAt: loopStartedAt,
+    heartbeatAt: loopStartedAt,
+    nextScheduledAt: resolveScheduledAt(config.delayMs),
+    inFlight: false,
+    config: runtimeConfig,
+    lastPass: null,
+    consecutiveFailurePasses: 0,
+    lastCrash: null,
+  }));
+
   const schedule = (delayMs: number) => {
     if (stopped) {
       return;
     }
+
+    updateKellyPrewarmRuntimeStatus((current) =>
+      current
+        ? {
+            ...current,
+            state: "scheduled",
+            nextScheduledAt: resolveScheduledAt(delayMs),
+          }
+        : current,
+    );
 
     timerId = setTimeout(async () => {
       timerId = null;
@@ -420,15 +555,69 @@ export const startKellyPrewarmLoop = (
       }
 
       inFlight = true;
+      const passStartedAt = new Date().toISOString();
+      updateKellyPrewarmRuntimeStatus((current) =>
+        current
+          ? {
+              ...current,
+              state: "running",
+              inFlight: true,
+              heartbeatAt: passStartedAt,
+              nextScheduledAt: null,
+            }
+          : current,
+      );
       try {
-        await runKellyPrewarmPass(service, config, logger, {
+        const summary = await runKellyPrewarmPass(service, config, logger, {
           passIndex,
         });
+        const lastPass: KellyPrewarmLastPassStatus = {
+          passIndex: summary.passIndex,
+          startedAt: summary.startedAt,
+          completedAt: summary.completedAt,
+          durationMs: summary.durationMs,
+          total: summary.total,
+          succeeded: summary.succeeded,
+          failed: summary.failed,
+          forceRefreshLocationIds: [...summary.forceRefreshLocationIds],
+          nextDayLocationIds: [...summary.nextDayLocationIds],
+          failures: summary.failures.map(cloneKellyPrewarmPassFailure),
+        };
+        updateKellyPrewarmRuntimeStatus((current) =>
+          current
+            ? {
+                ...current,
+                state: config.intervalMs > 0 ? "scheduled" : "idle",
+                inFlight: false,
+                heartbeatAt: summary.completedAt,
+                lastPass,
+                consecutiveFailurePasses: summary.failed > 0 ? current.consecutiveFailurePasses + 1 : 0,
+                lastCrash: null,
+              }
+            : current,
+        );
         passIndex += 1;
       } catch (error) {
+        const crashAt = new Date().toISOString();
+        const crashMessage = error instanceof Error ? error.message : String(error);
         logger.error("[kelly-prewarm] background pass crashed", {
-          error: error instanceof Error ? error.message : String(error),
+          error: crashMessage,
         });
+        updateKellyPrewarmRuntimeStatus((current) =>
+          current
+            ? {
+                ...current,
+                state: config.intervalMs > 0 ? "scheduled" : "idle",
+                inFlight: false,
+                heartbeatAt: crashAt,
+                consecutiveFailurePasses: current.consecutiveFailurePasses + 1,
+                lastCrash: {
+                  at: crashAt,
+                  error: crashMessage,
+                },
+              }
+            : current,
+        );
       } finally {
         inFlight = false;
         if (!stopped && config.intervalMs > 0) {
@@ -447,6 +636,16 @@ export const startKellyPrewarmLoop = (
         clearTimeout(timerId);
         timerId = null;
       }
+      updateKellyPrewarmRuntimeStatus((current) =>
+        current
+          ? {
+              ...current,
+              state: "stopped",
+              inFlight: false,
+              nextScheduledAt: null,
+            }
+          : current,
+      );
     },
     config,
   };

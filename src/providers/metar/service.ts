@@ -284,7 +284,7 @@ const toRecentReports = (reports: MetarRecentReport[], recentHours = DASHBOARD_R
   }
 
   const cutoffTime = latestTime - recentHours * 60 * 60 * 1000;
-  return reports.filter((entry) => Date.parse(entry.observedAt) >= cutoffTime);
+  return reports.filter((entry) => Date.parse(entry.observedAt) >= cutoffTime).slice(0, 4);
 };
 
 const toRecentReportFromCache = (stationId: string, cached: CachedMetarRow): MetarRecentReport => ({

@@ -69,6 +69,15 @@ describe("weatherApi", () => {
     );
   });
 
+  test("treats signal aborted without reason as an abort-like cancellation", async () => {
+    const apiModulePath = new URL("../zip/src/api.ts", import.meta.url).href;
+    const { isAbortLikeError } = (await import(apiModulePath)) as {
+      isAbortLikeError: (error: unknown) => boolean;
+    };
+
+    expect(isAbortLikeError(new Error("signal is aborted without reason"))).toBe(true);
+  });
+
   test("builds Kelly endpoint requests with route controls", async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValue(

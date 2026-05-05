@@ -1,5 +1,5 @@
 import { Globe2, MapPinned, Pin, Search, Star, X } from "lucide-react";
-import { Fragment, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type MutableRefObject, type RefObject, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import type { DockLocation, DockLocationGroup } from "../types";
@@ -201,6 +201,7 @@ const PickerLocationCard = ({
         type="button"
         onClick={() => onToggleFavorite(location.id)}
         disabled={favoritePending}
+        aria-pressed={location.isFavorite}
         aria-label={location.isFavorite ? "取消收藏" : "收藏"}
         className="location-picker-favorite"
       >
@@ -221,9 +222,11 @@ export const LocationRail = ({
   onSelect,
   onToggleFavorite,
   favoritePendingIds,
-  error,
+  favoriteError,
   onDismiss,
   onExpand,
+  returnFocusRef,
+  restoreFocusOnCloseRef,
 }: {
   mobile?: boolean;
   expanded: boolean;
@@ -235,9 +238,11 @@ export const LocationRail = ({
   onSelect: (id: string) => void;
   onToggleFavorite: (id: string) => void;
   favoritePendingIds: string[];
-  error: string | null;
+  favoriteError: string | null;
   onDismiss: () => void;
   onExpand: () => void;
+  returnFocusRef?: RefObject<HTMLButtonElement | null>;
+  restoreFocusOnCloseRef?: MutableRefObject<boolean>;
 }) => {
   const [pickerView, setPickerView] = useState<PickerView>("common");
   const [searchQuery, setSearchQuery] = useState("");
@@ -343,6 +348,7 @@ export const LocationRail = ({
       )
       .map((entry) => entry.location);
   }, [activeGroup, activeId, allLocations, deferredSearchQuery]);
+  const activeLocationFavoritePending = activeLocation ? favoritePendingIds.includes(activeLocation.id) : false;
 
   const commonSections = useMemo(
     () => [
@@ -367,6 +373,18 @@ export const LocationRail = ({
     ],
     [activeGroup, activeLocation, currentGroupItems, favoriteLocations],
   );
+  const favoritePickerItems = useMemo(
+    () => dedupeLocations([activeLocation?.isFavorite ? activeLocation : null, ...favoriteLocations]),
+    [activeLocation, favoriteLocations],
+  );
+  const mobileCommonItems = useMemo(
+    () => dedupeLocations([...favoriteLocations, ...quickAccessLocations]).slice(0, 10),
+    [favoriteLocations, quickAccessLocations],
+  );
+  const mobileGroupItems = useMemo(() => {
+    const nextItems = currentGroupItems.filter((location) => location.id !== activeId);
+    return nextItems.length > 0 ? nextItems : currentGroupItems;
+  }, [activeId, currentGroupItems]);
 
   const groupPanelTitle = useMemo(() => {
     if (deferredSearchQuery) {
@@ -399,11 +417,77 @@ export const LocationRail = ({
 
     return "把当前城市、收藏地点和当前分组放在一屏里，先命中最常用的入口。";
   }, [activeGroup, deferredSearchQuery, pickerView]);
+  const mobileResultTitle = useMemo(() => {
+    if (deferredSearchQuery) {
+      return "搜索结果";
+    }
+
+    if (pickerView === "favorites") {
+      return "收藏地点";
+    }
+
+    if (pickerView === "group") {
+      return resolveGroupLongLabel(activeGroup);
+    }
+
+    return "收藏与常用";
+  }, [activeGroup, deferredSearchQuery, pickerView]);
+  const mobileResultCopy = useMemo(() => {
+    if (deferredSearchQuery) {
+      return "搜索优先展示最可能命中的地点，清空后会回到单手入口。";
+    }
+
+    if (pickerView === "favorites") {
+      return favoriteLocations.length
+        ? "把高频地点收在首屏，切换时不需要再回到桌面式双栏。"
+        : "还没有额外收藏地点，先从下方城市卡片里点亮星标。";
+    }
+
+    if (pickerView === "group") {
+      return `${resolveGroupDescription(activeGroup)} 当前分组会继续留在同一条滚动流里。`;
+    }
+
+    return "先看收藏，再从当前分组的常用地点里就近切到下一个城市。";
+  }, [activeGroup, deferredSearchQuery, favoriteLocations.length, pickerView]);
+  const mobileResultItems = useMemo(() => {
+    if (deferredSearchQuery) {
+      return filteredLocations;
+    }
+
+    if (pickerView === "favorites") {
+      return favoritePickerItems;
+    }
+
+    if (pickerView === "group") {
+      return mobileGroupItems;
+    }
+
+    return mobileCommonItems;
+  }, [deferredSearchQuery, favoritePickerItems, filteredLocations, mobileCommonItems, mobileGroupItems, pickerView]);
 
   useEffect(() => {
     if (!expanded) {
       setPickerView("common");
       setSearchQuery("");
+
+      if (!mobile || !restoreFocusOnCloseRef?.current) {
+        return;
+      }
+
+      restoreFocusOnCloseRef.current = false;
+      const trigger = returnFocusRef?.current;
+      if (!trigger) {
+        return;
+      }
+
+      const frameId = window.requestAnimationFrame(() => {
+        trigger.focus();
+      });
+
+      return () => window.cancelAnimationFrame(frameId);
+    }
+
+    if (mobile) {
       return;
     }
 
@@ -412,7 +496,11 @@ export const LocationRail = ({
     });
 
     return () => window.cancelAnimationFrame(frameId);
-  }, [expanded]);
+  }, [expanded, mobile, restoreFocusOnCloseRef, returnFocusRef]);
+
+  const focusSearchInput = () => {
+    searchInputRef.current?.focus();
+  };
 
   const renderSectionGrid = (items: DockLocation[]) => {
     if (!items.length) {
@@ -443,6 +531,121 @@ export const LocationRail = ({
     );
   };
 
+  const searchField = (
+    <label className="location-rail-search">
+      <Search className="h-4 w-4 text-[var(--accent)]" />
+      <input
+        ref={searchInputRef}
+        type="search"
+        value={searchQuery}
+        onChange={(event) => setSearchQuery(event.target.value)}
+        placeholder={RAIL_TEXT.searchPlaceholder}
+        aria-label={RAIL_TEXT.searchPlaceholder}
+      />
+    </label>
+  );
+  const activeLocationAnchor = activeLocation ? (
+    <div className="location-rail-anchor location-rail-anchor-static">
+      <div className="location-rail-anchor-head">
+        <span className="eyebrow">{RAIL_TEXT.currentLocation}</span>
+        <span className="data-mono location-rail-anchor-temp">
+          {formatTemperature(activeLocation.temp, activeLocation.displayUnit)}
+        </span>
+      </div>
+      <div className="location-rail-anchor-title">{activeLocation.cityName}</div>
+      <div className="location-rail-anchor-copy">{activeLocation.displayNameZh}</div>
+      <div className="location-rail-anchor-meta">
+        <span className="location-code-pill">{activeLocation.code}</span>
+        <StatusBadges isActive isPending={pendingId === activeLocation.id} isFavorite={activeLocation.isFavorite} />
+        <button
+          type="button"
+          onClick={() => onToggleFavorite(activeLocation.id)}
+          disabled={activeLocationFavoritePending}
+          aria-pressed={activeLocation.isFavorite}
+          aria-label={activeLocation.isFavorite ? "取消收藏" : "收藏"}
+          className="location-rail-anchor-favorite"
+        >
+          <Star
+            className={`h-4 w-4 ${activeLocation.isFavorite ? "fill-[var(--warning)] text-[var(--warning)]" : "text-white/58"}`}
+          />
+        </button>
+      </div>
+    </div>
+  ) : null;
+  const favoriteErrorMessage = favoriteError ? (
+    <div className="location-rail-error" aria-live="polite">
+      {favoriteError}
+    </div>
+  ) : null;
+  const groupButtons = groups.map((group) => {
+    const active = !deferredSearchQuery && pickerView === "group" && group.group === activeGroup;
+
+    return (
+      <button
+        key={group.group}
+        type="button"
+        onClick={() => {
+          setSearchQuery("");
+          setPickerView("group");
+          onGroupChange(group.group);
+        }}
+        className={`location-rail-group-panel-button ${active ? "is-active" : ""}`}
+        aria-pressed={active}
+      >
+        <span className="location-rail-group-panel-head">
+          <span>{resolveGroupLongLabel(group.group)}</span>
+          <span className="data-mono">{group.items.length}</span>
+        </span>
+        <span className="location-rail-group-panel-copy">{resolveGroupDescription(group.group)}</span>
+      </button>
+    );
+  });
+  const mobileViewSwitch = (
+    <div className="location-rail-view-switch location-rail-view-switch-mobile">
+      <button
+        type="button"
+        className={`location-rail-view-button ${pickerView === "common" && !deferredSearchQuery ? "is-active" : ""}`}
+        aria-pressed={pickerView === "common" && !deferredSearchQuery}
+        onClick={() => {
+          setSearchQuery("");
+          setPickerView("common");
+        }}
+      >
+        常用
+      </button>
+
+      <button
+        type="button"
+        className={`location-rail-view-button ${pickerView === "favorites" && !deferredSearchQuery ? "is-active" : ""}`}
+        aria-pressed={pickerView === "favorites" && !deferredSearchQuery}
+        onClick={() => {
+          setSearchQuery("");
+          setPickerView("favorites");
+        }}
+      >
+        收藏
+      </button>
+
+      <button
+        type="button"
+        className={`location-rail-view-button ${pickerView === "group" && !deferredSearchQuery ? "is-active" : ""}`}
+        aria-pressed={pickerView === "group" && !deferredSearchQuery}
+        onClick={() => {
+          setSearchQuery("");
+          setPickerView("group");
+        }}
+      >
+        分组
+      </button>
+    </div>
+  );
+  const mobileStickyControls = (
+    <div className="location-rail-mobile-sticky-band">
+      {searchField}
+      {mobileViewSwitch}
+    </div>
+  );
+
   const pickerShell = (
     <div className="panel-section location-rail-picker-shell">
       <div className="location-rail-canvas-header">
@@ -464,38 +667,9 @@ export const LocationRail = ({
 
       <div className="location-rail-picker-layout">
         <div className="location-rail-picker-sidebar">
-          <label className="location-rail-search">
-            <Search className="h-4 w-4 text-[var(--accent)]" />
-            <input
-              ref={searchInputRef}
-              type="search"
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
-              placeholder={RAIL_TEXT.searchPlaceholder}
-              aria-label={RAIL_TEXT.searchPlaceholder}
-            />
-          </label>
+          {searchField}
 
-          {activeLocation ? (
-            <div className="location-rail-anchor location-rail-anchor-static">
-              <div className="location-rail-anchor-head">
-                <span className="eyebrow">{RAIL_TEXT.currentLocation}</span>
-                <span className="data-mono location-rail-anchor-temp">
-                  {formatTemperature(activeLocation.temp, activeLocation.displayUnit)}
-                </span>
-              </div>
-              <div className="location-rail-anchor-title">{activeLocation.cityName}</div>
-              <div className="location-rail-anchor-copy">{activeLocation.displayNameZh}</div>
-              <div className="location-rail-anchor-meta">
-                <span className="location-code-pill">{activeLocation.code}</span>
-                <StatusBadges
-                  isActive
-                  isPending={pendingId === activeLocation.id}
-                  isFavorite={activeLocation.isFavorite}
-                />
-              </div>
-            </div>
-          ) : null}
+          {activeLocationAnchor}
 
           <div className="location-rail-view-switch">
             <button
@@ -524,32 +698,10 @@ export const LocationRail = ({
           </div>
 
           <div className="location-rail-group-list">
-            {groups.map((group) => {
-              const active = !deferredSearchQuery && pickerView === "group" && group.group === activeGroup;
-
-              return (
-                <button
-                  key={group.group}
-                  type="button"
-                  onClick={() => {
-                    setSearchQuery("");
-                    setPickerView("group");
-                    onGroupChange(group.group);
-                  }}
-                  className={`location-rail-group-panel-button ${active ? "is-active" : ""}`}
-                  aria-pressed={active}
-                >
-                  <span className="location-rail-group-panel-head">
-                    <span>{resolveGroupLongLabel(group.group)}</span>
-                    <span className="data-mono">{group.items.length}</span>
-                  </span>
-                  <span className="location-rail-group-panel-copy">{resolveGroupDescription(group.group)}</span>
-                </button>
-              );
-            })}
+            {groupButtons}
           </div>
 
-          {error ? <div className="location-rail-error">{error}</div> : null}
+          {favoriteErrorMessage}
         </div>
 
         <div className="location-rail-picker-main">
@@ -573,7 +725,7 @@ export const LocationRail = ({
             {deferredSearchQuery ? (
               renderSectionGrid(filteredLocations)
             ) : pickerView === "favorites" ? (
-              renderSectionGrid(dedupeLocations([activeLocation?.isFavorite ? activeLocation : null, ...favoriteLocations]))
+              renderSectionGrid(favoritePickerItems)
             ) : pickerView === "group" ? (
               renderSectionGrid(currentGroupItems)
             ) : (
@@ -597,6 +749,94 @@ export const LocationRail = ({
       </div>
     </div>
   );
+  const mobilePickerShell = (
+    <div className="panel-section location-rail-picker-shell location-rail-picker-shell-mobile">
+      <div className="location-rail-canvas-header">
+        <div>
+          <div className="eyebrow flex items-center gap-2">
+            <MapPinned className="h-4 w-4 text-[var(--accent)]" />
+            城市选择器
+          </div>
+          <h2 className="location-rail-canvas-title">单手切到下一个地点</h2>
+          <p className="location-rail-canvas-copy">
+            搜索优先，当前地点、收藏与分组入口保持在一条连续滚动流里。
+          </p>
+        </div>
+
+        <button type="button" className="location-rail-close-button" onClick={onDismiss} aria-label={RAIL_TEXT.closeRail}>
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className="location-rail-mobile-flow scrollbar-terminal">
+        {mobileStickyControls}
+        {activeLocationAnchor}
+        {favoriteErrorMessage}
+
+        {deferredSearchQuery ? (
+          <section className="location-rail-mobile-section location-rail-mobile-section--results">
+            <div className="location-rail-mobile-section-head">
+              <div className="location-rail-mobile-section-copy">
+                <div className="eyebrow">搜索命中</div>
+                <h3>{mobileResultTitle}</h3>
+                <p>{mobileResultCopy}</p>
+              </div>
+              <span className="location-rail-mobile-section-meta">{mobileResultItems.length} 个地点</span>
+            </div>
+            {renderSectionGrid(mobileResultItems)}
+          </section>
+        ) : (
+          <>
+            <section className="location-rail-mobile-section">
+              <div className="location-rail-mobile-section-head">
+                <div className="location-rail-mobile-section-copy">
+                  <div className="eyebrow">{pickerView === "group" ? "分组浏览" : "收藏 / 常用"}</div>
+                  <h3>{pickerView === "favorites" ? "收藏地点" : pickerView === "group" ? "先选分组入口" : "收藏与常用"}</h3>
+                  <p>
+                    {pickerView === "favorites"
+                      ? mobileResultCopy
+                      : pickerView === "group"
+                        ? "先选一个分组入口，再在下方继续筛选地点。"
+                        : mobileResultCopy}
+                  </p>
+                </div>
+              </div>
+              {pickerView === "group" ? null : renderSectionGrid(mobileResultItems)}
+            </section>
+
+            <section className="location-rail-mobile-section location-rail-mobile-section--group-entry">
+              <div className="location-rail-mobile-section-head">
+                <div className="location-rail-mobile-section-copy">
+                  <div className="eyebrow">分组入口</div>
+                  <h3>{pickerView === "group" ? `${resolveGroupLongLabel(activeGroup)} 快切` : "按时区分组切换"}</h3>
+                  <p>
+                    {pickerView === "group"
+                      ? resolveGroupDescription(activeGroup)
+                      : "只保留最常用的分组入口，不再把整块桌面侧栏硬塞进手机 sheet。"}
+                  </p>
+                </div>
+              </div>
+              <div className="location-rail-group-list location-rail-group-list-mobile">{groupButtons}</div>
+            </section>
+
+            {pickerView === "group" ? (
+              <section className="location-rail-mobile-section location-rail-mobile-section--results">
+                <div className="location-rail-mobile-section-head">
+                  <div className="location-rail-mobile-section-copy">
+                    <div className="eyebrow">{resolveGroupLongLabel(activeGroup)} 分组</div>
+                    <h3>{mobileResultTitle}</h3>
+                    <p>{mobileResultCopy}</p>
+                  </div>
+                  <span className="location-rail-mobile-section-meta">{mobileResultItems.length} 个地点</span>
+                </div>
+                {renderSectionGrid(mobileResultItems)}
+              </section>
+            ) : null}
+          </>
+        )}
+      </div>
+    </div>
+  );
 
   if (mobile) {
     if (!expanded) {
@@ -613,11 +853,23 @@ export const LocationRail = ({
         }}
       >
         <SheetContent
+          id="mobile-location-rail-sheet"
           side="bottom"
           className="location-rail-mobile-sheet max-h-[min(92svh,920px)] overflow-hidden p-0 [&>button]:hidden"
           aria-label={RAIL_TEXT.ariaLabel}
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            focusSearchInput();
+          }}
+          onCloseAutoFocus={(event) => {
+            if (!restoreFocusOnCloseRef?.current) {
+              return;
+            }
+
+            event.preventDefault();
+          }}
         >
-          <div className="location-rail-canvas location-rail-canvas-mobile">{pickerShell}</div>
+          <div className="location-rail-canvas location-rail-canvas-mobile">{mobilePickerShell}</div>
         </SheetContent>
       </Sheet>
     );

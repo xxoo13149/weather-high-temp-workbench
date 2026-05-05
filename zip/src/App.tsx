@@ -1,6 +1,6 @@
 import { lazy, startTransition, Suspense, useEffect, useMemo, useRef, useState } from "react";
 
-import { getErrorMessage, weatherApi } from "./api";
+import { getErrorMessage, isAbortLikeError, weatherApi } from "./api";
 import { CommandHeader } from "./components/CommandHeader";
 import { HomeReferenceCard } from "./components/HomeReferenceCard";
 import { InsightCard } from "./components/InsightCard";
@@ -13,6 +13,7 @@ const LazyAnalysisWorkspace = lazy(() =>
 );
 const LazyKellyWorkbench = lazy(() => import("./components/KellyWorkbench").then((mod) => ({ default: mod.KellyWorkbench })));
 import { CONFIG } from "./config";
+import { detectShellMobileLayout, observeShellMobileLayout } from "./layout";
 import {
   UI_TEXT,
   buildPeakSummary,
@@ -109,7 +110,6 @@ type ParsedKellyDraftControls = {
 const KELLY_DEFAULT_BANKROLL = 1000;
 const KELLY_DEFAULT_MIN_EDGE = 0.02;
 const SILENT_REFRESH_STALE_MS = 10 * 60 * 1000;
-const MOBILE_LAYOUT_MEDIA_QUERY = "(max-width: 900px)";
 const DASHBOARD_WARM_CACHE_TTL_MS = SILENT_REFRESH_STALE_MS;
 const DASHBOARD_PREWARM_CONCURRENCY = 2;
 const LOCATION_PREWARM_DELAY_MS = 180;
@@ -119,10 +119,31 @@ const ENABLE_KELLY_DATE_WARM = false;
 const KELLY_STREAM_RECONNECT_BASE_MS = 1_500;
 const KELLY_STREAM_RECONNECT_MAX_MS = 12_000;
 const SHARED_IN_FLIGHT_STALE_MS = 15_000;
+const ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS = 20_000;
 const DASHBOARD_SNAPSHOT_CLIENT_TIMEOUT_MS = 20_000;
 const KELLY_SNAPSHOT_CLIENT_TIMEOUT_MS = 20_000;
 const KELLY_FOCUS_RECOVERY_STALE_MS = 20_000;
 const KELLY_FOCUS_RECOVERY_COOLDOWN_MS = 1_500;
+const MOBILE_RAIL_HISTORY_KEY = "__weatherMobileRail";
+
+const hasMobileRailHistoryState = (state: unknown) =>
+  Boolean(state && typeof state === "object" && (state as Record<string, unknown>)[MOBILE_RAIL_HISTORY_KEY] === true);
+
+const withMobileRailHistoryState = (state: unknown) => ({
+  ...(state && typeof state === "object" ? (state as Record<string, unknown>) : {}),
+  [MOBILE_RAIL_HISTORY_KEY]: true,
+});
+
+const withoutMobileRailHistoryState = (state: unknown) => {
+  if (!state || typeof state !== "object") {
+    return null;
+  }
+
+  const nextState = { ...(state as Record<string, unknown>) };
+  delete nextState[MOBILE_RAIL_HISTORY_KEY];
+  return Object.keys(nextState).length > 0 ? nextState : null;
+};
+
 const parseNumber = (value: string | null) => {
   if (!value) {
     return null;
@@ -133,11 +154,6 @@ const parseNumber = (value: string | null) => {
 };
 
 const formatKellyMinEdgeInput = (minEdge: number) => (minEdge * 100).toFixed(1);
-
-const detectMobileLayout = () =>
-  typeof window !== "undefined" && typeof window.matchMedia === "function"
-    ? window.matchMedia(MOBILE_LAYOUT_MEDIA_QUERY).matches
-    : false;
 
 const buildKellyDraftFromRoute = (
   state: Pick<RouteState, "bankroll" | "minEdge" | "riskMode" | "kellyActualTemperatureC">,
@@ -624,7 +640,7 @@ export default function App() {
   const [kellyDraftControls, setKellyDraftControls] = useState(() => buildKellyDraftFromRoute(routeState));
 
   const [railExpanded, setRailExpanded] = useState(false);
-  const [isMobileLayout, setIsMobileLayout] = useState(detectMobileLayout);
+  const [isMobileLayout, setIsMobileLayout] = useState(detectShellMobileLayout);
   const [browsingTimezoneGroup, setBrowsingTimezoneGroup] = useState<TimezoneGroup | null>(null);
   const [manualTemperatureText, setManualTemperatureText] = useState(initialManualTemperatureText);
   const [referenceTemperatureMode, setReferenceTemperatureMode] = useState<"default" | "manual">(
@@ -663,6 +679,7 @@ export default function App() {
   const locationTransitionSeqRef = useRef(0);
   const dashboardRequestSeqRef = useRef(0);
   const railScrollLockYRef = useRef(0);
+  const previousMobileLayoutRef = useRef(isMobileLayout);
   const transitionDashboardAbortRef = useRef<AbortController | null>(null);
   const refreshDashboardAbortRef = useRef<AbortController | null>(null);
   const insightAbortRef = useRef<AbortController | null>(null);
@@ -684,6 +701,8 @@ export default function App() {
   const dashboardWarmInFlightRef = useRef<Map<string, InFlightEntry<DashboardViewModel>>>(
     new Map<string, InFlightEntry<DashboardViewModel>>(),
   );
+  const mobileRailTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const mobileRailFocusRestoreRef = useRef(false);
   const insightWarmCacheRef = useRef<Map<string, WarmCacheEntry<InsightViewModel>>>(
     new Map<string, WarmCacheEntry<InsightViewModel>>(),
   );
@@ -722,6 +741,11 @@ export default function App() {
   routeStateRef.current = routeState;
   const dashboardRef = useRef<DashboardViewModel | null>(dashboard);
   dashboardRef.current = dashboard;
+  const railExpandedRef = useRef(railExpanded);
+  railExpandedRef.current = railExpanded;
+  const mobileLayoutRef = useRef(isMobileLayout);
+  mobileLayoutRef.current = isMobileLayout;
+  const desktopRailExpanded = railExpanded && !isMobileLayout;
   analysisRuntimeRef.current = {
     routeLocationId: routeState.locationId,
     routePath: routeState.path,
@@ -827,8 +851,59 @@ export default function App() {
     }
   };
 
+  const stripMobileRailHistoryState = () => {
+    if (!hasMobileRailHistoryState(window.history.state)) {
+      return;
+    }
+
+    window.history.replaceState(withoutMobileRailHistoryState(window.history.state), "", window.location.href);
+  };
+
+  const collapseRail = (mode: "dismiss" | "programmatic" = "programmatic") => {
+    if (!mobileLayoutRef.current) {
+      mobileRailFocusRestoreRef.current = false;
+      setRailExpanded(false);
+      return;
+    }
+
+    mobileRailFocusRestoreRef.current = mode === "dismiss" && railExpandedRef.current;
+    const hasHistoryEntry = hasMobileRailHistoryState(window.history.state);
+    if (mode === "dismiss" && railExpandedRef.current && hasHistoryEntry) {
+      window.history.back();
+      return;
+    }
+
+    if (hasHistoryEntry) {
+      stripMobileRailHistoryState();
+    }
+
+    setRailExpanded(false);
+  };
+
+  const expandRail = () => {
+    if (railExpandedRef.current) {
+      return;
+    }
+
+    mobileRailFocusRestoreRef.current = false;
+    if (mobileLayoutRef.current && !hasMobileRailHistoryState(window.history.state)) {
+      window.history.pushState(withMobileRailHistoryState(window.history.state), "", window.location.href);
+    }
+
+    setRailExpanded(true);
+  };
+
+  const toggleRailVisibility = () => {
+    if (railExpandedRef.current) {
+      collapseRail("dismiss");
+      return;
+    }
+
+    expandRail();
+  };
+
   useEffect(() => {
-    const onPopState = () => {
+    const onPopState = (event: PopStateEvent) => {
       const next = parseRouteState();
       const nextGroup =
         resolveTimezoneGroupForLocation(dashboard?.locationDirectory, next.locationId) ??
@@ -855,6 +930,21 @@ export default function App() {
         ) ??
         "C";
       setManualTemperatureText(formatTemperatureInputValue(next.actualTemperatureC, nextDisplayUnit));
+
+      if (!mobileLayoutRef.current) {
+        return;
+      }
+
+      if (hasMobileRailHistoryState(event.state)) {
+        mobileRailFocusRestoreRef.current = false;
+        setRailExpanded(true);
+        return;
+      }
+
+      if (railExpandedRef.current) {
+        mobileRailFocusRestoreRef.current = true;
+        setRailExpanded(false);
+      }
     };
 
     window.addEventListener("popstate", onPopState);
@@ -870,7 +960,7 @@ export default function App() {
   }, [railExpanded]);
 
   useEffect(() => {
-    if (!railExpanded || isMobileLayout) {
+    if (!desktopRailExpanded) {
       return;
     }
 
@@ -899,28 +989,27 @@ export default function App() {
       body.style.position = previousPosition;
       body.style.top = previousTop;
       body.style.width = previousWidth;
-      window.scrollTo({ top: railScrollLockYRef.current, behavior: "auto" });
+      const restoreScrollTop = railScrollLockYRef.current;
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          window.scrollTo({ top: restoreScrollTop, behavior: "auto" });
+        });
+      });
     };
-  }, [isMobileLayout, railExpanded]);
+  }, [desktopRailExpanded]);
 
   useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    if (previousMobileLayoutRef.current === isMobileLayout) {
       return;
     }
 
-    const mediaQueryList = window.matchMedia(MOBILE_LAYOUT_MEDIA_QUERY);
-    const handleChange = (event: MediaQueryListEvent) => {
-      setIsMobileLayout(event.matches);
-    };
+    previousMobileLayoutRef.current = isMobileLayout;
+    collapseRail("programmatic");
+    setBrowsingTimezoneGroup(null);
+  }, [isMobileLayout]);
 
-    setIsMobileLayout(mediaQueryList.matches);
-    if (typeof mediaQueryList.addEventListener === "function") {
-      mediaQueryList.addEventListener("change", handleChange);
-      return () => mediaQueryList.removeEventListener("change", handleChange);
-    }
-
-    mediaQueryList.addListener(handleChange);
-    return () => mediaQueryList.removeListener(handleChange);
+  useEffect(() => {
+    return observeShellMobileLayout(setIsMobileLayout);
   }, []);
 
   const updateRouteState = (updater: (current: RouteState) => RouteState, mode: "replace" | "push" = "replace") => {
@@ -995,10 +1084,13 @@ export default function App() {
       }
     }
 
-    const request = weatherApi
-      .fetchInsights(locationId, selectedTimestamp ?? undefined, actualTemperatureC ?? undefined, {
+    const request = withClientTimeout(
+      weatherApi.fetchInsights(locationId, selectedTimestamp ?? undefined, actualTemperatureC ?? undefined, {
         signal,
-      })
+      }),
+      ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS,
+      `Insight refresh timed out after ${Math.round(ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS / 1_000)}s.`,
+    )
       .then((response) => writeWarmCacheEntry(insightWarmCacheRef.current, insightKey, mapInsightResponse(response)));
     const entry = {
       startedAt: Date.now(),
@@ -1057,8 +1149,11 @@ export default function App() {
       }
     }
 
-    const request = weatherApi
-      .fetchDistribution(locationId, selectedTimestamp, 1, { signal })
+    const request = withClientTimeout(
+      weatherApi.fetchDistribution(locationId, selectedTimestamp, 1, { signal }),
+      ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS,
+      `Distribution refresh timed out after ${Math.round(ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS / 1_000)}s.`,
+    )
       .then((response) =>
         writeWarmCacheEntry(distributionWarmCacheRef.current, distributionKey, mapDistributionResponse(response)),
       );
@@ -1365,7 +1460,7 @@ export default function App() {
 
         if (result.status === "rejected") {
           const error = result.reason;
-          if (error instanceof DOMException && error.name === "AbortError") {
+          if (isAbortLikeError(error)) {
             return;
           }
         }
@@ -1393,7 +1488,7 @@ export default function App() {
         });
         locationTransitionInFlightRef.current = false;
       }
-      setRailExpanded(false);
+      collapseRail("programmatic");
       return;
     }
 
@@ -1403,8 +1498,7 @@ export default function App() {
     transitionDashboardAbortRef.current = controller;
     const currentPath = liveRouteState.path;
     const currentTab = liveRouteState.tab;
-    const isAbortError = (error: unknown) => error instanceof DOMException && error.name === "AbortError";
-    const shouldRetryFreshAfterAbort = (error: unknown) => isAbortError(error) && !controller.signal.aborted;
+    const shouldRetryFreshAfterAbort = (error: unknown) => isAbortLikeError(error) && !controller.signal.aborted;
 
     console.info("[location-transition:start]", {
       locationId,
@@ -1481,15 +1575,19 @@ export default function App() {
     }) => {
       if (currentPath === "/analysis" && currentTab === "models") {
         try {
-          const [nextInsight, nextDistribution] = await Promise.all([
-            fetchTransitionInsightSnapshot({
-              selectedTimestamp,
-              actualTemperatureC,
-            }),
-            fetchTransitionDistributionSnapshot({
-              selectedTimestamp,
-            }),
-          ]);
+          const nextInsight = await fetchTransitionInsightSnapshot({
+            selectedTimestamp,
+            actualTemperatureC,
+          });
+          let nextDistribution = await fetchTransitionDistributionSnapshot({
+            selectedTimestamp: nextInsight.selectedTimestamp,
+          });
+
+          if (nextDistribution.selectedTimestamp !== nextInsight.selectedTimestamp) {
+            nextDistribution = await fetchTransitionDistributionSnapshot({
+              selectedTimestamp: nextInsight.selectedTimestamp,
+            });
+          }
 
           return {
             nextModelTimestamp: nextInsight.selectedTimestamp,
@@ -1498,7 +1596,7 @@ export default function App() {
             nextKelly: null,
           };
         } catch (error) {
-          if (error instanceof DOMException && error.name === "AbortError") {
+          if (isAbortLikeError(error)) {
             throw error;
           }
 
@@ -1524,30 +1622,14 @@ export default function App() {
       }
 
       if (currentPath === "/") {
-        try {
-          const nextInsight = await fetchTransitionInsightSnapshot({
-            selectedTimestamp,
-            actualTemperatureC,
-          });
-
-          return {
-            nextModelTimestamp: nextInsight.selectedTimestamp,
-            nextInsight,
-            nextDistribution: null,
-            nextKelly: null,
-          };
-        } catch (error) {
-          if (error instanceof DOMException && error.name === "AbortError") {
-            throw error;
-          }
-
-          return {
-            nextModelTimestamp: selectedTimestamp,
-            nextInsight: null,
-            nextDistribution: null,
-            nextKelly: null,
-          };
-        }
+        // Keep homepage location switches responsive; the quick insight rail
+        // revalidates through the normal effect after the dashboard commits.
+        return {
+          nextModelTimestamp: selectedTimestamp,
+          nextInsight: null,
+          nextDistribution: null,
+          nextKelly: null,
+        };
       }
 
       return {
@@ -1635,7 +1717,7 @@ export default function App() {
       });
     };
 
-    setRailExpanded(false);
+    collapseRail("programmatic");
     locationTransitionInFlightRef.current = true;
     kellyDateWarmAbortRef.current?.abort();
     kellyAbortRef.current?.abort();
@@ -1696,20 +1778,6 @@ export default function App() {
           nextKelly: primed.nextKelly,
         });
 
-        if (currentPath !== "/kelly") {
-          void warmLocationSurfaces({
-            locationId,
-            selectedTimestamp: cachedSelectedHour,
-            actualTemperatureC: cachedActualTemperature,
-            targetDate: cachedTargetDate,
-            bankroll: liveRouteState.bankroll,
-            riskMode: liveRouteState.riskMode,
-            minEdge: liveRouteState.minEdge,
-            targets: buildWarmLocationTargets(currentPath, currentTab),
-            bypassCache: true,
-          });
-        }
-
         shouldPostTransitionRefresh = true;
         return;
       }
@@ -1747,7 +1815,7 @@ export default function App() {
         nextKelly: primed.nextKelly,
       });
     } catch (error) {
-      if (isAbortError(error)) {
+      if (isAbortLikeError(error)) {
         if (requestSeq === locationTransitionSeqRef.current) {
           console.info("[location-transition:aborted]", {
             locationId,
@@ -1803,7 +1871,7 @@ export default function App() {
         pendingLocationId: null,
         stage: "idle",
       });
-      setRailExpanded(false);
+      collapseRail("programmatic");
       return;
     }
 
@@ -1985,17 +2053,14 @@ export default function App() {
       clearRefreshResetTimer();
       setRefreshState("pending");
       if (shouldRefreshAnalysisSurface) {
-        setManualAnalysisRefreshPending(true);
-        setAnalysisReloadNonce((current) => current + 1);
         analysisRequestEpochRef.current += 1;
         insightAbortRef.current?.abort();
         insightAbortRef.current = null;
         distributionAbortRef.current?.abort();
         distributionAbortRef.current = null;
-        setInsightError(null);
-        setDistributionError(null);
-        setLoadingInsight(true);
-        setLoadingDistribution(true);
+        setLoadingInsight(false);
+        setLoadingDistribution(false);
+        setManualAnalysisRefreshPending(false);
       }
     }
     const startedAt = Date.now();
@@ -2014,6 +2079,12 @@ export default function App() {
         setCacheBust(Date.now());
         if (shouldRefreshAnalysisSurface) {
           invalidateAnalysisWarmCaches(locationId);
+          setInsightError(null);
+          setDistributionError(null);
+          setLoadingInsight(true);
+          setLoadingDistribution(true);
+          setManualAnalysisRefreshPending(true);
+          setAnalysisReloadNonce((current) => current + 1);
         }
       }
 
@@ -2030,7 +2101,7 @@ export default function App() {
         return;
       }
 
-      if (error instanceof DOMException && error.name === "AbortError") {
+      if (isAbortLikeError(error)) {
         return;
       }
 
@@ -2230,6 +2301,10 @@ export default function App() {
         current.path === "/kelly"
           ? resolveKellyTargetDateForSelection(dashboard.hourly.locationTimezone, nextSelectedHour)
           : current.targetDate;
+      const nextActualTemperature =
+        current.path !== "/kelly" && referenceTemperatureMode === "default"
+          ? resolveDefaultReferenceTemperature(dashboard, nextSelectedHour)
+          : current.actualTemperatureC;
       const isAutoKellyTargetDate =
         current.path === "/kelly" &&
         (current.targetDate === null ||
@@ -2239,6 +2314,7 @@ export default function App() {
       if (nextSelectedHour === current.selectedHourlyTimestamp) {
         if (
           nextInsightTimestamp === current.selectedInsightTimestamp &&
+          nextActualTemperature === current.actualTemperatureC &&
           (!isAutoKellyTargetDate || nextKellyTargetDate === current.targetDate)
         ) {
           return current;
@@ -2249,10 +2325,11 @@ export default function App() {
         ...current,
         selectedHourlyTimestamp: nextSelectedHour,
         selectedInsightTimestamp: nextInsightTimestamp,
+        actualTemperatureC: nextActualTemperature,
         targetDate: isAutoKellyTargetDate ? nextKellyTargetDate : current.targetDate,
       };
     });
-  }, [dashboard]);
+  }, [dashboard, referenceTemperatureMode]);
 
   useEffect(() => {
     if (routeState.path !== "/kelly") {
@@ -2366,7 +2443,7 @@ export default function App() {
             signal: controller.signal,
           });
         } catch (error) {
-          if (error instanceof DOMException && error.name === "AbortError") {
+          if (isAbortLikeError(error)) {
             return;
           }
         }
@@ -2597,11 +2674,11 @@ export default function App() {
           cachedInsight
             ? Promise.resolve(cachedInsight)
             : fetchInsightSnapshot({
-            locationId: requestLocationId,
-            selectedTimestamp: requestSelectedTimestamp,
-            actualTemperatureC: requestActualTemperature,
-            signal: controller.signal,
-          });
+                locationId: requestLocationId,
+                selectedTimestamp: requestSelectedTimestamp,
+                actualTemperatureC: requestActualTemperature,
+                signal: controller.signal,
+              });
         const distributionPromise =
           routeState.path === "/analysis"
             ? cachedDistribution
@@ -2612,7 +2689,7 @@ export default function App() {
                   signal: controller.signal,
                 })
             : Promise.resolve(null);
-        const [insightTask, analysisTask] = await Promise.all([insightPromise, distributionPromise]);
+        const [insightResult, distributionResult] = await Promise.allSettled([insightPromise, distributionPromise]);
 
         if (cancelled) {
           return;
@@ -2637,21 +2714,61 @@ export default function App() {
           return;
         }
 
-        if (routeState.path === "/analysis" && (!analysisTask || liveAnalysisRuntime.routePath !== "/analysis")) {
+        let insightTask = insightResult.status === "fulfilled" ? insightResult.value : null;
+        let analysisTask = distributionResult.status === "fulfilled" ? distributionResult.value : null;
+        const insightFailure =
+          insightResult.status === "rejected" && !isAbortLikeError(insightResult.reason)
+            ? getErrorMessage(insightResult.reason, UI_TEXT.errors.insight)
+            : null;
+        let distributionFailure =
+          distributionResult.status === "rejected" && !isAbortLikeError(distributionResult.reason)
+            ? getErrorMessage(distributionResult.reason, UI_TEXT.errors.distribution)
+            : null;
+
+        if (routeState.path === "/analysis" && insightTask) {
+          const needsAlignedDistribution =
+            !analysisTask || analysisTask.selectedTimestamp !== insightTask.selectedTimestamp;
+
+          if (needsAlignedDistribution) {
+            try {
+              analysisTask = await fetchDistributionSnapshot({
+                locationId: requestLocationId,
+                selectedTimestamp: insightTask.selectedTimestamp,
+                signal: controller.signal,
+              });
+              distributionFailure = null;
+            } catch (error) {
+              distributionFailure = isAbortLikeError(error)
+                ? null
+                : getErrorMessage(error, UI_TEXT.errors.distribution);
+            }
+          }
+        }
+
+        if (
+          routeState.path === "/analysis" &&
+          liveAnalysisRuntime.routePath === "/analysis" &&
+          !analysisTask &&
+          !distributionFailure
+        ) {
           return;
         }
 
-        const key = buildAnalysisBatchKey(requestLocationId, insightTask.selectedTimestamp);
+        const insightBatchKey = insightTask
+          ? buildAnalysisBatchKey(requestLocationId, insightTask.selectedTimestamp)
+          : null;
 
-        setInsight(insightTask);
-        if (key) {
-          setLatestInsightEnvelope({
-            key,
-            locationId: requestLocationId,
-            selectedTimestamp: insightTask.selectedTimestamp,
-            generatedAt,
-            data: insightTask,
-          });
+        if (insightTask) {
+          setInsight(insightTask);
+          if (insightBatchKey) {
+            setLatestInsightEnvelope({
+              key: insightBatchKey,
+              locationId: requestLocationId,
+              selectedTimestamp: insightTask.selectedTimestamp,
+              generatedAt,
+              data: insightTask,
+            });
+          }
         }
 
         if (routeState.path === "/analysis" && analysisTask) {
@@ -2666,20 +2783,30 @@ export default function App() {
               data: analysisTask,
             });
           }
-          if (key && distributionBatchKey && key === distributionBatchKey) {
+          if (insightBatchKey && distributionBatchKey && insightBatchKey === distributionBatchKey && insightTask) {
             setAnalysisSnapshot({
-              key,
+              key: insightBatchKey,
               locationId: requestLocationId,
               insight: insightTask,
               distribution: analysisTask,
             });
-            setLastConsistentAnalysisKey(key);
+            setLastConsistentAnalysisKey(insightBatchKey);
           }
-          setDistributionError(null);
         }
-        setInsightError(null);
+        if (insightFailure && !insightTask) {
+          setInsightError(insightFailure);
+        } else {
+          setInsightError(null);
+        }
+        if (routeState.path === "/analysis") {
+          if (distributionFailure && !analysisTask) {
+            setDistributionError(distributionFailure);
+          } else {
+            setDistributionError(null);
+          }
+        }
       } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") {
+        if (isAbortLikeError(error)) {
           return;
         }
         if (!cancelled && requestEpoch === analysisRequestEpochRef.current) {
@@ -2826,7 +2953,7 @@ export default function App() {
         setKellyError(null);
         setKellyStreamState(response.streamHealth.state);
       } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") {
+        if (isAbortLikeError(error)) {
           return;
         }
         if (!cancelled && requestSeq === kellyRequestSeqRef.current) {
@@ -2895,11 +3022,7 @@ export default function App() {
       : null;
   const imageAvailable = Boolean(imageUrl);
   const imageAvailabilityStatus = imageAvailable
-    ? rawImageAvailabilityStatus === "fallback_error"
-      ? "fallback_error"
-      : rawImageAvailabilityStatus === "revalidating"
-        ? "revalidating"
-        : "ready"
+    ? "ready"
     : rawImageAvailabilityStatus === "revalidating"
       ? "revalidating"
       : "unavailable";
@@ -3228,6 +3351,12 @@ export default function App() {
     latestDistributionEnvelope,
     routeState.locationId,
   );
+  const homepageInsight =
+    latestInsightForCurrentLocation?.data ??
+    (insight?.location.id === routeState.locationId ? insight : null);
+  const homepageDistribution =
+    latestDistributionForCurrentLocation?.data ??
+    (distribution?.location.id === routeState.locationId ? distribution : null);
   const requestedAnalysisTimestamp =
     routeState.selectedInsightTimestamp ?? latestInsightForCurrentLocation?.selectedTimestamp ?? null;
   const currentAnalysisKey = buildAnalysisBatchKey(routeState.locationId, requestedAnalysisTimestamp);
@@ -3242,24 +3371,37 @@ export default function App() {
       latestDistributionForCurrentLocation.selectedTimestamp === requestedAnalysisTimestamp)
       ? latestDistributionForCurrentLocation
       : null;
-  const latestAnalysisReady =
-    Boolean(
-      latestInsightForCurrentBatch &&
-        latestDistributionForCurrentBatch &&
-        currentAnalysisKey &&
-        latestInsightForCurrentBatch.key === latestDistributionForCurrentBatch.key &&
-        latestInsightForCurrentBatch.key === currentAnalysisKey,
-    ) && isAnalysis;
+  const latestInsightMatchesCurrentBatch = Boolean(
+    latestInsightForCurrentBatch &&
+      currentAnalysisKey &&
+      latestInsightForCurrentBatch.key === currentAnalysisKey,
+  );
+  const latestDistributionMatchesCurrentBatch = Boolean(
+    latestDistributionForCurrentBatch &&
+      currentAnalysisKey &&
+      latestDistributionForCurrentBatch.key === currentAnalysisKey,
+  );
   const analysisSnapshotForLocation =
     analysisSnapshot && analysisSnapshot.locationId === routeState.locationId ? analysisSnapshot : null;
+  const homepageStableAnalysisSnapshot =
+    latestInsightForCurrentLocation &&
+    latestDistributionForCurrentLocation &&
+    latestInsightForCurrentLocation.key === latestDistributionForCurrentLocation.key
+      ? {
+          insight: latestInsightForCurrentLocation.data,
+          distribution: latestDistributionForCurrentLocation.data,
+        }
+      : analysisSnapshotForLocation;
+  const homepageCommittedInsight = homepageStableAnalysisSnapshot?.insight ?? null;
+  const homepageCommittedDistribution = homepageStableAnalysisSnapshot?.distribution ?? null;
   const effectiveLastConsistentAnalysisKey = analysisSnapshotForLocation?.key ?? lastConsistentAnalysisKey;
   const displayedAnalysisInsight = isAnalysis
-    ? latestAnalysisReady
+    ? latestInsightMatchesCurrentBatch
       ? latestInsightForCurrentBatch?.data ?? null
       : analysisSnapshotForLocation?.insight ?? null
     : insight;
   const displayedAnalysisDistribution = isAnalysis
-    ? latestAnalysisReady
+    ? latestDistributionMatchesCurrentBatch
       ? latestDistributionForCurrentBatch?.data ?? null
       : analysisSnapshotForLocation?.distribution ?? null
     : distribution;
@@ -3267,17 +3409,18 @@ export default function App() {
   const analysisPageLoading =
     isAnalysis &&
     routeState.tab === "models" &&
+    (loadingInsight || loadingDistribution || manualAnalysisRefreshPending) &&
     !hasRenderableAnalysisData &&
     !insightError &&
     !distributionError;
   const analysisAvailabilityStatus =
-    insightError || distributionError
-      ? "fallback_error"
-      : analysisPageLoading || loadingInsight || loadingDistribution
+    hasRenderableAnalysisData
+      ? "ready"
+      : insightError || distributionError
+        ? "fallback_error"
+        : analysisPageLoading || loadingInsight || loadingDistribution
         ? "revalidating"
-        : hasRenderableAnalysisData
-          ? "ready"
-          : "ready";
+          : "unavailable";
   const effectiveModelTimestamp =
     requestedAnalysisTimestamp ?? displayedAnalysisDistribution?.selectedTimestamp ?? null;
   const dashboardDefaultSelectedTimestamp = dashboard
@@ -3301,15 +3444,15 @@ export default function App() {
   const homepageWarnings = collectHomeDisplayWarnings({
     dashboardWarnings: dashboard?.hourly.warnings,
     reportWarnings: report?.warnings,
-    insightWarnings: insight?.warnings,
-    distributionWarnings: distribution?.warnings,
+    insightWarnings: homepageCommittedInsight?.warnings,
+    distributionWarnings: homepageCommittedDistribution?.warnings,
     suppressRequestedTimestampFallback: shouldSuppressRequestedTimestampFallbackWarning,
   });
   const activeLocationTimezone =
     dashboard?.locationDirectory.find((location) => location.id === displayedLocationId)?.timezone ??
     dashboardWarmCacheRef.current.get(displayedLocationId)?.data.locationDirectory.find((location) => location.id === displayedLocationId)?.timezone ??
-    insight?.location.timezone ??
-    distribution?.location.timezone ??
+    homepageInsight?.location.timezone ??
+    homepageDistribution?.location.timezone ??
     dashboard?.hourly.locationTimezone ??
     undefined;
 
@@ -3321,9 +3464,9 @@ export default function App() {
         items,
         currentItem: currentHourItem,
         selectedItem,
-        insight,
+        insight: homepageInsight,
       }),
-    [currentHourItem, dashboard, insight, items, reportText, selectedItem],
+    [currentHourItem, dashboard, homepageInsight, items, reportText, selectedItem],
   );
 
   const locations = useMemo(
@@ -3344,44 +3487,153 @@ export default function App() {
       : null) ??
     null;
   const pendingLocationName = pendingLocation?.displayName ?? null;
+  const headerLocationName =
+    currentPage === "kelly"
+      ? (kellySnapshot?.location.name ?? displayedLocation?.displayName ?? homeViewModel.locationName)
+      : (displayedLocation?.displayName ?? homeViewModel.locationName);
+  const headerLocationShortName =
+    displayedLocation?.cityName ?? displayedLocation?.displayNameZh ?? displayedLocation?.displayName ?? homeViewModel.locationName;
+  const headerLocationCode = displayedLocation?.code ?? null;
 
   const hasCommittedSnapshot = Boolean(dashboard);
   const showDashboardWarning = hasCommittedSnapshot && Boolean(dashboardError);
   const showDashboardFallback = !hasCommittedSnapshot && Boolean(dashboardError);
+  const showDashboardBootstrap = !hasCommittedSnapshot && !showDashboardFallback;
   const workspaceMuted = isLocationTransitionPending && !hasCommittedSnapshot;
   const kellyRefreshDisabled = !routeState.targetDate || manualRefreshingKelly || isLocationTransitionPending;
   const headerRefreshState = isKelly
     ? manualRefreshingKelly || isLocationTransitionPending
       ? "pending"
       : "idle"
-    : loadingDashboard || manualAnalysisRefreshPending
-      ? "pending"
-      : refreshState;
+    : refreshState;
   const headerRefreshDisabled = isKelly
     ? kellyRefreshDisabled
-    : loadingDashboard || manualAnalysisRefreshPending || refreshState === "pending" || isLocationTransitionPending;
+    : isLocationTransitionPending || refreshState === "pending";
   const headerSyncState =
-    dashboard?.sync.state === "fallback_error"
+    dashboardError && dashboard?.sync.state === "fallback_error"
       ? "fallback_error"
       : "fresh";
+  const closeRail = () => collapseRail("dismiss");
+  const toggleRail = () => toggleRailVisibility();
+  const openRail = () => expandRail();
+  const handleShellNavigation = (path: AppPath) => {
+    collapseRail("programmatic");
+    updateRouteState(
+      (current) => ({
+        ...current,
+        path,
+      }),
+      "push",
+    );
+  };
+  const handleRailLocationSelect = (id: string) => {
+    void transitionToLocation(id, "push");
+  };
   const peakSummary = displayedAnalysisInsight
     ? buildPeakSummary(displayedAnalysisInsight.peakTimeDistribution, activeLocationTimezone)
     : UI_TEXT.analysis.peakSummaryLoading;
+  const homepageInsightCard = hasCommittedSnapshot && dashboard ? (
+    <InsightCard
+      insight={homepageInsight}
+      loading={loadingInsight}
+      error={insightError}
+      displayUnit={insightDisplayUnit}
+      locationTimezone={activeLocationTimezone}
+      selectedWeatherTimestamp={routeState.selectedHourlyTimestamp}
+      selectedModelTimestamp={effectiveModelTimestamp}
+      actualTemperatureC={routeState.actualTemperatureC}
+      manualTemperatureText={manualTemperatureText}
+      referenceMode={referenceTemperatureMode}
+      onSelectTimestamp={(value) =>
+        updateRouteState((current) => {
+          const nextSelectedTimestamp = value ?? current.selectedInsightTimestamp ?? current.selectedHourlyTimestamp;
+          const nextActualTemperature =
+            referenceTemperatureMode === "default"
+              ? resolveDefaultReferenceTemperature(dashboardRef.current, nextSelectedTimestamp)
+              : current.actualTemperatureC;
+
+          return {
+            ...current,
+            selectedInsightTimestamp: nextSelectedTimestamp,
+            selectedHourlyTimestamp: nextSelectedTimestamp,
+            actualTemperatureC: nextActualTemperature,
+          };
+        })
+      }
+      onTemperatureChange={(value) => {
+        setReferenceTemperatureMode("manual");
+        setManualTemperatureText(value);
+        const parsed = Number.parseFloat(value);
+        updateRouteState((current) => ({
+          ...current,
+          actualTemperatureC: Number.isFinite(parsed) ? convertTemperatureToC(parsed, insightDisplayUnit) : null,
+        }));
+      }}
+      onResetTemperature={() => {
+        setReferenceTemperatureMode("default");
+        setManualTemperatureText(formatTemperatureInputValue(defaultReferenceTemperature, insightDisplayUnit));
+        updateRouteState((current) => ({
+          ...current,
+          actualTemperatureC: defaultReferenceTemperature,
+        }));
+      }}
+      onOpenDetails={() =>
+        updateRouteState(
+          (current) => ({
+            ...current,
+            path: "/analysis",
+            tab: "models",
+          }),
+          "push",
+        )
+      }
+      mobileSummary={isMobileLayout}
+    />
+  ) : null;
+  const homepageReferenceCard = hasCommittedSnapshot && dashboard ? (
+    <HomeReferenceCard
+      hourly={dashboard.hourly}
+      metar={dashboard.metar}
+      taf={dashboard.taf}
+      report={dashboard.report}
+      multimodel={dashboard.multimodel}
+      insight={homepageCommittedInsight}
+      sourceMetadata={dashboard.sourceMetadata}
+      pageUrl={dashboard.hourly.pageUrl}
+      displayUnit={dashboard.displayUnit ?? activeDisplayUnit}
+      locationTimezone={activeLocationTimezone}
+      mobileSummary={isMobileLayout}
+    />
+  ) : null;
+  const homepageWarningLines =
+    homepageWarnings.length > 0 ? <WarningLines items={homepageWarnings.slice(0, 2)} /> : null;
+  const desktopHomepageSupportContent = (
+    <>
+      {homepageInsightCard}
+      {homepageReferenceCard}
+      {homepageWarningLines}
+    </>
+  );
+  const mobileHomepageSupportContent = (
+    <>
+      {homepageReferenceCard}
+      {homepageWarningLines}
+      {homepageInsightCard}
+    </>
+  );
 
   return (
     <div
-      className={`weather-shell ${isMobileLayout ? "weather-shell-mobile" : ""} ${railExpanded ? "weather-shell-rail-open" : ""} ${currentPage === "analysis" ? "weather-shell-analysis" : currentPage === "kelly" ? "weather-shell-kelly" : "weather-shell-home"}`}
+      className={`weather-shell ${desktopRailExpanded ? "weather-shell-rail-open" : ""} ${currentPage === "analysis" ? "weather-shell-analysis" : currentPage === "kelly" ? "weather-shell-kelly" : "weather-shell-home"}`}
       data-page={currentPage}
       data-mobile-layout={isMobileLayout ? "true" : "false"}
     >
       <TerminalBackdrop />
 
       <CommandHeader
-        locationName={
-          currentPage === "kelly"
-            ? (kellySnapshot?.location.name ?? displayedLocation?.displayName ?? homeViewModel.locationName)
-            : (displayedLocation?.displayName ?? homeViewModel.locationName)
-        }
+        locationName={headerLocationName}
+        locationShortName={headerLocationShortName}
+        locationCode={headerLocationCode}
         pendingLocationName={pendingLocationName}
         transitioning={isLocationTransitionPending}
         locationTimezone={activeLocationTimezone}
@@ -3390,11 +3642,11 @@ export default function App() {
         refreshState={headerRefreshState}
         refreshDisabled={headerRefreshDisabled}
         currentPage={currentPage}
+        mobile={isMobileLayout}
         railExpanded={railExpanded}
-        favorite={favoriteLocationIds.includes(routeState.locationId)}
-        favoriteDisabled={favoritePendingIds.includes(routeState.locationId)}
-        favoriteError={favoritesError}
-        onToggleRail={() => setRailExpanded((current) => !current)}
+        onToggleRail={toggleRail}
+        onOpenRail={openRail}
+        mobileLocationTriggerRef={mobileRailTriggerRef}
         onRefresh={() => {
           if (isKelly) {
             applyKellyDraftControls();
@@ -3403,37 +3655,9 @@ export default function App() {
 
           void refreshDashboard(true, routeState.locationId);
         }}
-        onToggleFavorite={() => void toggleFavorite(routeState.locationId)}
-        onNavigateHome={() => {
-          setRailExpanded(false);
-          updateRouteState(
-            (current) => ({
-              ...current,
-              path: "/",
-            }),
-            "push",
-          );
-        }}
-        onNavigateAnalysis={() => {
-          setRailExpanded(false);
-          updateRouteState(
-            (current) => ({
-              ...current,
-              path: "/analysis",
-            }),
-            "push",
-          );
-        }}
-        onNavigateKelly={() => {
-          setRailExpanded(false);
-          updateRouteState(
-            (current) => ({
-              ...current,
-              path: "/kelly",
-            }),
-            "push",
-          );
-        }}
+        onNavigateHome={() => handleShellNavigation("/")}
+        onNavigateAnalysis={() => handleShellNavigation("/analysis")}
+        onNavigateKelly={() => handleShellNavigation("/kelly")}
       />
 
       {showDashboardWarning && dashboardError ? <WarningLines items={[dashboardError]} /> : null}
@@ -3460,12 +3684,24 @@ export default function App() {
         </section>
       ) : null}
 
-      {!hasCommittedSnapshot && !showDashboardFallback ? (
+      {showDashboardBootstrap ? (
         <section className="terminal-panel flex flex-1 items-center justify-center px-6 py-10">
-          <div className="panel-section text-center">
+          <div className="panel-section max-w-2xl text-center">
             <div className="eyebrow">{UI_TEXT.app.loadingEyebrow}</div>
             <div className="mt-3 text-3xl font-semibold text-white">{UI_TEXT.app.loadingTitle}</div>
             <div className="mt-3 text-sm text-white/56">{UI_TEXT.app.loadingDescription}</div>
+            <p className="mt-4 text-sm leading-6 text-white/52">
+              首次打开如果还在接入数据，顶部导航仍可操作，也可以直接重试当前地点。
+            </p>
+            <button
+              type="button"
+              className="mt-6 inline-flex items-center justify-center rounded-full border border-white/18 bg-white/8 px-5 py-2 text-sm font-medium text-white transition hover:border-white/28 hover:bg-white/12"
+              onClick={() => {
+                void refreshDashboard(true, routeState.locationId);
+              }}
+            >
+              立即重试
+            </button>
           </div>
         </section>
       ) : null}
@@ -3480,16 +3716,16 @@ export default function App() {
             activeGroup={activeTimezoneGroup}
             groups={locationGroups}
             favoritePendingIds={favoritePendingIds}
-            error={favoritesError}
+            favoriteError={favoritesError}
             onGroupChange={(group) => {
               setBrowsingTimezoneGroup(group);
             }}
-            onSelect={(id) => {
-              void transitionToLocation(id, "push");
-            }}
+            onSelect={handleRailLocationSelect}
             onToggleFavorite={(id) => void toggleFavorite(id)}
-            onDismiss={() => setRailExpanded(false)}
-            onExpand={() => setRailExpanded(true)}
+            onDismiss={closeRail}
+            onExpand={openRail}
+            returnFocusRef={mobileRailTriggerRef}
+            restoreFocusOnCloseRef={mobileRailFocusRestoreRef}
           />
 
           {isAnalysis ? (
@@ -3507,6 +3743,7 @@ export default function App() {
                   insight={displayedAnalysisInsight}
                   distribution={displayedAnalysisDistribution}
                   dashboard={dashboard}
+                  mobileLayout={isMobileLayout}
                   displayUnit={
                     displayedAnalysisInsight?.displayUnit ??
                     displayedAnalysisDistribution?.displayUnit ??
@@ -3651,78 +3888,8 @@ export default function App() {
                 />
               </Suspense>
 
-              <aside className="home-support-column home-quick-insight-column analysis-column scrollbar-terminal overflow-y-auto pr-1">
-                <InsightCard
-                  insight={insight}
-                  loading={loadingInsight}
-                  error={insightError}
-                  displayUnit={insightDisplayUnit}
-                  locationTimezone={activeLocationTimezone}
-                  selectedWeatherTimestamp={routeState.selectedHourlyTimestamp}
-                  selectedModelTimestamp={effectiveModelTimestamp}
-                  actualTemperatureC={routeState.actualTemperatureC}
-                  manualTemperatureText={manualTemperatureText}
-                  referenceMode={referenceTemperatureMode}
-                  onSelectTimestamp={(value) =>
-                    updateRouteState((current) => {
-                      const nextSelectedTimestamp = value ?? current.selectedInsightTimestamp ?? current.selectedHourlyTimestamp;
-                      const nextActualTemperature =
-                        referenceTemperatureMode === "default"
-                          ? resolveDefaultReferenceTemperature(dashboardRef.current, nextSelectedTimestamp)
-                          : current.actualTemperatureC;
-
-                      return {
-                        ...current,
-                        selectedInsightTimestamp: nextSelectedTimestamp,
-                        selectedHourlyTimestamp: nextSelectedTimestamp,
-                        actualTemperatureC: nextActualTemperature,
-                      };
-                    })
-                  }
-                  onTemperatureChange={(value) => {
-                    setReferenceTemperatureMode("manual");
-                    setManualTemperatureText(value);
-                    const parsed = Number.parseFloat(value);
-                    updateRouteState((current) => ({
-                      ...current,
-                      actualTemperatureC:
-                        Number.isFinite(parsed) ? convertTemperatureToC(parsed, insightDisplayUnit) : null,
-                    }));
-                  }}
-                  onResetTemperature={() => {
-                    setReferenceTemperatureMode("default");
-                    setManualTemperatureText(formatTemperatureInputValue(defaultReferenceTemperature, insightDisplayUnit));
-                    updateRouteState((current) => ({
-                      ...current,
-                      actualTemperatureC: defaultReferenceTemperature,
-                    }));
-                  }}
-                  onOpenDetails={() =>
-                    updateRouteState(
-                      (current) => ({
-                        ...current,
-                        path: "/analysis",
-                        tab: "models",
-                      }),
-                      "push",
-                    )
-                  }
-                />
-
-                <HomeReferenceCard
-                  hourly={dashboard.hourly}
-                  metar={dashboard.metar}
-                  taf={dashboard.taf}
-                  report={dashboard.report}
-                  multimodel={dashboard.multimodel}
-                  insight={insight}
-                  sourceMetadata={dashboard.sourceMetadata}
-                  pageUrl={dashboard.hourly.pageUrl}
-                  displayUnit={dashboard.displayUnit ?? activeDisplayUnit}
-                  locationTimezone={activeLocationTimezone}
-                />
-
-                {homepageWarnings.length > 0 ? <WarningLines items={homepageWarnings.slice(0, 2)} /> : null}
+              <aside className="home-support-column home-quick-insight-column analysis-column scrollbar-terminal overflow-visible pr-1 2xl:overflow-y-auto">
+                {isMobileLayout ? mobileHomepageSupportContent : desktopHomepageSupportContent}
               </aside>
             </div>
           )}

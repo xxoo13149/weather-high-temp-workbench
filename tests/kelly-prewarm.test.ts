@@ -1,10 +1,18 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
+  getKellyPrewarmRuntimeStatus,
+  resetKellyPrewarmRuntimeStatus,
   resolveDefaultKellyPrewarmLocationIds,
   resolveKellyPrewarmConfig,
   runKellyPrewarmPass,
+  startKellyPrewarmLoop,
 } from "../src/server/kelly-prewarm.js";
+
+afterEach(() => {
+  resetKellyPrewarmRuntimeStatus();
+  vi.useRealTimers();
+});
 
 describe("kelly prewarm", () => {
   test("defaults to production Kelly cities only", () => {
@@ -212,6 +220,77 @@ describe("kelly prewarm", () => {
       succeeded: 2,
       failed: 1,
       failures: [{ locationId: "toronto_yyz", error: "toronto cold" }],
+    });
+  });
+
+  test("publishes runtime heartbeat and last-pass summary for the background loop", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-24T12:00:00.000Z"));
+
+    const service = {
+      getKellyWorkbench: vi.fn(async (_locationId: string, options?: Record<string, unknown>) => ({
+        targetDate: options?.targetDate ?? "2026-04-24",
+        markets: [],
+        inactiveMarkets: [],
+      })),
+    };
+
+    const loop = startKellyPrewarmLoop(
+      service as never,
+      {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+      {
+        KELLY_PREWARM_ENABLED: "true",
+        KELLY_PREWARM_DELAY_MS: "0",
+        KELLY_PREWARM_INTERVAL_MS: "0",
+        KELLY_PREWARM_CONCURRENCY: "1",
+        KELLY_PREWARM_FORCE_REFRESH_COUNT: "1",
+        KELLY_PREWARM_NEXT_DAY_WARM_COUNT: "0",
+        KELLY_PREWARM_NEXT_DAY_AFTER_LOCAL_HOUR: "15",
+        KELLY_PREWARM_LOCATION_IDS: "miami_mia",
+      },
+    );
+
+    expect(getKellyPrewarmRuntimeStatus()).toMatchObject({
+      state: "scheduled",
+      enabled: true,
+      config: expect.objectContaining({
+        locationIds: ["miami_mia"],
+        forceRefreshCount: 1,
+      }),
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(service.getKellyWorkbench).toHaveBeenCalledWith(
+      "miami_mia",
+      expect.objectContaining({
+        targetDate: "2026-04-24",
+        forceRefresh: true,
+      }),
+    );
+    expect(getKellyPrewarmRuntimeStatus()).toMatchObject({
+      state: "idle",
+      enabled: true,
+      inFlight: false,
+      heartbeatAt: expect.any(String),
+      lastPass: expect.objectContaining({
+        passIndex: 0,
+        total: 1,
+        succeeded: 1,
+        failed: 0,
+        forceRefreshLocationIds: ["miami_mia"],
+      }),
+    });
+
+    loop.stop();
+
+    expect(getKellyPrewarmRuntimeStatus()).toMatchObject({
+      state: "stopped",
+      nextScheduledAt: null,
     });
   });
 });

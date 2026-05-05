@@ -574,6 +574,7 @@ describe("MeteoblueWeatherService", () => {
 
     vi.advanceTimersByTime(300_001);
     fetchBinaryMock.mockRejectedValueOnce(new Error("boom"));
+    fetchTextMock.mockRejectedValue(new Error("multimodel boom"));
 
     const stale = await service.getMultiModelImage("shanghai_pvg", true);
     expect(stale.stale).toBe(false);
@@ -589,7 +590,10 @@ describe("MeteoblueWeatherService", () => {
   });
 
   test("reports multimodel cache status", async () => {
-    fetchTextMock.mockResolvedValue(fixture("multimodel.html"));
+    fetchTextMock
+      .mockResolvedValueOnce(fixture("multimodel.html"))
+      .mockResolvedValueOnce(fixture("multimodel.html"))
+      .mockResolvedValueOnce(fixture("multimodel-highcharts.json"));
     fetchBinaryMock.mockResolvedValueOnce({
       body: Buffer.from("png"),
       contentType: "image/png",
@@ -602,13 +606,15 @@ describe("MeteoblueWeatherService", () => {
     const status = await service.getMultiModelStatus("shanghai_pvg");
     expect(status).toMatchObject({
       imageUrlFound: true,
+      imageStatus: "ready",
+      analysisStatus: "ready",
       stale: false,
       imageUrl: "https://my.meteoblue.com/images/meteogram_multimodel?format=png&download=1&sig=abc123",
     });
   });
 
   test("reports multimodel analysis as unavailable after a cold refresh failure without stale cache", async () => {
-    fetchTextMock.mockRejectedValueOnce(new Error("multimodel boom"));
+    fetchTextMock.mockRejectedValue(new Error("multimodel boom"));
 
     const service = new MeteoblueWeatherService();
 
@@ -619,7 +625,49 @@ describe("MeteoblueWeatherService", () => {
     const status = await service.getMultiModelStatus("shanghai_pvg");
     expect(status.analysisStatus).toBe("unavailable");
     expect(status.lastError).toContain("multimodel boom");
-    expect(status.freshness).not.toBe("fallback_error");
+    expect(status.freshness).toBe("revalidating");
+  });
+
+  test("keeps multimodel analysis status ready when stale cache is still renderable after refresh failure", async () => {
+    fetchTextMock
+      .mockResolvedValueOnce(fixture("multimodel.html"))
+      .mockResolvedValueOnce(fixture("multimodel-highcharts.json"));
+
+    const service = new MeteoblueWeatherService();
+    await service.getMultiModelDistribution("shanghai_pvg", "2026-03-28T04:00:00+08:00", 1);
+
+    const cache = (service as any).getMultiModelDistributionCache("shanghai_pvg");
+    cache.entry.expiresAt = Date.now() - 1;
+    fetchTextMock.mockRejectedValueOnce(new Error("multimodel refresh failed"));
+
+    const distribution = await service.getMultiModelDistribution("shanghai_pvg", "2026-03-28T04:00:00+08:00", 1);
+    expect(distribution.freshness).toBe("revalidating");
+
+    await vi.waitFor(async () => {
+      const status = await service.getMultiModelStatus("shanghai_pvg");
+      expect(status.analysisStatus).toBe("ready");
+      expect(status.freshness).toBe("fallback_error");
+      expect(status.lastError).toContain("multimodel refresh failed");
+    });
+  });
+
+  test("refreshes an expired multimodel distribution cache before reporting ready status", async () => {
+    fetchTextMock
+      .mockResolvedValueOnce(fixture("multimodel.html"))
+      .mockResolvedValueOnce(fixture("multimodel-highcharts.json"))
+      .mockResolvedValueOnce(fixture("multimodel.html"))
+      .mockResolvedValueOnce(fixture("multimodel-highcharts.json"));
+
+    const service = new MeteoblueWeatherService();
+    await service.getMultiModelDistribution("shanghai_pvg", "2026-03-28T04:00:00+08:00", 1);
+
+    const cache = (service as any).getMultiModelDistributionCache("shanghai_pvg");
+    cache.entry.expiresAt = Date.now() - 1;
+
+    const status = await service.getMultiModelStatus("shanghai_pvg");
+    expect(status.analysisStatus).toBe("ready");
+    expect(status.freshness).toBe("fresh");
+    expect(fetchTextMock).toHaveBeenCalledTimes(4);
   });
 
   test("builds multimodel distribution from page highcharts data", async () => {
@@ -644,6 +692,120 @@ describe("MeteoblueWeatherService", () => {
         }),
       ]),
     );
+  });
+
+  test("gives the multimodel highcharts fetch a fresh timeout budget after the page load completes", async () => {
+    const resolveAbortableText = (value: string, delayMs: number, init?: RequestInit) =>
+      new Promise<string>((resolve, reject) => {
+        const onAbort = () => {
+          clearTimeout(timerId);
+          reject(init?.signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+        };
+        const timerId = setTimeout(() => {
+          init?.signal?.removeEventListener("abort", onAbort);
+          resolve(value);
+        }, delayMs);
+
+        if (!init?.signal) {
+          return;
+        }
+
+        if (init.signal.aborted) {
+          onAbort();
+          return;
+        }
+
+        init.signal.addEventListener("abort", onAbort, { once: true });
+      });
+
+    fetchTextMock
+      .mockImplementationOnce(async (_url: string, init?: RequestInit) =>
+        await resolveAbortableText(fixture("multimodel.html"), 7_000, init),
+      )
+      .mockImplementationOnce(async (_url: string, init?: RequestInit) =>
+        await resolveAbortableText(fixture("multimodel-highcharts.json"), 7_000, init),
+      );
+
+    const service = new MeteoblueWeatherService();
+    const distributionPromise = service.getMultiModelDistribution("shanghai_pvg", "2026-03-28T04:00:00+08:00", 1);
+
+    await vi.advanceTimersByTimeAsync(14_000);
+
+    await expect(distributionPromise).resolves.toMatchObject({
+      modelCount: 3,
+      selectedTimestamp: "2026-03-28T04:00:00+08:00",
+    });
+    expect(fetchTextMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("keeps insight and distribution on the same fallback timestamp from the shared multimodel cache", async () => {
+    fetchTextMock
+      .mockResolvedValueOnce(fixture("multimodel.html"))
+      .mockResolvedValueOnce(fixture("multimodel-highcharts.json"));
+
+    const service = new MeteoblueWeatherService();
+    const requestedTimestamp = "2026-03-28T04:30:00+08:00";
+    const [distribution, insight] = await Promise.all([
+      service.getMultiModelDistribution("shanghai_pvg", requestedTimestamp, 1),
+      service.getMultiModelInsight("shanghai_pvg", requestedTimestamp, 19.8),
+    ]);
+
+    expect(distribution.requestedTimestampValid).toBe(false);
+    expect(insight.requestedTimestampValid).toBe(false);
+    expect(distribution.selectedTimestamp).toBe("2026-03-28T04:00:00+08:00");
+    expect(insight.selectedTimestamp).toBe(distribution.selectedTimestamp);
+    expect(insight.availableTimestamps).toEqual(distribution.availableTimestamps);
+    expect(insight.freshness).toBe(distribution.freshness);
+  });
+
+  test("returns stale multimodel insight and distribution immediately while an expired cache revalidates", async () => {
+    fetchTextMock
+      .mockResolvedValueOnce(fixture("multimodel.html"))
+      .mockResolvedValueOnce(fixture("multimodel-highcharts.json"));
+
+    const service = new MeteoblueWeatherService();
+    await service.getMultiModelDistribution("shanghai_pvg", "2026-03-28T04:00:00+08:00", 1);
+
+    const cache = (service as any).getMultiModelDistributionCache("shanghai_pvg");
+    cache.entry.expiresAt = Date.now() - 1;
+
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    fetchTextMock.mockImplementation(async (url: string) => {
+      await gate;
+      return /format=highcharts|highcharts\.json|download=1/i.test(url)
+        ? fixture("multimodel-highcharts.json")
+        : fixture("multimodel.html");
+    });
+
+    const [distribution, insight] = await Promise.all([
+      service.getMultiModelDistribution("shanghai_pvg", "2026-03-28T04:00:00+08:00", 1),
+      service.getMultiModelInsight("shanghai_pvg", "2026-03-28T04:00:00+08:00", 19.8),
+    ]);
+
+    expect(fetchTextMock).toHaveBeenCalledTimes(3);
+    expect(distribution).toMatchObject({
+      freshness: "revalidating",
+      cacheHit: true,
+      selectedTimestamp: "2026-03-28T04:00:00+08:00",
+    });
+    expect(distribution.warnings).toContain(
+      "Background refresh is in progress; showing the most recent cached multimodel statistics.",
+    );
+    expect(insight).toMatchObject({
+      freshness: "revalidating",
+      cacheHit: true,
+      selectedTimestamp: "2026-03-28T04:00:00+08:00",
+    });
+    expect(insight.warnings).toContain(
+      "Background refresh is in progress; showing the most recent cached multimodel insights.",
+    );
+
+    releaseGate();
+    await Promise.resolve();
+    await Promise.resolve();
   });
 
 
@@ -1254,9 +1416,9 @@ describe("MeteoblueWeatherService", () => {
       warnings: [],
     } as any;
 
-    let resolveRefresh: ((value: unknown) => void) | null = null;
+    let resolveRefresh: (value: unknown) => void = () => undefined;
     const slowRefresh = new Promise((resolve) => {
-      resolveRefresh = resolve;
+      resolveRefresh = resolve as (value: unknown) => void;
     });
 
     buildKellyWorkbenchSnapshot.mockResolvedValueOnce(baseSnapshot).mockImplementationOnce(() => slowRefresh as Promise<any>);
@@ -1276,7 +1438,7 @@ describe("MeteoblueWeatherService", () => {
       expect.arrayContaining([expect.stringContaining("后台刷新中")]),
     );
 
-    resolveRefresh?.({
+    resolveRefresh({
       ...baseSnapshot,
       generatedAt: "2026-04-24T00:05:00.000Z",
     });

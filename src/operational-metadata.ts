@@ -4,6 +4,7 @@ import type {
   HourlyWeatherResponse,
   IntradaySignalsSummary,
   KellyTemperatureUnit,
+  KellyPrewarmRuntimeStatus,
   LocationCapabilityStatus,
   LocationContractSource,
   LocationDirectoryEntry,
@@ -132,6 +133,15 @@ const toPrometheusMetric = (name: string, labels: Record<string, string> | null,
     .map(([key, labelValue]) => `${key}="${escapeMetricLabel(labelValue)}"`)
     .join(",");
   return `${name}{${labelString}} ${value}`;
+};
+
+const toUnixTimeSeconds = (value: string | null | undefined) => {
+  if (!value) {
+    return 0;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1_000) : 0;
 };
 
 const buildSource = (
@@ -692,6 +702,44 @@ export const buildMetricsText = (status: SystemStatusResponse) => {
         "# TYPE weather_kelly_fallback_mode gauge",
         toPrometheusMetric("weather_kelly_fallback_mode", null, status.runtime.kelly.fallbackMode ? 1 : 0),
       );
+    }
+
+    if (status.runtime.prewarm) {
+      const prewarm = status.runtime.prewarm as KellyPrewarmRuntimeStatus;
+      lines.push(
+        "# HELP weather_prewarm_enabled Kelly prewarm loop enabled flag.",
+        "# TYPE weather_prewarm_enabled gauge",
+        toPrometheusMetric("weather_prewarm_enabled", null, prewarm.enabled ? 1 : 0),
+        "# HELP weather_prewarm_inflight Kelly prewarm loop in-flight flag.",
+        "# TYPE weather_prewarm_inflight gauge",
+        toPrometheusMetric("weather_prewarm_inflight", null, prewarm.inFlight ? 1 : 0),
+        "# HELP weather_prewarm_consecutive_failure_passes Consecutive prewarm passes with failures or crashes.",
+        "# TYPE weather_prewarm_consecutive_failure_passes gauge",
+        toPrometheusMetric("weather_prewarm_consecutive_failure_passes", null, prewarm.consecutiveFailurePasses),
+        "# HELP weather_prewarm_heartbeat_unixtime Last prewarm heartbeat timestamp.",
+        "# TYPE weather_prewarm_heartbeat_unixtime gauge",
+        toPrometheusMetric("weather_prewarm_heartbeat_unixtime", null, toUnixTimeSeconds(prewarm.heartbeatAt)),
+        "# HELP weather_prewarm_next_scheduled_unixtime Next scheduled prewarm pass timestamp.",
+        "# TYPE weather_prewarm_next_scheduled_unixtime gauge",
+        toPrometheusMetric("weather_prewarm_next_scheduled_unixtime", null, toUnixTimeSeconds(prewarm.nextScheduledAt)),
+      );
+
+      if (prewarm.lastPass) {
+        lines.push(
+          "# HELP weather_prewarm_last_pass_total Last prewarm pass city count.",
+          "# TYPE weather_prewarm_last_pass_total gauge",
+          toPrometheusMetric("weather_prewarm_last_pass_total", null, prewarm.lastPass.total),
+          "# HELP weather_prewarm_last_pass_succeeded Last prewarm pass success count.",
+          "# TYPE weather_prewarm_last_pass_succeeded gauge",
+          toPrometheusMetric("weather_prewarm_last_pass_succeeded", null, prewarm.lastPass.succeeded),
+          "# HELP weather_prewarm_last_pass_failed Last prewarm pass failure count.",
+          "# TYPE weather_prewarm_last_pass_failed gauge",
+          toPrometheusMetric("weather_prewarm_last_pass_failed", null, prewarm.lastPass.failed),
+          "# HELP weather_prewarm_last_pass_duration_ms Last prewarm pass duration in milliseconds.",
+          "# TYPE weather_prewarm_last_pass_duration_ms gauge",
+          toPrometheusMetric("weather_prewarm_last_pass_duration_ms", null, prewarm.lastPass.durationMs),
+        );
+      }
     }
   }
 

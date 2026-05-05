@@ -3,12 +3,17 @@ import { AppError, isAppError } from "../domain/errors.js";
 import type {
   DashboardMetarSnapshot,
   DashboardTafSnapshot,
+  HourlyFieldCoverage,
   HourlyMode,
+  HourlySourceType,
+  HourlyWeatherResponse,
   KellyCircuitState,
   KellyRequestOptions,
   KellyRiskMode,
   KellyStreamMessage,
   LocationInfo,
+  WeatherReportMetrics,
+  WeatherReportResponse,
 } from "../domain/weather.js";
 import { normalizeDashboardMetarSnapshot } from "../domain/weather.js";
 import {
@@ -314,6 +319,120 @@ const EMPTY_DASHBOARD_TAF_SNAPSHOT: DashboardTafSnapshot = {
   forecasts: [],
 };
 
+const buildEmptyHourlyFieldCoverage = (sourceType: HourlySourceType): HourlyFieldCoverage => ({
+  precipitationProbabilityPct: {
+    availableHours: 0,
+    totalHours: 0,
+    source: sourceType,
+    completeness: "missing",
+    missingReasons: {
+      "source-unpublished": 0,
+      "parser-unrecognized": 0,
+      "fallback-unavailable": 0,
+    },
+  },
+  feelsLikeC: {
+    availableHours: 0,
+    totalHours: 0,
+    source: sourceType,
+    completeness: "missing",
+    missingReasons: {
+      "source-unpublished": 0,
+      "parser-unrecognized": 0,
+      "fallback-unavailable": 0,
+    },
+  },
+  windDirection: {
+    availableHours: 0,
+    totalHours: 0,
+    source: sourceType,
+    completeness: "missing",
+    missingReasons: {
+      "source-unpublished": 0,
+      "parser-unrecognized": 0,
+      "fallback-unavailable": 0,
+    },
+  },
+  mixedSources: [],
+});
+
+const buildDashboardHourlyFallback = (
+  locationId: LocationInfo["id"],
+  mode: HourlyMode,
+  reason: unknown,
+): HourlyWeatherResponse => {
+  const location = LOCATION_REGISTRY[locationId];
+  const sourceType: HourlySourceType = mode === "1h" ? "week-table-1h" : "week-table-3h";
+  const detail = reason instanceof Error ? reason.message : String(reason);
+
+  return {
+    location: {
+      id: location.id,
+      name: location.name,
+      timezone: location.timezone,
+    },
+    fetchedAt: new Date().toISOString(),
+    sourceObservedAt: null,
+    mode,
+    periodHours: mode === "1h" ? 1 : 3,
+    sourceType,
+    stale: true,
+    freshness: "fallback_error",
+    pageUrl: location.weekPageUrl,
+    parserVersion: "unavailable",
+    items: [],
+    fieldCoverage: buildEmptyHourlyFieldCoverage(sourceType),
+    partial: true,
+    warnings: [`Week page hourly data is temporarily unavailable. ${detail}`.trim()],
+    cacheHit: false,
+    current: null,
+  };
+};
+
+const EMPTY_WEATHER_REPORT_METRICS: WeatherReportMetrics = {
+  forecastDayLabel: null,
+  maxTemperatureC: null,
+  uvIndex: null,
+  overnightWindKphMin: null,
+  overnightWindKphMax: null,
+  daytimeWindKphMin: null,
+  daytimeWindKphMax: null,
+  overnightWindDirection: null,
+  daytimeWindDirection: null,
+  confidence: null,
+  predictability: null,
+  predictabilityScore: null,
+};
+
+const buildDashboardReportFallback = (
+  locationId: LocationInfo["id"],
+  reason: unknown,
+): WeatherReportResponse => {
+  const location = LOCATION_REGISTRY[locationId];
+  const detail = reason instanceof Error ? reason.message : String(reason);
+
+  return {
+    location: {
+      id: location.id,
+      name: location.name,
+      timezone: location.timezone,
+    },
+    fetchedAt: new Date().toISOString(),
+    sourceObservedAt: null,
+    stale: true,
+    freshness: "fallback_error",
+    cacheHit: false,
+    pageUrl: location.weekPageUrl,
+    parserVersion: "unavailable",
+    available: false,
+    titleEn: null,
+    sourceTextEn: null,
+    textZh: null,
+    metrics: EMPTY_WEATHER_REPORT_METRICS,
+    warnings: [`Week page weather report is temporarily unavailable. ${detail}`.trim()],
+  };
+};
+
 const buildEdgeCacheControl = (ttlSeconds: number) =>
   `public, max-age=0, s-maxage=${ttlSeconds}, stale-while-revalidate=${ttlSeconds}`;
 
@@ -369,6 +488,34 @@ const hasFreshFreshness = (payload: unknown) =>
   payload === null ||
   !("freshness" in payload) ||
   (payload as { freshness?: unknown }).freshness === "fresh";
+
+const hasCacheableMultimodelFreshness = (payload: unknown) => {
+  if (typeof payload !== "object" || payload === null || !("freshness" in payload)) {
+    return true;
+  }
+
+  const freshness = (payload as { freshness?: unknown }).freshness;
+  return freshness === "fresh" || freshness === "fallback_error";
+};
+
+const hasCacheableMultimodelStatus = (payload: unknown) => {
+  if (!hasCacheableMultimodelFreshness(payload)) {
+    return false;
+  }
+
+  if (
+    typeof payload === "object" &&
+    payload !== null &&
+    "imageStatus" in payload &&
+    "analysisStatus" in payload &&
+    (payload as { imageStatus?: unknown }).imageStatus === "unavailable" &&
+    (payload as { analysisStatus?: unknown }).analysisStatus === "unavailable"
+  ) {
+    return false;
+  }
+
+  return true;
+};
 
 const hasFreshDashboardSync = (payload: unknown) =>
   typeof payload === "object" &&
@@ -660,6 +807,24 @@ const extractDashboardOriginMetarStationId = (payload: unknown) => {
   return null;
 };
 
+const extractDashboardOriginTafStationId = (payload: unknown) => {
+  if (typeof payload !== "object" || payload === null) {
+    return null;
+  }
+
+  const tafForecast = (payload as { taf?: { forecast?: unknown } }).taf?.forecast;
+  if (typeof tafForecast !== "object" || tafForecast === null) {
+    return null;
+  }
+
+  const stationId = (tafForecast as { stationId?: unknown }).stationId;
+  if (typeof stationId === "string" && stationId.trim() !== "") {
+    return stationId.trim().toUpperCase();
+  }
+
+  return null;
+};
+
 const isDashboardOriginMetarContractSkew = async (request: Request, response: Response) => {
   if (!response.ok || !isKellyOriginJsonResponse(response)) {
     return false;
@@ -691,33 +856,82 @@ const isDashboardOriginMetarContractSkew = async (request: Request, response: Re
 const isObjectRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 
-const isDashboardOriginAviationContractSkew = async (_request: Request, response: Response) => {
+const isNullableObjectRecord = (value: unknown): value is Record<string, unknown> | null =>
+  value === null || isObjectRecord(value);
+
+const hasOwnKey = (record: Record<string, unknown>, key: string) => Object.prototype.hasOwnProperty.call(record, key);
+
+const isDashboardOriginAviationContractSkew = async (request: Request, response: Response) => {
   if (!response.ok || !isKellyOriginJsonResponse(response)) {
     return false;
   }
 
+  const rawLocationId = new URL(request.url).searchParams.get("locationId")?.trim();
+  if (!rawLocationId || !(rawLocationId in LOCATION_REGISTRY)) {
+    return false;
+  }
+
+  const locationId = rawLocationId as LocationInfo["id"];
   const payload = await response.clone().json().catch(() => null);
   if (!isObjectRecord(payload)) {
     return false;
   }
 
-  const metar = isObjectRecord(payload.metar) ? payload.metar : null;
-  const taf = isObjectRecord(payload.taf) ? payload.taf : null;
-  const tafForecast = taf && isObjectRecord(taf.forecast) ? taf.forecast : null;
-  const tafActiveForecast =
-    tafForecast && isObjectRecord(tafForecast.activeForecast) ? tafForecast.activeForecast : null;
+  const metarPayload = hasOwnKey(payload, "metar") ? payload.metar : undefined;
+  const tafPayload = hasOwnKey(payload, "taf") ? payload.taf : undefined;
+  if (metarPayload !== undefined && !isNullableObjectRecord(metarPayload)) {
+    return true;
+  }
+  if (tafPayload !== undefined && !isNullableObjectRecord(tafPayload)) {
+    return true;
+  }
 
-  const hasMetarObservation = metar ? isObjectRecord(metar.observation) : false;
-  const hasRecentMetarReports =
-    metar && (Array.isArray(metar.recentReports) || Array.isArray(metar.recentObservations));
-  const hasTafRaw = typeof tafForecast?.rawTaf === "string" && tafForecast.rawTaf.trim() !== "";
-  const hasTafDailySummary = isObjectRecord(tafForecast?.dailySummary);
-  const hasActiveCloudLayers = Array.isArray(tafActiveForecast?.cloudLayers);
+  const metar = isObjectRecord(metarPayload) ? metarPayload : null;
+  if (metar) {
+    if (hasOwnKey(metar, "observation") && !isNullableObjectRecord(metar.observation)) {
+      return true;
+    }
+    if (hasOwnKey(metar, "recentTemperatures") && !Array.isArray(metar.recentTemperatures)) {
+      return true;
+    }
+    if (hasOwnKey(metar, "recentReports") && !Array.isArray(metar.recentReports)) {
+      return true;
+    }
+    if (hasOwnKey(metar, "recentObservations") && !Array.isArray(metar.recentObservations)) {
+      return true;
+    }
+  }
 
-  return Boolean(
-    (hasMetarObservation && !hasRecentMetarReports) ||
-      (hasTafRaw && (!hasTafDailySummary || !hasActiveCloudLayers)),
-  );
+  const taf = isObjectRecord(tafPayload) ? tafPayload : null;
+  if (taf) {
+    if (hasOwnKey(taf, "forecast") && !isNullableObjectRecord(taf.forecast)) {
+      return true;
+    }
+    if (hasOwnKey(taf, "forecasts") && !Array.isArray(taf.forecasts)) {
+      return true;
+    }
+
+    const tafForecast = isObjectRecord(taf.forecast) ? taf.forecast : null;
+    if (tafForecast) {
+      if (hasOwnKey(tafForecast, "activeForecast") && !isNullableObjectRecord(tafForecast.activeForecast)) {
+        return true;
+      }
+      if (hasOwnKey(tafForecast, "dailySummary") && !isNullableObjectRecord(tafForecast.dailySummary)) {
+        return true;
+      }
+      if (hasOwnKey(tafForecast, "rawTaf") && tafForecast.rawTaf !== null && typeof tafForecast.rawTaf !== "string") {
+        return true;
+      }
+    }
+  }
+
+  const expectedTafStationId = getLocationSourceContract(locationId).targetUpgrades.taf.stationCode?.trim().toUpperCase();
+  if (!expectedTafStationId) {
+    return false;
+  }
+
+  const tafStationId = extractDashboardOriginTafStationId(payload);
+  return Boolean(tafStationId && tafStationId !== expectedTafStationId);
 };
 
 type OriginProxyAttemptResult =
@@ -1353,13 +1567,25 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
         ctx,
         EDGE_CACHE_TTL_SECONDS.dashboard,
         async () => {
-        const [hourly, multimodel, report, metar, taf] = await Promise.all([
-          service.getHourly(locationId, mode, limit),
-          service.getMultiModelStatus(locationId),
-          service.getWeatherReport(locationId),
-          loadDashboardMetarSnapshot(service, locationId),
-          loadDashboardTafSnapshot(service, locationId),
-        ]);
+          const [hourlyResult, multimodel, reportResult, metar, taf] = await Promise.all([
+            service.getHourly(locationId, mode, limit).then(
+              (value) => ({ ok: true as const, value }),
+              (error) => ({ ok: false as const, error }),
+            ),
+            service.getMultiModelStatus(locationId),
+            service.getWeatherReport(locationId).then(
+              (value) => ({ ok: true as const, value }),
+              (error) => ({ ok: false as const, error }),
+            ),
+            loadDashboardMetarSnapshot(service, locationId),
+            loadDashboardTafSnapshot(service, locationId),
+          ]);
+          const hourly = hourlyResult.ok
+            ? hourlyResult.value
+            : buildDashboardHourlyFallback(locationId, mode, hourlyResult.error);
+          const report = reportResult.ok
+            ? reportResult.value
+            : buildDashboardReportFallback(locationId, reportResult.error);
           const dashboardEnhancements = buildDashboardEnhancements({
             locationId,
             hourly,
@@ -1429,7 +1655,7 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
         EDGE_CACHE_TTL_SECONDS.multimodelStatus,
         async () => await service.getMultiModelStatus(locationId),
         {
-          shouldCache: hasFreshFreshness,
+          shouldCache: hasCacheableMultimodelStatus,
         },
       );
 
@@ -1445,7 +1671,7 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
             parseBucketSize(url.searchParams.get("bucketSize")),
           ),
         {
-          shouldCache: hasFreshFreshness,
+          shouldCache: hasCacheableMultimodelFreshness,
         },
       );
 
@@ -1466,7 +1692,7 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
             parseActualTemperatureC(url.searchParams.get("actualTemperatureC")),
           ),
         {
-          shouldCache: hasFreshFreshness,
+          shouldCache: hasCacheableMultimodelFreshness,
         },
       );
 
