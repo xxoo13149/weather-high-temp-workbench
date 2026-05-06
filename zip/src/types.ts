@@ -107,6 +107,8 @@ export interface ApiErrorPayload {
   retryable: boolean;
   staleAvailable: boolean;
   lastSuccessAt: string | null;
+  diagnosticCode?: string;
+  diagnosticMessage?: string;
 }
 
 export interface DashboardSyncInfo {

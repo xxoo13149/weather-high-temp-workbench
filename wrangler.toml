@@ -14,6 +14,9 @@ HOST = "0.0.0.0"
 PORT = "8787"
 KELLY_SERVER_BASE_URL = "http://kelly-origin.lukaluka.fun:8081"
 KELLY_STREAM_PROXY_MODE = "canary"
+KELLY_PROXY_GET_TIMEOUT_MS = "14000"
+DASHBOARD_PROXY_GET_TIMEOUT_MS = "8000"
+KELLY_PROXY_STREAM_TIMEOUT_MS = "6000"
 
 [[routes]]
 pattern = "lukaluka.fun"

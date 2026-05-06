@@ -44,7 +44,7 @@ import {
   resolveKellyDateKeyFromTimestamp,
   resolveKellyTargetDate,
 } from "../../kelly/workbench.js";
-import { RefreshableCache } from "../../lib/cache.js";
+import { RefreshableCache, type CacheSnapshot } from "../../lib/cache.js";
 import { FavoritesStore, type FavoritesStoreLike } from "../../lib/favorites-store.js";
 import { fetchBinary, fetchText } from "../../lib/http.js";
 import { withHandledTimeout as withTimeout } from "../../lib/with-timeout.js";
@@ -62,7 +62,16 @@ import {
   loadMultiModelDistribution,
   type MultiModelDistributionCacheValue,
 } from "./multimodel-distribution.js";
-import { extractMultiModelImageUrl, MULTIMODEL_IMAGE_VERSION } from "./multimodel.js";
+import {
+  buildMultiModelStatusPresentation,
+  wrapMultiModelAppError,
+} from "./multimodel-error-presentation.js";
+import {
+  assertMultiModelUrlMatchesLocation,
+  extractMultiModelImageUrl,
+  MULTIMODEL_IMAGE_VERSION,
+  type MultiModelUrlLocationExpectation,
+} from "./multimodel.js";
 import {
   mergeHourlyItems,
   parseWeekPage,
@@ -86,7 +95,7 @@ const METEOBLUE_WEEK_PAGE_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 10_
 const METEOBLUE_WEEK_METEOGRAM_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 10_000);
 const METEOBLUE_WEEK_OPTIONAL_METEOGRAM_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 2_500);
 const METEOBLUE_MULTIMODEL_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 12_000);
-const METEOBLUE_MULTIMODEL_CACHE_LOAD_CONCURRENCY = 4;
+const METEOBLUE_MULTIMODEL_CACHE_LOAD_CONCURRENCY = 8;
 const METEOBLUE_MULTIMODEL_CACHE_SLOT_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 30_000);
 const METEOBLUE_WEEK_CACHE_SLOT_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 20_000);
 const METEOBLUE_WEEK_PAGE_TOTAL_TIMEOUT_MS = METEOBLUE_WEEK_PAGE_LOADER_TIMEOUT_MS + 1_500;
@@ -272,6 +281,43 @@ interface ImageCacheValue {
   contentType: string;
   body: Buffer;
 }
+
+const toMultiModelLocationExpectation = (location: {
+  latitude: number;
+  longitude: number;
+  timezone: string;
+}): MultiModelUrlLocationExpectation => ({
+  latitude: location.latitude,
+  longitude: location.longitude,
+  timezone: location.timezone,
+});
+
+const validateCachedMultiModelImageUrl = (
+  imageUrl: string,
+  expectedLocation: MultiModelUrlLocationExpectation,
+) =>
+  assertMultiModelUrlMatchesLocation(
+    imageUrl,
+    expectedLocation,
+    "MULTIMODEL_IMAGE_LOCATION_MISMATCH",
+    "image link",
+  );
+
+const validateCachedMultiModelDistributionValue = (
+  value: Pick<MultiModelDistributionCacheValue, "highchartsUrl" | "pngUrl">,
+  expectedLocation: MultiModelUrlLocationExpectation,
+) => {
+  assertMultiModelUrlMatchesLocation(
+    value.highchartsUrl,
+    expectedLocation,
+    "MULTIMODEL_HIGHCHARTS_LOCATION_MISMATCH",
+    "highcharts link",
+  );
+
+  if (value.pngUrl) {
+    validateCachedMultiModelImageUrl(value.pngUrl, expectedLocation);
+  }
+};
 
 interface MetarCacheValue {
   observation: Omit<MetarObservation, "stale" | "cacheHit"> | null;
@@ -863,14 +909,29 @@ const resolveSnapshotFreshness = <T,>(snapshot: ReturnType<RefreshableCache<T>["
   return "fresh";
 };
 
-const ensureCacheHasEntry = async <T>(cache: RefreshableCache<T>) => {
-  if (isSnapshotMissingOrExpired(cache.peek())) {
-    try {
-      await cache.get({ allowStaleOnError: true });
-    } catch {
-      // ignore loader failures; status will reflect last known state
-    }
+const triggerCacheRefreshInBackground = <T>(
+  cache: RefreshableCache<T>,
+  options?: {
+    allowStale?: boolean;
+  },
+) => {
+  const snapshot = cache.peek();
+  if (snapshot.inFlight) {
+    return;
   }
+
+  const request = snapshot.entry
+    ? cache.get({
+        allowStaleOnError: options?.allowStale ?? true,
+        staleWhileRevalidate: true,
+        background: true,
+      })
+    : cache.get({
+        allowStaleOnError: options?.allowStale ?? true,
+        background: true,
+      });
+
+  void request.catch(() => undefined);
 };
 
 const pushRefreshableCacheWarning = (
@@ -1395,6 +1456,7 @@ export class MeteoblueWeatherService implements WeatherService {
 
     const location = this.requireLocation(locationId);
     const cache = new RefreshableCache<ImageCacheValue>(config.multimodelImageTtlMs, async () => {
+      const expectedLocation = toMultiModelLocationExpectation(location);
       const pageHtml = await withTimeout(
         fetchText(location.multimodelPageUrl, { signal: createMultiModelLoaderSignal() }),
         METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
@@ -1409,7 +1471,7 @@ export class MeteoblueWeatherService implements WeatherService {
           ),
       );
       const pageFetchedAt = new Date().toISOString();
-      const imageUrl = extractMultiModelImageUrl(pageHtml);
+      const imageUrl = extractMultiModelImageUrl(pageHtml, expectedLocation);
       const image = await withTimeout(
         fetchBinary(imageUrl, { signal: createMultiModelLoaderSignal() }),
         METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
@@ -1499,6 +1561,7 @@ export class MeteoblueWeatherService implements WeatherService {
                 ),
             },
             location.fallbackDisplayUnit,
+            toMultiModelLocationExpectation(location),
           ),
         ),
     );
@@ -2109,11 +2172,22 @@ export class MeteoblueWeatherService implements WeatherService {
 
   async getMultiModelImage(locationId: LocationInfo["id"], allowStale: boolean): Promise<MultiModelImageResponse> {
     const location = this.requireLocation(locationId);
+    const imageCache = this.getMultiModelImageCache(locationId);
+    const expectedLocation = toMultiModelLocationExpectation(location);
     try {
-      const result = await this.getMultiModelImageCache(locationId).get({
+      const result = await imageCache.get({
         allowStaleOnError: allowStale,
         staleWhileRevalidate: allowStale,
       });
+      try {
+        validateCachedMultiModelImageUrl(result.value.imageUrl, expectedLocation);
+      } catch (error) {
+        imageCache.invalidate();
+        triggerCacheRefreshInBackground(imageCache, {
+          allowStale,
+        });
+        throw error;
+      }
       const fallbackOnError = isFallbackErrorFreshness(result.freshness);
       const response = {
         contentType: result.value.contentType,
@@ -2133,18 +2207,14 @@ export class MeteoblueWeatherService implements WeatherService {
         },
       };
       return response;
-    } catch {
-      const snapshot = this.getMultiModelImageCache(locationId).peek();
-      throw new AppError(
-        503,
-        "MULTIMODEL_IMAGE_UNAVAILABLE",
-        "Could not fetch the official meteoblue multimodel image.",
-        {
-          retryable: true,
-          staleAvailable: snapshot.entry !== null,
-          lastSuccessAt: snapshot.entry?.value.imageFetchedAt ?? null,
-        },
-      );
+    } catch (error) {
+      const snapshot = imageCache.peek();
+      throw wrapMultiModelAppError(error, {
+        fallbackCode: "MULTIMODEL_IMAGE_UNAVAILABLE",
+        surfaceCode: "fallback",
+        staleAvailable: snapshot.entry !== null,
+        lastSuccessAt: snapshot.entry?.value.imageFetchedAt ?? null,
+      });
     }
   }
 
@@ -2152,40 +2222,66 @@ export class MeteoblueWeatherService implements WeatherService {
     const location = this.requireLocation(locationId);
     const distributionCache = this.getMultiModelDistributionCache(locationId);
     const imageCache = this.getMultiModelImageCache(locationId);
+    const expectedLocation = toMultiModelLocationExpectation(location);
 
-    await ensureCacheHasEntry(distributionCache);
-
-    let snapshot = imageCache.peek();
     let distributionSnapshot = distributionCache.peek();
-
-    if (isSnapshotMissingOrExpired(snapshot) && (distributionSnapshot.entry?.value.pngUrl ?? null) === null) {
-      await ensureCacheHasEntry(imageCache);
-      snapshot = imageCache.peek();
+    let cacheValidationError: { code: string; message: string } | null = null;
+    if (distributionSnapshot.entry) {
+      try {
+        validateCachedMultiModelDistributionValue(distributionSnapshot.entry.value, expectedLocation);
+      } catch (error) {
+        distributionCache.invalidate();
+        cacheValidationError = error instanceof AppError ? { code: error.code, message: error.message } : null;
+        distributionSnapshot = distributionCache.peek();
+      }
+    }
+    if (isSnapshotMissingOrExpired(distributionSnapshot)) {
+      triggerCacheRefreshInBackground(distributionCache);
       distributionSnapshot = distributionCache.peek();
     }
 
-    const imageInFlight = snapshot.inFlight;
+    let snapshot = imageCache.peek();
+    if (snapshot.entry) {
+      try {
+        validateCachedMultiModelImageUrl(snapshot.entry.value.imageUrl, expectedLocation);
+      } catch (error) {
+        imageCache.invalidate();
+        cacheValidationError =
+          cacheValidationError ??
+          (error instanceof AppError ? { code: error.code, message: error.message } : null);
+        snapshot = imageCache.peek();
+      }
+    }
+    if (
+      snapshot.entry !== null &&
+      isSnapshotMissingOrExpired(snapshot) &&
+      (distributionSnapshot.entry?.value.pngUrl ?? null) === null
+    ) {
+      triggerCacheRefreshInBackground(imageCache);
+      snapshot = imageCache.peek();
+    }
+
     const analysisInFlight = distributionSnapshot.inFlight;
+    const imageInFlight = snapshot.inFlight || analysisInFlight;
     const resolvedImageUrl = snapshot.entry?.value.imageUrl ?? distributionSnapshot.entry?.value.pngUrl ?? null;
     const imageUrlFound = resolvedImageUrl !== null;
     const hasRenderableImage = snapshot.entry !== null || imageUrlFound;
     const hasRenderableAnalysis = distributionSnapshot.entry !== null;
-    const imageFreshness =
-      resolveSnapshotFreshness(snapshot) ?? (hasRenderableImage ? (imageInFlight ? "revalidating" : "fresh") : "revalidating");
-    const analysisFreshness =
+    const distributionFreshness =
       resolveSnapshotFreshness(distributionSnapshot) ??
-      (hasRenderableAnalysis ? (analysisInFlight ? "revalidating" : "fresh") : "revalidating");
+      (hasRenderableAnalysis ? (analysisInFlight ? "revalidating" : "fresh") : analysisInFlight ? "revalidating" : null);
+    const imageFreshness =
+      resolveSnapshotFreshness(snapshot) ??
+      distributionFreshness ??
+      (hasRenderableImage ? (imageInFlight ? "revalidating" : "fresh") : imageInFlight ? "revalidating" : "revalidating");
+    const analysisFreshness = distributionFreshness ?? "revalidating";
     const imageStatus = hasRenderableImage
-      ? imageInFlight
-        ? "revalidating"
-        : "ready"
+      ? "ready"
       : imageInFlight
         ? "revalidating"
         : "unavailable";
     const analysisStatus = hasRenderableAnalysis
-      ? analysisInFlight
-        ? "revalidating"
-        : "ready"
+      ? "ready"
       : analysisInFlight
         ? "revalidating"
         : "unavailable";
@@ -2193,10 +2289,29 @@ export class MeteoblueWeatherService implements WeatherService {
       imageFreshness === "fallback_error" || analysisFreshness === "fallback_error"
         ? "fallback_error"
         : !hasRenderableImage && !hasRenderableAnalysis
-          ? "revalidating"
+          ? imageInFlight || analysisInFlight
+            ? "revalidating"
+            : "revalidating"
         : imageInFlight || analysisInFlight
           ? "revalidating"
           : "fresh";
+    const statusError =
+      cacheValidationError ??
+      (snapshot.lastError !== null
+        ? {
+            code: snapshot.lastErrorCode,
+            message: snapshot.lastError,
+          }
+        : distributionSnapshot.lastError !== null
+          ? {
+              code: distributionSnapshot.lastErrorCode,
+              message: distributionSnapshot.lastError,
+            }
+          : null);
+    const presentation = buildMultiModelStatusPresentation(statusError, {
+      hasRenderableImage,
+      hasRenderableAnalysis,
+    });
     const displayUnit = location.fallbackDisplayUnit;
     return {
       location: {
@@ -2216,7 +2331,9 @@ export class MeteoblueWeatherService implements WeatherService {
       freshness,
       imageStatus,
       analysisStatus,
-      lastError: snapshot.lastError ?? distributionSnapshot.lastError,
+      lastError: presentation.userMessage,
+      diagnosticCode: presentation.diagnosticCode,
+      diagnosticMessage: presentation.diagnosticMessage,
       lastSuccessAt: snapshot.entry?.value.imageFetchedAt ?? distributionSnapshot.lastSuccessAt,
       imageUrl: resolvedImageUrl,
       pageUrl: location.multimodelPageUrl,
@@ -2229,11 +2346,20 @@ export class MeteoblueWeatherService implements WeatherService {
     bucketSizeC = 1,
   ): Promise<MultiModelDistributionResponse> {
     const location = this.requireLocation(locationId);
+    const distributionCache = this.getMultiModelDistributionCache(locationId);
+    const expectedLocation = toMultiModelLocationExpectation(location);
     try {
-      const result = await this.getMultiModelDistributionCache(locationId).get({
+      const result = await distributionCache.get({
         allowStaleOnError: true,
         staleWhileRevalidate: true,
       });
+      try {
+        validateCachedMultiModelDistributionValue(result.value, expectedLocation);
+      } catch (error) {
+        distributionCache.invalidate();
+        triggerCacheRefreshInBackground(distributionCache);
+        throw error;
+      }
       const fallbackOnError = isFallbackErrorFreshness(result.freshness);
       const response = buildMultiModelDistributionResponse(
         result.value,
@@ -2262,26 +2388,13 @@ export class MeteoblueWeatherService implements WeatherService {
       }
       return response;
     } catch (error) {
-      const snapshot = this.getMultiModelDistributionCache(locationId).peek();
-
-      if (error instanceof AppError) {
-        throw new AppError(error.statusCode, error.code, error.message, {
-          retryable: error.retryable,
-          staleAvailable: error.staleAvailable || snapshot.entry !== null,
-          lastSuccessAt: error.lastSuccessAt ?? snapshot.lastSuccessAt,
-        });
-      }
-
-      throw new AppError(
-        503,
-        "MULTIMODEL_DISTRIBUTION_UNAVAILABLE",
-        error instanceof Error ? error.message : "Could not load multimodel distribution.",
-        {
-          retryable: true,
-          staleAvailable: snapshot.entry !== null,
-          lastSuccessAt: snapshot.lastSuccessAt,
-        },
-      );
+      const snapshot = distributionCache.peek();
+      throw wrapMultiModelAppError(error, {
+        fallbackCode: "MULTIMODEL_DISTRIBUTION_UNAVAILABLE",
+        surfaceCode: "original",
+        staleAvailable: snapshot.entry !== null,
+        lastSuccessAt: snapshot.lastSuccessAt,
+      });
     }
   }
 
@@ -2291,11 +2404,20 @@ export class MeteoblueWeatherService implements WeatherService {
     actualTemperatureC?: number,
   ): Promise<MultiModelInsightResponse> {
     const location = this.requireLocation(locationId);
+    const distributionCache = this.getMultiModelDistributionCache(locationId);
+    const expectedLocation = toMultiModelLocationExpectation(location);
     try {
-      const result = await this.getMultiModelDistributionCache(locationId).get({
+      const result = await distributionCache.get({
         allowStaleOnError: true,
         staleWhileRevalidate: true,
       });
+      try {
+        validateCachedMultiModelDistributionValue(result.value, expectedLocation);
+      } catch (error) {
+        distributionCache.invalidate();
+        triggerCacheRefreshInBackground(distributionCache);
+        throw error;
+      }
       const fallbackOnError = isFallbackErrorFreshness(result.freshness);
       const response = buildMultiModelInsightResponse(
         result.value,
@@ -2326,26 +2448,13 @@ export class MeteoblueWeatherService implements WeatherService {
       }
       return response;
     } catch (error) {
-      const snapshot = this.getMultiModelDistributionCache(locationId).peek();
-
-      if (error instanceof AppError) {
-        throw new AppError(error.statusCode, error.code, error.message, {
-          retryable: error.retryable,
-          staleAvailable: error.staleAvailable || snapshot.entry !== null,
-          lastSuccessAt: error.lastSuccessAt ?? snapshot.lastSuccessAt,
-        });
-      }
-
-      throw new AppError(
-        503,
-        "MULTIMODEL_INSIGHT_UNAVAILABLE",
-        error instanceof Error ? error.message : "Could not load multimodel insights.",
-        {
-          retryable: true,
-          staleAvailable: snapshot.entry !== null,
-          lastSuccessAt: snapshot.lastSuccessAt,
-        },
-      );
+      const snapshot = distributionCache.peek();
+      throw wrapMultiModelAppError(error, {
+        fallbackCode: "MULTIMODEL_INSIGHT_UNAVAILABLE",
+        surfaceCode: "original",
+        staleAvailable: snapshot.entry !== null,
+        lastSuccessAt: snapshot.lastSuccessAt,
+      });
     }
   }
 

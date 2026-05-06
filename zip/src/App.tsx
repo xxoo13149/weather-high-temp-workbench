@@ -1,6 +1,6 @@
 import { lazy, startTransition, Suspense, useEffect, useMemo, useRef, useState } from "react";
 
-import { getErrorMessage, isAbortLikeError, weatherApi } from "./api";
+import { WeatherApiError, getErrorMessage, isAbortLikeError, weatherApi } from "./api";
 import { CommandHeader } from "./components/CommandHeader";
 import { HomeReferenceCard } from "./components/HomeReferenceCard";
 import { InsightCard } from "./components/InsightCard";
@@ -125,6 +125,12 @@ const KELLY_SNAPSHOT_CLIENT_TIMEOUT_MS = 20_000;
 const KELLY_FOCUS_RECOVERY_STALE_MS = 20_000;
 const KELLY_FOCUS_RECOVERY_COOLDOWN_MS = 1_500;
 const MOBILE_RAIL_HISTORY_KEY = "__weatherMobileRail";
+const MULTIMODEL_WARMUP_RETRY_DELAYS_MS = [900, 1_600, 2_600, 4_000, 6_000];
+const MULTIMODEL_WARMUP_RETRY_CODES = new Set([
+  "MULTIMODEL_DISTRIBUTION_REFRESH_IN_PROGRESS",
+  "MULTIMODEL_INSIGHT_REFRESH_IN_PROGRESS",
+  "MULTIMODEL_CACHE_LOAD_BUSY",
+]);
 
 const hasMobileRailHistoryState = (state: unknown) =>
   Boolean(state && typeof state === "object" && (state as Record<string, unknown>)[MOBILE_RAIL_HISTORY_KEY] === true);
@@ -203,6 +209,64 @@ const withClientTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, mes
   } finally {
     if (timerId !== null) {
       window.clearTimeout(timerId);
+    }
+  }
+};
+
+const waitForAbortableDelay = (delayMs: number, signal: AbortSignal) => {
+  if (signal.aborted) {
+    return Promise.reject(createAbortError());
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const timerId = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      window.clearTimeout(timerId);
+      signal.removeEventListener("abort", onAbort);
+      reject(createAbortError());
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+};
+
+const resolveWeatherApiErrorCode = (error: unknown) =>
+  error instanceof WeatherApiError ? error.payload?.diagnosticCode ?? error.payload?.code ?? null : null;
+
+const isMultiModelWarmupRetryError = (error: unknown) => {
+  if (!(error instanceof WeatherApiError)) {
+    return false;
+  }
+
+  const code = resolveWeatherApiErrorCode(error);
+  return Boolean(code && MULTIMODEL_WARMUP_RETRY_CODES.has(code) && error.payload?.retryable !== false);
+};
+
+const withMultiModelWarmupRetry = async <T,>(
+  load: () => Promise<T>,
+  signal: AbortSignal,
+  enabled: boolean,
+): Promise<T> => {
+  let attempt = 0;
+
+  while (true) {
+    try {
+      return await load();
+    } catch (error) {
+      if (
+        !enabled ||
+        isAbortLikeError(error) ||
+        !isMultiModelWarmupRetryError(error) ||
+        attempt >= MULTIMODEL_WARMUP_RETRY_DELAYS_MS.length
+      ) {
+        throw error;
+      }
+
+      await waitForAbortableDelay(MULTIMODEL_WARMUP_RETRY_DELAYS_MS[attempt] ?? 1_000, signal);
+      attempt += 1;
     }
   }
 };
@@ -1060,6 +1124,7 @@ export default function App() {
     signal,
     bypassCache = false,
     allowInFlightReuse = true,
+    retryWarmup = true,
   }: {
     locationId: string;
     selectedTimestamp: string | null;
@@ -1067,6 +1132,7 @@ export default function App() {
     signal: AbortSignal;
     bypassCache?: boolean;
     allowInFlightReuse?: boolean;
+    retryWarmup?: boolean;
   }): Promise<InsightViewModel> => {
     const insightKey = buildInsightWarmKey(locationId, selectedTimestamp, actualTemperatureC);
     const useSharedInFlight = !bypassCache && allowInFlightReuse;
@@ -1085,9 +1151,14 @@ export default function App() {
     }
 
     const request = withClientTimeout(
-      weatherApi.fetchInsights(locationId, selectedTimestamp ?? undefined, actualTemperatureC ?? undefined, {
+      withMultiModelWarmupRetry(
+        () =>
+          weatherApi.fetchInsights(locationId, selectedTimestamp ?? undefined, actualTemperatureC ?? undefined, {
+            signal,
+          }),
         signal,
-      }),
+        retryWarmup,
+      ),
       ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS,
       `Insight refresh timed out after ${Math.round(ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS / 1_000)}s.`,
     )
@@ -1116,12 +1187,14 @@ export default function App() {
     signal,
     bypassCache = false,
     allowInFlightReuse = true,
+    retryWarmup = true,
   }: {
     locationId: string;
     selectedTimestamp: string | null;
     signal: AbortSignal;
     bypassCache?: boolean;
     allowInFlightReuse?: boolean;
+    retryWarmup?: boolean;
   }): Promise<DistributionViewModel | null> => {
     if (!selectedTimestamp) {
       return null;
@@ -1150,7 +1223,11 @@ export default function App() {
     }
 
     const request = withClientTimeout(
-      weatherApi.fetchDistribution(locationId, selectedTimestamp, 1, { signal }),
+      withMultiModelWarmupRetry(
+        () => weatherApi.fetchDistribution(locationId, selectedTimestamp, 1, { signal }),
+        signal,
+        retryWarmup,
+      ),
       ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS,
       `Distribution refresh timed out after ${Math.round(ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS / 1_000)}s.`,
     )
@@ -1294,11 +1371,6 @@ export default function App() {
 
   const clearAnalysisSurfaceState = () => {
     analysisRequestEpochRef.current += 1;
-    setInsight(null);
-    setDistribution(null);
-    setLatestInsightEnvelope(null);
-    setLatestDistributionEnvelope(null);
-    setLastConsistentAnalysisKey(null);
   };
 
   const invalidateAnalysisWarmCaches = (locationId: string) => {
@@ -1498,8 +1570,6 @@ export default function App() {
     transitionDashboardAbortRef.current = controller;
     const currentPath = liveRouteState.path;
     const currentTab = liveRouteState.tab;
-    const shouldRetryFreshAfterAbort = (error: unknown) => isAbortLikeError(error) && !controller.signal.aborted;
-
     console.info("[location-transition:start]", {
       locationId,
       requestSeq,
@@ -1508,130 +1578,10 @@ export default function App() {
       tab: currentTab,
     });
 
-    const fetchTransitionInsightSnapshot = async ({
-      selectedTimestamp,
-      actualTemperatureC,
-    }: {
-      selectedTimestamp: string | null;
-      actualTemperatureC: number | null;
-    }) => {
-      try {
-        return await fetchInsightSnapshot({
-          locationId,
-          selectedTimestamp,
-          actualTemperatureC,
-          signal: controller.signal,
-          allowInFlightReuse: false,
-        });
-      } catch (error) {
-        if (shouldRetryFreshAfterAbort(error)) {
-          return await fetchInsightSnapshot({
-            locationId,
-            selectedTimestamp,
-            actualTemperatureC,
-            signal: controller.signal,
-            bypassCache: true,
-            allowInFlightReuse: false,
-          });
-        }
-        throw error;
-      }
-    };
-
-    const fetchTransitionDistributionSnapshot = async ({
-      selectedTimestamp,
-    }: {
-      selectedTimestamp: string | null;
-    }) => {
-      try {
-        return await fetchDistributionSnapshot({
-          locationId,
-          selectedTimestamp,
-          signal: controller.signal,
-          allowInFlightReuse: false,
-        });
-      } catch (error) {
-        if (shouldRetryFreshAfterAbort(error)) {
-          return await fetchDistributionSnapshot({
-            locationId,
-            selectedTimestamp,
-            signal: controller.signal,
-            bypassCache: true,
-            allowInFlightReuse: false,
-          });
-        }
-        throw error;
-      }
-    };
-
-    const hydrateCurrentSurface = async ({
-      selectedTimestamp,
-      actualTemperatureC,
-      targetDate,
-    }: {
-      selectedTimestamp: string | null;
-      actualTemperatureC: number | null;
-      targetDate: string;
-    }) => {
-      if (currentPath === "/analysis" && currentTab === "models") {
-        try {
-          const nextInsight = await fetchTransitionInsightSnapshot({
-            selectedTimestamp,
-            actualTemperatureC,
-          });
-          let nextDistribution = await fetchTransitionDistributionSnapshot({
-            selectedTimestamp: nextInsight.selectedTimestamp,
-          });
-
-          if (nextDistribution.selectedTimestamp !== nextInsight.selectedTimestamp) {
-            nextDistribution = await fetchTransitionDistributionSnapshot({
-              selectedTimestamp: nextInsight.selectedTimestamp,
-            });
-          }
-
-          return {
-            nextModelTimestamp: nextInsight.selectedTimestamp,
-            nextInsight,
-            nextDistribution,
-            nextKelly: null,
-          };
-        } catch (error) {
-          if (isAbortLikeError(error)) {
-            throw error;
-          }
-
-          return {
-            nextModelTimestamp: selectedTimestamp,
-            nextInsight: null,
-            nextDistribution: null,
-            nextKelly: null,
-          };
-        }
-      }
-
-      if (currentPath === "/kelly") {
-        // Do not block location commit on Kelly payload hydration. Route/URL
-        // should switch immediately, then Kelly page loader fetches snapshot
-        // for the new location independently.
-        return {
-          nextModelTimestamp: selectedTimestamp,
-          nextInsight: null,
-          nextDistribution: null,
-          nextKelly: null,
-        };
-      }
-
-      if (currentPath === "/") {
-        // Keep homepage location switches responsive; the quick insight rail
-        // revalidates through the normal effect after the dashboard commits.
-        return {
-          nextModelTimestamp: selectedTimestamp,
-          nextInsight: null,
-          nextDistribution: null,
-          nextKelly: null,
-        };
-      }
-
+    const createImmediateSurfaceSeed = (selectedTimestamp: string | null) => {
+      // Commit city changes as soon as the dashboard is available. Analysis,
+      // Kelly, and homepage snapshots hydrate through route-bound loaders after
+      // the location switch, so multimodel latency never blocks navigation.
       return {
         nextModelTimestamp: selectedTimestamp,
         nextInsight: null,
@@ -1758,14 +1708,7 @@ export default function App() {
           cachedSelectedHour,
         );
         const cachedActualTemperature = resolveDefaultReferenceTemperature(cachedDashboard, cachedSelectedHour);
-        const primed = await hydrateCurrentSurface({
-          selectedTimestamp: cachedSelectedHour,
-          actualTemperatureC: cachedActualTemperature,
-          targetDate: cachedTargetDate,
-        });
-        if (requestSeq !== locationTransitionSeqRef.current) {
-          return;
-        }
+        const primed = createImmediateSurfaceSeed(cachedSelectedHour);
 
         commitLocationTransition({
           nextDashboard: cachedDashboard,
@@ -1794,15 +1737,7 @@ export default function App() {
         selectedTimestamp,
       );
       const nextActualTemperature = resolveDefaultReferenceTemperature(nextDashboard, selectedTimestamp);
-      const primed = await hydrateCurrentSurface({
-        selectedTimestamp,
-        actualTemperatureC: nextActualTemperature,
-        targetDate: nextTargetDate,
-      });
-
-      if (requestSeq !== locationTransitionSeqRef.current) {
-        return;
-      }
+      const primed = createImmediateSurfaceSeed(selectedTimestamp);
 
       commitLocationTransition({
         nextDashboard,
@@ -2077,14 +2012,16 @@ export default function App() {
 
       if (manual) {
         setCacheBust(Date.now());
-        if (shouldRefreshAnalysisSurface) {
+        if (locationId === routeState.locationId && routeState.path !== "/kelly") {
           invalidateAnalysisWarmCaches(locationId);
           setInsightError(null);
           setDistributionError(null);
+          setAnalysisReloadNonce((current) => current + 1);
+        }
+        if (shouldRefreshAnalysisSurface) {
           setLoadingInsight(true);
           setLoadingDistribution(true);
           setManualAnalysisRefreshPending(true);
-          setAnalysisReloadNonce((current) => current + 1);
         }
       }
 
@@ -2592,7 +2529,19 @@ export default function App() {
       locationTransitionState.pendingLocationId !== null &&
       locationTransitionState.pendingLocationId !== routeState.locationId;
     const dashboardAligned = dashboard?.hourly.location.id === routeState.locationId;
-    if (awaitingLocationCommit || !dashboard || !dashboardAligned || routeState.path === "/kelly") {
+    if (routeState.path === "/kelly") {
+      setInsight(null);
+      setDistribution(null);
+      setLatestInsightEnvelope(null);
+      setLatestDistributionEnvelope(null);
+      return;
+    }
+
+    if (awaitingLocationCommit) {
+      return;
+    }
+
+    if (!dashboard || !dashboardAligned) {
       setInsight(null);
       setDistribution(null);
       setLatestInsightEnvelope(null);
@@ -2633,7 +2582,9 @@ export default function App() {
       ? readWarmCacheEntry<DistributionViewModel>(distributionWarmCacheRef.current, distributionKey)
       : null;
 
-    if (routeState.path !== "/analysis" && cachedInsight) {
+    const shouldRevalidateHomeInsight = routeState.path !== "/analysis" && cachedInsight;
+
+    if (shouldRevalidateHomeInsight) {
       setInsight(cachedInsight);
       const key = buildAnalysisBatchKey(requestLocationId, cachedInsight.selectedTimestamp);
       if (key) {
@@ -2646,9 +2597,7 @@ export default function App() {
         });
       }
       setInsightError(null);
-      setLoadingInsight(false);
       setLoadingDistribution(false);
-      return;
     }
 
     let cancelled = false;
@@ -2659,7 +2608,7 @@ export default function App() {
     if (routeState.path === "/analysis") {
       distributionAbortRef.current = controller;
     }
-    setLoadingInsight(true);
+    setLoadingInsight(!shouldRevalidateHomeInsight);
     if (routeState.path === "/analysis") {
       setLoadingDistribution(true);
     } else {
@@ -2669,11 +2618,41 @@ export default function App() {
     }
 
     const load = async () => {
+      const isCurrentAnalysisRequest = () => {
+        if (cancelled || requestEpoch !== analysisRequestEpochRef.current) {
+          return false;
+        }
+
+        const liveAnalysisRuntime = analysisRuntimeRef.current;
+        const liveRouteState = routeStateRef.current;
+        const liveSelectedTimestamp =
+          liveAnalysisRuntime.selectedInsightTimestamp ?? liveRouteState.selectedHourlyTimestamp ?? null;
+        const liveActualTemperature =
+          liveAnalysisRuntime.actualTemperatureC ??
+          resolveDefaultReferenceTemperature(dashboardRef.current, liveSelectedTimestamp);
+
+        return (
+          liveAnalysisRuntime.routeLocationId === requestLocationId &&
+          liveAnalysisRuntime.routePath === routeState.path &&
+          liveSelectedTimestamp === requestSelectedTimestamp &&
+          liveActualTemperature === requestActualTemperature
+        );
+      };
+
       try {
         const insightPromise =
-          cachedInsight
-            ? Promise.resolve(cachedInsight)
-            : fetchInsightSnapshot({
+          shouldRevalidateHomeInsight
+            ? fetchInsightSnapshot({
+                locationId: requestLocationId,
+                selectedTimestamp: requestSelectedTimestamp,
+                actualTemperatureC: requestActualTemperature,
+                signal: controller.signal,
+                bypassCache: true,
+                allowInFlightReuse: false,
+              })
+            : cachedInsight
+              ? Promise.resolve(cachedInsight)
+              : fetchInsightSnapshot({
                 locationId: requestLocationId,
                 selectedTimestamp: requestSelectedTimestamp,
                 actualTemperatureC: requestActualTemperature,
@@ -2691,26 +2670,7 @@ export default function App() {
             : Promise.resolve(null);
         const [insightResult, distributionResult] = await Promise.allSettled([insightPromise, distributionPromise]);
 
-        if (cancelled) {
-          return;
-        }
-        if (requestEpoch !== analysisRequestEpochRef.current) {
-          return;
-        }
-
-        const liveAnalysisRuntime = analysisRuntimeRef.current;
-        const liveRouteState = routeStateRef.current;
-        const liveSelectedTimestamp =
-          liveAnalysisRuntime.selectedInsightTimestamp ?? liveRouteState.selectedHourlyTimestamp ?? null;
-        const liveActualTemperature =
-          liveAnalysisRuntime.actualTemperatureC ??
-          resolveDefaultReferenceTemperature(dashboardRef.current, liveSelectedTimestamp);
-        if (
-          liveAnalysisRuntime.routeLocationId !== requestLocationId ||
-          liveAnalysisRuntime.routePath === "/kelly" ||
-          liveSelectedTimestamp !== requestSelectedTimestamp ||
-          liveActualTemperature !== requestActualTemperature
-        ) {
+        if (!isCurrentAnalysisRequest()) {
           return;
         }
 
@@ -2745,9 +2705,14 @@ export default function App() {
           }
         }
 
+        if (!isCurrentAnalysisRequest()) {
+          return;
+        }
+
         if (
           routeState.path === "/analysis" &&
-          liveAnalysisRuntime.routePath === "/analysis" &&
+          analysisRuntimeRef.current.routePath === "/analysis" &&
+          !insightTask &&
           !analysisTask &&
           !distributionFailure
         ) {
@@ -3017,15 +2982,10 @@ export default function App() {
   const reportText = report?.textZh ?? CONFIG.fallback.emptyText;
   const rawImageAvailabilityStatus = dashboard?.multimodel.imageStatus ?? "unavailable";
   const imageUrl =
-    dashboard
+    dashboard && dashboard.multimodel.imageUrlFound && rawImageAvailabilityStatus !== "unavailable"
       ? weatherApi.buildMultiModelImageUrl(routeState.locationId, true, cacheBust)
       : null;
-  const imageAvailable = Boolean(imageUrl);
-  const imageAvailabilityStatus = imageAvailable
-    ? "ready"
-    : rawImageAvailabilityStatus === "revalidating"
-      ? "revalidating"
-      : "unavailable";
+  const imageAvailabilityStatus = rawImageAvailabilityStatus;
   const imageUpdatedAt =
     imageAvailabilityStatus !== "unavailable"
       ? (dashboard?.multimodel.displayUpdatedAt ?? dashboard?.sync.updatedAt ?? null)
@@ -3383,6 +3343,13 @@ export default function App() {
   );
   const analysisSnapshotForLocation =
     analysisSnapshot && analysisSnapshot.locationId === routeState.locationId ? analysisSnapshot : null;
+  const analysisSnapshotWhileTransitioning =
+    isAnalysis &&
+    analysisSnapshot?.locationId === routeState.locationId &&
+    (isLocationTransitionPending || loadingInsight || loadingDistribution || manualAnalysisRefreshPending)
+      ? analysisSnapshot
+      : null;
+  const displayedAnalysisSnapshot = analysisSnapshotForLocation ?? analysisSnapshotWhileTransitioning;
   const homepageStableAnalysisSnapshot =
     latestInsightForCurrentLocation &&
     latestDistributionForCurrentLocation &&
@@ -3394,16 +3361,19 @@ export default function App() {
       : analysisSnapshotForLocation;
   const homepageCommittedInsight = homepageStableAnalysisSnapshot?.insight ?? null;
   const homepageCommittedDistribution = homepageStableAnalysisSnapshot?.distribution ?? null;
-  const effectiveLastConsistentAnalysisKey = analysisSnapshotForLocation?.key ?? lastConsistentAnalysisKey;
+  const lastConsistentAnalysisKeyForLocation = lastConsistentAnalysisKey?.startsWith(`${routeState.locationId}::`)
+    ? lastConsistentAnalysisKey
+    : null;
+  const effectiveLastConsistentAnalysisKey = displayedAnalysisSnapshot?.key ?? lastConsistentAnalysisKeyForLocation;
   const displayedAnalysisInsight = isAnalysis
     ? latestInsightMatchesCurrentBatch
       ? latestInsightForCurrentBatch?.data ?? null
-      : analysisSnapshotForLocation?.insight ?? null
+      : displayedAnalysisSnapshot?.insight ?? null
     : insight;
   const displayedAnalysisDistribution = isAnalysis
     ? latestDistributionMatchesCurrentBatch
       ? latestDistributionForCurrentBatch?.data ?? null
-      : analysisSnapshotForLocation?.distribution ?? null
+      : displayedAnalysisSnapshot?.distribution ?? null
     : distribution;
   const hasRenderableAnalysisData = Boolean(displayedAnalysisInsight || displayedAnalysisDistribution);
   const analysisPageLoading =
@@ -3414,12 +3384,12 @@ export default function App() {
     !insightError &&
     !distributionError;
   const analysisAvailabilityStatus =
-    hasRenderableAnalysisData
-      ? "ready"
-      : insightError || distributionError
-        ? "fallback_error"
-        : analysisPageLoading || loadingInsight || loadingDistribution
+    insightError || distributionError
+      ? "fallback_error"
+      : analysisPageLoading || loadingInsight || loadingDistribution || manualAnalysisRefreshPending
         ? "revalidating"
+        : hasRenderableAnalysisData
+          ? "ready"
           : "unavailable";
   const effectiveModelTimestamp =
     requestedAnalysisTimestamp ?? displayedAnalysisDistribution?.selectedTimestamp ?? null;

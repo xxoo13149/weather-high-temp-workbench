@@ -20,6 +20,7 @@ import {
   extractMultiModelImageUrl,
   extractMultiModelPageInventory,
   MULTIMODEL_HIGHCHARTS_VERSION,
+  type MultiModelUrlLocationExpectation,
   resolveMultiModelTemperatureUnit,
 } from "./multimodel.js";
 
@@ -1078,12 +1079,13 @@ export const loadMultiModelDistribution = async (
   timeZone: string,
   loaders: MultiModelDistributionLoaders = {},
   fallbackTemperatureUnit: ParsedTemperatureUnit = "C",
+  expectedLocation?: MultiModelUrlLocationExpectation,
 ): Promise<MultiModelDistributionCacheValue> => {
   const loadPageHtml = loaders.loadPageHtml ?? ((url: string, init?: RequestInit) => fetchText(url, init));
   const loadHighchartsText = loaders.loadHighchartsText ?? ((url: string, init?: RequestInit) => fetchText(url, init));
   const pageHtml = await loadPageHtml(pageUrl);
   const pageFetchedAt = new Date().toISOString();
-  const highchartsUrl = extractMultiModelHighchartsUrl(pageHtml);
+  const highchartsUrl = extractMultiModelHighchartsUrl(pageHtml, expectedLocation);
   const highchartsText = await loadHighchartsText(highchartsUrl);
   const sourceTemperatureUnit = resolveMultiModelTemperatureUnit(highchartsUrl, fallbackTemperatureUnit);
   const parsedDataset = parseMultiModelHighcharts(highchartsText, timeZone, sourceTemperatureUnit);
@@ -1092,7 +1094,7 @@ export const loadMultiModelDistribution = async (
   let pngUrl: string | null = null;
 
   try {
-    pngUrl = extractMultiModelImageUrl(pageHtml);
+    pngUrl = extractMultiModelImageUrl(pageHtml, expectedLocation);
   } catch {
     pngUrl = null;
   }

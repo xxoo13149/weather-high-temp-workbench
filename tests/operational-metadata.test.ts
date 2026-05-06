@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import { buildDashboardEnhancements, getLocationSourceContract } from "../src/operational-metadata.js";
 
 describe("buildDashboardEnhancements", () => {
-  test("does not tell users multimodel is unavailable for production locations just because the cache is cold", () => {
+  test("does not overstate multimodel availability when the current city has no usable multimodel payload", () => {
     const enhancements = buildDashboardEnhancements({
       locationId: "shanghai_pvg",
       hourly: {
@@ -31,11 +31,9 @@ describe("buildDashboardEnhancements", () => {
       } as never,
     });
 
-    expect(enhancements.intradaySignals.evidence).toContain(
-      "多模型参考可以在分析页继续确认升温时间和温度区间是否稳定。",
-    );
+    expect(enhancements.intradaySignals.evidence).toContain("多模型参考当前可能暂不可用，先看小时轨道和天气摘要。");
     expect(enhancements.intradaySignals.evidence).not.toContain(
-      "多模型参考暂时不可用，先以小时轨道和天气摘要为主。",
+      "多模型参考可以在分析页继续确认升温时间和温度区间是否稳定。",
     );
   });
 
@@ -73,6 +71,7 @@ describe("buildDashboardEnhancements", () => {
     expect(enhancements.intradaySignals.upsideCase).toContain("°F");
     expect(enhancements.intradaySignals.downsideCase).toContain("°F");
   });
+
   test("marks cities without stable Kelly mapping as non-production", () => {
     expect(getLocationSourceContract("laufau_shan_lfs").kellyMarketMapping).toMatchObject({
       status: "planned",

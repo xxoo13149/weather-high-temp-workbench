@@ -12,6 +12,9 @@ type TestWorkerEnv = {
   };
   KELLY_SERVER_BASE_URL?: string;
   KELLY_STREAM_PROXY_MODE?: string;
+  KELLY_PROXY_GET_TIMEOUT_MS?: string;
+  DASHBOARD_PROXY_GET_TIMEOUT_MS?: string;
+  KELLY_PROXY_STREAM_TIMEOUT_MS?: string;
 };
 
 const createEnv = (overrides: Partial<TestWorkerEnv> = {}) => ({
@@ -124,7 +127,11 @@ afterEach(() => {
 describe("cloudflare worker kelly routing", () => {
   test("reports worker runtime metadata on /healthz", async () => {
     const worker = await loadWorker();
-    const env = createEnv();
+    const env = createEnv({
+      DASHBOARD_PROXY_GET_TIMEOUT_MS: "9000",
+      KELLY_PROXY_GET_TIMEOUT_MS: "12000",
+      KELLY_PROXY_STREAM_TIMEOUT_MS: "5000",
+    });
 
     const response = await worker.fetch(new Request("https://lukaluka.fun/healthz"), env, createContext());
 
@@ -136,6 +143,11 @@ describe("cloudflare worker kelly routing", () => {
       startedAt: expect.any(String),
       kellyProxy: expect.objectContaining({
         configured: false,
+        timeoutsMs: {
+          kellyGet: 12000,
+          dashboardGet: 9000,
+          stream: 5000,
+        },
         circuitState: "closed",
         localFallbackActive: false,
         streamMode: "canary",
@@ -144,9 +156,39 @@ describe("cloudflare worker kelly routing", () => {
     });
   }, 15_000);
 
+  test("rejects malformed numeric and timestamp query parameters before dispatch", async () => {
+    const worker = await loadWorker();
+    const env = createEnv();
+
+    const badDistribution = await worker.fetch(
+      new Request("https://lukaluka.fun/api/weather/multimodel/distribution?locationId=miami_mia&timestamp=1&bucketSize=1x"),
+      env,
+      createContext(),
+    );
+    const badKelly = await worker.fetch(
+      new Request("https://lukaluka.fun/api/weather/kelly?locationId=miami_mia&bankroll=100x&minEdge=0.03x&selectedHour=1"),
+      env,
+      createContext(),
+    );
+
+    expect(badDistribution.status).toBe(400);
+    await expect(badDistribution.json()).resolves.toMatchObject({
+      code: "BAD_REQUEST",
+      message: "Query parameter 'timestamp' must be a valid ISO timestamp.",
+    });
+    expect(badKelly.status).toBe(400);
+    await expect(badKelly.json()).resolves.toMatchObject({
+      code: "BAD_REQUEST",
+      message: "Query parameter 'bankroll' must be a positive number.",
+    });
+  });
+
   test("reports source contracts and Kelly proxy state on /api/system/status", async () => {
     const worker = await loadWorker();
-    const env = createEnv({ KELLY_SERVER_BASE_URL: "https://kelly-proxy.example" });
+    const env = createEnv({
+      KELLY_SERVER_BASE_URL: "https://kelly-proxy.example",
+      DASHBOARD_PROXY_GET_TIMEOUT_MS: "9000",
+    });
 
     const response = await worker.fetch(new Request("https://lukaluka.fun/api/system/status"), env, createContext());
 
@@ -183,6 +225,9 @@ describe("cloudflare worker kelly routing", () => {
       kellyProxy: expect.objectContaining({
         configured: true,
         originBaseUrl: "https://kelly-proxy.example",
+        timeoutsMs: expect.objectContaining({
+          dashboardGet: 9000,
+        }),
         streamMode: "canary",
       }),
     });
@@ -1570,7 +1615,182 @@ describe("cloudflare worker kelly routing", () => {
     });
   });
 
-  test("edge-caches stable dashboard responses while upstream data is revalidating in background", async () => {
+  test("keeps the worker-local dashboard available when multimodel status fails", async () => {
+    const getHourly = vi.fn(async () => ({
+      location: { id: "lagos_los", name: "Lagos", timezone: "Africa/Lagos" },
+      fetchedAt: "2026-04-23T00:00:00.000Z",
+      sourceObservedAt: null,
+      mode: "1h",
+      periodHours: 1,
+      sourceType: "week-table-1h",
+      stale: false,
+      freshness: "fresh",
+      pageUrl: "https://example.com/week",
+      parserVersion: "test",
+      items: [],
+      fieldCoverage: {},
+      partial: false,
+      warnings: [],
+      cacheHit: true,
+      current: null,
+    }));
+    const getWeatherReport = vi.fn(async () => ({
+      location: { id: "lagos_los", name: "Lagos", timezone: "Africa/Lagos" },
+      pageUrl: "https://example.com/week",
+      parserVersion: "test",
+      available: true,
+      titleEn: "Report",
+      sourceTextEn: "Report",
+      textZh: "Report",
+      metrics: {},
+      warnings: [],
+      fetchedAt: "2026-04-23T00:00:00.000Z",
+      sourceObservedAt: null,
+      stale: false,
+      freshness: "fresh",
+      cacheHit: true,
+    }));
+    const getMultiModelStatus = vi.fn(async () => {
+      throw new Error("multimodel parse failed");
+    });
+
+    vi.doMock("../src/providers/meteoblue/service.js", () => {
+      class MockMeteoblueWeatherService {
+        getHourly = getHourly;
+        getWeatherReport = getWeatherReport;
+        getMultiModelStatus = getMultiModelStatus;
+      }
+
+      return { MeteoblueWeatherService: MockMeteoblueWeatherService };
+    });
+
+    const worker = await loadWorker();
+    const response = await worker.fetch(
+      new Request("https://lukaluka.fun/api/weather/dashboard?locationId=lagos_los"),
+      createEnv(),
+      createContext(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      multimodel: {
+        analysisStatus: "unavailable",
+        imageStatus: "unavailable",
+        freshness: "fallback_error",
+        lastError: "该城市当前暂不可用，请稍后再试。",
+        diagnosticMessage: "multimodel parse failed",
+      },
+      sourceMetadata: {
+        freshness: {
+          multimodel: "fallback_error",
+        },
+      },
+    });
+  });
+
+  test("does not edge-cache dashboard responses while multimodel is revalidating", async () => {
+    const edgeCache = createEdgeCache();
+    vi.stubGlobal("caches", { default: edgeCache });
+    vi.doMock("../src/providers/meteoblue/service.js", () => {
+      class MockMeteoblueWeatherService {
+        async getHourly() {
+          return {
+            location: { id: "toronto_yyz", name: "Toronto Pearson International Airport", timezone: "America/Toronto" },
+            fetchedAt: "2026-04-09T00:00:00.000Z",
+            sourceObservedAt: null,
+            mode: "1h",
+            periodHours: 1,
+            sourceType: "week-table-1h",
+            stale: false,
+            freshness: "fresh",
+            pageUrl: "https://example.com/week",
+            parserVersion: "test",
+            items: [],
+            fieldCoverage: {},
+            partial: false,
+            warnings: [],
+            cacheHit: true,
+            current: null,
+          };
+        }
+
+        async getWeatherReport() {
+          return {
+            location: { id: "toronto_yyz", name: "Toronto Pearson International Airport", timezone: "America/Toronto" },
+            pageUrl: "https://example.com/week",
+            parserVersion: "test",
+            available: true,
+            titleEn: "Report",
+            sourceTextEn: "Report",
+            textZh: "Report",
+            metrics: {},
+            warnings: [],
+            fetchedAt: "2026-04-09T00:00:00.000Z",
+            sourceObservedAt: null,
+            stale: false,
+            freshness: "fresh",
+            cacheHit: true,
+          };
+        }
+
+        async getMultiModelStatus() {
+          return {
+            location: { id: "toronto_yyz", name: "Toronto Pearson International Airport", timezone: "America/Toronto" },
+            displayUnit: "C",
+            fallbackDisplayUnit: "C",
+            pageFetchedAt: "2026-04-09T00:00:00.000Z",
+            imageFetchedAt: "2026-04-09T00:00:00.000Z",
+            imageUrlFound: true,
+            cacheHit: true,
+            stale: false,
+            freshness: "revalidating",
+            imageStatus: "ready",
+            analysisStatus: "revalidating",
+            lastError: null,
+            lastSuccessAt: "2026-04-09T00:00:00.000Z",
+            imageUrl: "https://example.com/multimodel.png",
+            pageUrl: "https://example.com/multimodel",
+          };
+        }
+
+        async getMultiModelDistribution() {
+          return {
+            warnings: [],
+            freshness: "fresh",
+          };
+        }
+      }
+
+      return { MeteoblueWeatherService: MockMeteoblueWeatherService };
+    });
+
+    const worker = await loadWorker();
+    const response = await worker.fetch(
+      new Request("https://lukaluka.fun/api/weather/dashboard?locationId=toronto_yyz"),
+      createEnv(),
+      createContext(),
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(payload).toMatchObject({
+      sync: {
+        state: "fresh",
+        freshness: "fresh",
+      },
+      hourly: {
+        freshness: "fresh",
+      },
+      multimodel: {
+        freshness: "revalidating",
+        statusLabel: "revalidating",
+      },
+    });
+    expect(edgeCache.put).not.toHaveBeenCalled();
+  });
+
+  test("does not edge-cache dashboard responses while hourly is revalidating even when multimodel is ready", async () => {
     const edgeCache = createEdgeCache();
     vi.stubGlobal("caches", { default: edgeCache });
     vi.doMock("../src/providers/meteoblue/service.js", () => {
@@ -1618,22 +1838,20 @@ describe("cloudflare worker kelly routing", () => {
         async getMultiModelStatus() {
           return {
             location: { id: "toronto_yyz", name: "Toronto Pearson International Airport", timezone: "America/Toronto" },
-            pageFetchedAt: null,
-            imageFetchedAt: null,
-            imageUrlFound: false,
-            cacheHit: false,
+            displayUnit: "C",
+            fallbackDisplayUnit: "C",
+            pageFetchedAt: "2026-04-09T00:00:00.000Z",
+            imageFetchedAt: "2026-04-09T00:00:00.000Z",
+            imageUrlFound: true,
+            cacheHit: true,
             stale: false,
-            lastError: null,
-            lastSuccessAt: null,
-            imageUrl: null,
-            pageUrl: "https://example.com/multimodel",
-          };
-        }
-
-        async getMultiModelDistribution() {
-          return {
-            warnings: [],
             freshness: "fresh",
+            imageStatus: "ready",
+            analysisStatus: "ready",
+            lastError: null,
+            lastSuccessAt: "2026-04-09T00:00:00.000Z",
+            imageUrl: "https://example.com/multimodel.png",
+            pageUrl: "https://example.com/multimodel",
           };
         }
       }
@@ -1650,17 +1868,22 @@ describe("cloudflare worker kelly routing", () => {
     const payload = await response.json();
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("cache-control")).toContain("s-maxage=30");
+    expect(response.headers.get("cache-control")).toContain("no-store");
     expect(payload).toMatchObject({
       sync: {
-        state: "fresh",
-        freshness: "fresh",
+        state: "revalidating",
+        freshness: "revalidating",
+        label: "revalidating",
       },
       hourly: {
         freshness: "revalidating",
       },
+      multimodel: {
+        freshness: "fresh",
+        statusLabel: "ready",
+      },
     });
-    expect(edgeCache.put).toHaveBeenCalled();
+    expect(edgeCache.put).not.toHaveBeenCalled();
   });
 
   test("does not edge-cache fallback_error insight responses", async () => {
@@ -1868,17 +2091,17 @@ describe("cloudflare worker kelly routing", () => {
             location: { id: "toronto_yyz", name: "Toronto Pearson International Airport", timezone: "America/Toronto" },
             displayUnit: "C",
             fallbackDisplayUnit: "C",
-            pageFetchedAt: null,
-            imageFetchedAt: null,
-            imageUrlFound: false,
-            cacheHit: false,
+            pageFetchedAt: "2026-04-09T00:00:00.000Z",
+            imageFetchedAt: "2026-04-09T00:00:00.000Z",
+            imageUrlFound: true,
+            cacheHit: true,
             stale: false,
             freshness: "fresh",
-            imageStatus: "unavailable",
-            analysisStatus: "unavailable",
+            imageStatus: "ready",
+            analysisStatus: "ready",
             lastError: null,
-            lastSuccessAt: null,
-            imageUrl: null,
+            lastSuccessAt: "2026-04-09T00:00:00.000Z",
+            imageUrl: "https://example.com/multimodel.png",
             pageUrl: "https://example.com/multimodel",
           };
         }
@@ -1948,17 +2171,17 @@ describe("cloudflare worker kelly routing", () => {
             location: { id: "toronto_yyz", name: "Toronto Pearson International Airport", timezone: "America/Toronto" },
             displayUnit: "C",
             fallbackDisplayUnit: "C",
-            pageFetchedAt: null,
-            imageFetchedAt: null,
-            imageUrlFound: false,
-            cacheHit: false,
+            pageFetchedAt: "2026-04-09T00:00:00.000Z",
+            imageFetchedAt: "2026-04-09T00:00:00.000Z",
+            imageUrlFound: true,
+            cacheHit: true,
             stale: false,
             freshness: "fresh",
-            imageStatus: "unavailable",
-            analysisStatus: "unavailable",
+            imageStatus: "ready",
+            analysisStatus: "ready",
             lastError: null,
-            lastSuccessAt: null,
-            imageUrl: null,
+            lastSuccessAt: "2026-04-09T00:00:00.000Z",
+            imageUrl: "https://example.com/multimodel.png",
             pageUrl: "https://example.com/multimodel",
           };
         }
@@ -1988,6 +2211,10 @@ describe("cloudflare worker kelly routing", () => {
       sync: {
         state: "fresh",
         freshness: "fresh",
+      },
+      multimodel: {
+        freshness: "fresh",
+        statusLabel: "ready",
       },
     });
     expect(edgeCache.put).toHaveBeenCalledTimes(1);

@@ -3,39 +3,14 @@ import type { FastifyInstance, preHandlerHookHandler } from "fastify";
 import { DEFAULT_LOCATION, LOCATION_REGISTRY } from "../config.js";
 import { AppError } from "../domain/errors.js";
 import type { KellyRiskMode, KellyStreamHandle, KellyStreamMessage, LocationInfo, WeatherService } from "../domain/weather.js";
+import { parseFiniteNumberQuery, parseIsoTimestampQuery, parsePositiveNumberQuery } from "../lib/query-params.js";
 
 const parseTimestamp = (raw: unknown): string | undefined => {
-  if (raw === undefined || raw === "") {
-    return undefined;
-  }
-
-  if (typeof raw !== "string") {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'timestamp' must be a valid ISO timestamp.");
-  }
-
-  const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'timestamp' must be a valid ISO timestamp.");
-  }
-
-  return raw;
+  return parseIsoTimestampQuery(raw, "Query parameter 'timestamp' must be a valid ISO timestamp.");
 };
 
 const parseActualTemperatureC = (raw: unknown): number | undefined => {
-  if (raw === undefined || raw === "") {
-    return undefined;
-  }
-
-  if (typeof raw !== "string") {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'actualTemperatureC' must be a finite number.");
-  }
-
-  const value = Number.parseFloat(raw);
-  if (!Number.isFinite(value)) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'actualTemperatureC' must be a finite number.");
-  }
-
-  return value;
+  return parseFiniteNumberQuery(raw, "Query parameter 'actualTemperatureC' must be a finite number.");
 };
 
 const parseKellyTargetDate = (raw: unknown): string | undefined => {
@@ -51,20 +26,7 @@ const parseKellyTargetDate = (raw: unknown): string | undefined => {
 };
 
 const parseBankroll = (raw: unknown): number | undefined => {
-  if (raw === undefined || raw === "") {
-    return undefined;
-  }
-
-  if (typeof raw !== "string") {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'bankroll' must be a positive number.");
-  }
-
-  const value = Number.parseFloat(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'bankroll' must be a positive number.");
-  }
-
-  return value;
+  return parsePositiveNumberQuery(raw, "Query parameter 'bankroll' must be a positive number.");
 };
 
 const parseKellyRiskMode = (raw: unknown): KellyRiskMode | undefined => {
@@ -80,15 +42,11 @@ const parseKellyRiskMode = (raw: unknown): KellyRiskMode | undefined => {
 };
 
 const parseKellyMinEdge = (raw: unknown): number | undefined => {
-  if (raw === undefined || raw === "") {
+  const value = parseFiniteNumberQuery(raw, "Query parameter 'minEdge' must be between 0 and 1.");
+  if (value === undefined) {
     return undefined;
   }
 
-  if (typeof raw !== "string") {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'minEdge' must be between 0 and 1.");
-  }
-
-  const value = Number.parseFloat(raw);
   if (!Number.isFinite(value) || value < 0 || value > 1) {
     throw new AppError(400, "BAD_REQUEST", "Query parameter 'minEdge' must be between 0 and 1.");
   }

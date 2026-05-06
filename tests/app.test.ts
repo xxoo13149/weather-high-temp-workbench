@@ -937,6 +937,36 @@ describe("createApp", () => {
     await app.close();
   });
 
+  test("keeps dashboard available when multimodel status fails cold", async () => {
+    const service = createService();
+    vi.mocked(service.getMultiModelStatus).mockRejectedValueOnce(new Error("multimodel upstream down"));
+    const app = createApp(service, { frontendDistDir });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/weather/dashboard?mode=1h&limit=6&locationId=miami_mia",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      multimodel: {
+        analysisStatus: "unavailable",
+        imageStatus: "unavailable",
+        freshness: "fallback_error",
+        lastError: "该城市当前暂不可用，请稍后再试。",
+        diagnosticMessage: "multimodel upstream down",
+        imageProxyUrl: "/api/weather/multimodel/image?allowStale=true&locationId=miami_mia",
+      },
+      sourceMetadata: {
+        freshness: {
+          multimodel: "fallback_error",
+        },
+      },
+    });
+
+    await app.close();
+  });
+
   test("keeps dashboard sync stable while upstream data revalidates in background", async () => {
     const service = createService();
     vi.mocked(service.getHourly).mockResolvedValueOnce({
@@ -1053,6 +1083,41 @@ describe("createApp", () => {
       targetDate: "2026-03-28",
       markets: [expect.objectContaining({ marketId: "market-1" })],
       recommendations: [expect.objectContaining({ marketId: "market-1" })],
+    });
+
+    await app.close();
+  });
+
+  test("rejects malformed numeric and timestamp query parameters", async () => {
+    const service = createService();
+    const app = createApp(service, { frontendDistDir });
+    const badHourly = await app.inject({
+      method: "GET",
+      url: "/api/weather/hourly?locationId=miami_mia&limit=2abc",
+    });
+    const badDistribution = await app.inject({
+      method: "GET",
+      url: "/api/weather/multimodel/distribution?locationId=miami_mia&timestamp=1&bucketSize=1x",
+    });
+    const badKelly = await app.inject({
+      method: "GET",
+      url: "/api/weather/kelly?locationId=miami_mia&bankroll=100x&minEdge=0.03x&selectedHour=1",
+    });
+
+    expect(badHourly.statusCode).toBe(400);
+    expect(badHourly.json()).toMatchObject({
+      code: "BAD_REQUEST",
+      message: "Query parameter 'limit' must be a positive integer.",
+    });
+    expect(badDistribution.statusCode).toBe(400);
+    expect(badDistribution.json()).toMatchObject({
+      code: "BAD_REQUEST",
+      message: "Query parameter 'timestamp' must be a valid ISO timestamp.",
+    });
+    expect(badKelly.statusCode).toBe(400);
+    expect(badKelly.json()).toMatchObject({
+      code: "BAD_REQUEST",
+      message: "Query parameter 'bankroll' must be a positive number.",
     });
 
     await app.close();

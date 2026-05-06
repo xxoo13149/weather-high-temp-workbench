@@ -12,6 +12,7 @@ import type {
   KellyRiskMode,
   KellyStreamMessage,
   LocationInfo,
+  MultiModelStatusResponse,
   WeatherReportMetrics,
   WeatherReportResponse,
 } from "../domain/weather.js";
@@ -23,7 +24,9 @@ import {
   buildSystemStatusResponse,
   getLocationSourceContract,
 } from "../operational-metadata.js";
+import { buildMultiModelStatusPresentation } from "../providers/meteoblue/multimodel-error-presentation.js";
 import { MeteoblueWeatherService } from "../providers/meteoblue/service.js";
+import { parseFiniteNumberQuery, parseIsoTimestampQuery, parsePositiveIntegerQuery, parsePositiveNumberQuery } from "../lib/query-params.js";
 import { CloudflareFavoritesStore, InMemoryFavoritesStore } from "./favorites-store.js";
 
 type AssetBinding = {
@@ -38,6 +41,9 @@ type WorkerEnv = {
   };
   KELLY_SERVER_BASE_URL?: string;
   KELLY_STREAM_PROXY_MODE?: string;
+  KELLY_PROXY_GET_TIMEOUT_MS?: string;
+  DASHBOARD_PROXY_GET_TIMEOUT_MS?: string;
+  KELLY_PROXY_STREAM_TIMEOUT_MS?: string;
 };
 
 type WorkerContext = {
@@ -79,9 +85,27 @@ let servicePromise: Promise<MeteoblueWeatherService> | null = null;
 const KELLY_PROXY_FAILURE_THRESHOLD = 3;
 const KELLY_PROXY_FAILURE_WINDOW_MS = 60_000;
 const KELLY_PROXY_OPEN_DURATION_MS = 5 * 60_000;
-const KELLY_PROXY_GET_TIMEOUT_MS = 14_000;
-const DASHBOARD_PROXY_GET_TIMEOUT_MS = 14_000;
-const KELLY_PROXY_STREAM_TIMEOUT_MS = 6_000;
+const DEFAULT_KELLY_PROXY_GET_TIMEOUT_MS = 14_000;
+const DEFAULT_DASHBOARD_PROXY_GET_TIMEOUT_MS = 8_000;
+const DEFAULT_KELLY_PROXY_STREAM_TIMEOUT_MS = 6_000;
+
+const readPositiveIntegerEnv = (raw: string | undefined, fallback: number) => {
+  if (!raw) {
+    return fallback;
+  }
+
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
+
+const resolveKellyProxyGetTimeoutMs = (env: WorkerEnv) =>
+  readPositiveIntegerEnv(env.KELLY_PROXY_GET_TIMEOUT_MS, DEFAULT_KELLY_PROXY_GET_TIMEOUT_MS);
+
+const resolveDashboardProxyGetTimeoutMs = (env: WorkerEnv) =>
+  readPositiveIntegerEnv(env.DASHBOARD_PROXY_GET_TIMEOUT_MS, DEFAULT_DASHBOARD_PROXY_GET_TIMEOUT_MS);
+
+const resolveKellyProxyStreamTimeoutMs = (env: WorkerEnv) =>
+  readPositiveIntegerEnv(env.KELLY_PROXY_STREAM_TIMEOUT_MS, DEFAULT_KELLY_PROXY_STREAM_TIMEOUT_MS);
 
 const createKellyProxyCircuitTracker = (): KellyProxyCircuitTracker => ({
   failureTimestamps: [],
@@ -146,57 +170,21 @@ const parseMode = (raw: string | null): HourlyMode => {
 };
 
 const parseLimit = (raw: string | null): number | undefined => {
-  if (raw === null || raw === "") {
-    return undefined;
-  }
-
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'limit' must be a positive integer.");
-  }
-
-  return value;
+  return parsePositiveIntegerQuery(raw, "Query parameter 'limit' must be a positive integer.");
 };
 
 const parseAllowStale = (raw: string | null): boolean => raw === "true" || raw === "1";
 
 const parseTimestamp = (raw: string | null): string | undefined => {
-  if (raw === null || raw === "") {
-    return undefined;
-  }
-
-  const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'timestamp' must be a valid ISO timestamp.");
-  }
-
-  return raw;
+  return parseIsoTimestampQuery(raw, "Query parameter 'timestamp' must be a valid ISO timestamp.");
 };
 
 const parseBucketSize = (raw: string | null): number | undefined => {
-  if (raw === null || raw === "") {
-    return undefined;
-  }
-
-  const value = Number.parseFloat(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'bucketSize' must be a positive number.");
-  }
-
-  return value;
+  return parsePositiveNumberQuery(raw, "Query parameter 'bucketSize' must be a positive number.");
 };
 
 const parseFloatNumber = (raw: string | null, message: string): number | undefined => {
-  if (raw === null || raw === "") {
-    return undefined;
-  }
-
-  const value = Number.parseFloat(raw);
-  if (!Number.isFinite(value)) {
-    throw new AppError(400, "BAD_REQUEST", message);
-  }
-
-  return value;
+  return parseFiniteNumberQuery(raw, message);
 };
 
 const parseActualTemperatureC = (raw: string | null): number | undefined =>
@@ -433,6 +421,41 @@ const buildDashboardReportFallback = (
   };
 };
 
+const buildDashboardMultiModelFallback = (
+  locationId: LocationInfo["id"],
+  reason: unknown,
+): MultiModelStatusResponse => {
+  const location = LOCATION_REGISTRY[locationId];
+  const presentation = buildMultiModelStatusPresentation(reason, {
+    hasRenderableImage: false,
+    hasRenderableAnalysis: false,
+  });
+
+  return {
+    location: {
+      id: location.id,
+      name: location.name,
+      timezone: location.timezone,
+    },
+    displayUnit: location.fallbackDisplayUnit,
+    fallbackDisplayUnit: location.fallbackDisplayUnit,
+    pageFetchedAt: null,
+    imageFetchedAt: null,
+    imageUrlFound: false,
+    cacheHit: false,
+    stale: false,
+    freshness: "fallback_error",
+    imageStatus: "unavailable",
+    analysisStatus: "unavailable",
+    lastError: presentation.userMessage,
+    diagnosticCode: presentation.diagnosticCode,
+    diagnosticMessage: presentation.diagnosticMessage,
+    lastSuccessAt: null,
+    imageUrl: null,
+    pageUrl: location.multimodelPageUrl,
+  };
+};
+
 const buildEdgeCacheControl = (ttlSeconds: number) =>
   `public, max-age=0, s-maxage=${ttlSeconds}, stale-while-revalidate=${ttlSeconds}`;
 
@@ -506,6 +529,15 @@ const hasCacheableMultimodelStatus = (payload: unknown) => {
   if (
     typeof payload === "object" &&
     payload !== null &&
+    "diagnosticCode" in payload &&
+    typeof (payload as { diagnosticCode?: unknown }).diagnosticCode === "string"
+  ) {
+    return false;
+  }
+
+  if (
+    typeof payload === "object" &&
+    payload !== null &&
     "imageStatus" in payload &&
     "analysisStatus" in payload &&
     (payload as { imageStatus?: unknown }).imageStatus === "unavailable" &&
@@ -517,12 +549,34 @@ const hasCacheableMultimodelStatus = (payload: unknown) => {
   return true;
 };
 
-const hasFreshDashboardSync = (payload: unknown) =>
-  typeof payload === "object" &&
-  payload !== null &&
-  "sync" in payload &&
-  typeof (payload as { sync?: { freshness?: unknown } }).sync?.freshness === "string" &&
-  (payload as { sync: { freshness: string } }).sync.freshness === "fresh";
+const hasFreshNestedFreshness = (payload: unknown) =>
+  typeof payload !== "object" ||
+  payload === null ||
+  !("freshness" in payload) ||
+  (payload as { freshness?: unknown }).freshness === "fresh";
+
+const hasCacheableDashboardStatus = (payload: unknown) => {
+  if (typeof payload !== "object" || payload === null) {
+    return false;
+  }
+
+  const dashboard = payload as {
+    hourly?: unknown;
+    report?: unknown;
+    sync?: { freshness?: unknown };
+    multimodel?: { freshness?: unknown; statusLabel?: unknown };
+  };
+
+  return (
+    dashboard.sync?.freshness === "fresh" &&
+    hasFreshNestedFreshness(dashboard.hourly) &&
+    hasFreshNestedFreshness(dashboard.report) &&
+    typeof dashboard.multimodel === "object" &&
+    dashboard.multimodel !== null &&
+    dashboard.multimodel.statusLabel === "ready" &&
+    hasFreshNestedFreshness(dashboard.multimodel)
+  );
+};
 
 const resolvePayloadFreshness = (
   payload: unknown,
@@ -1290,7 +1344,7 @@ const fetchKellyOriginStream = async (
     timeoutId = setTimeout(() => {
       controller.abort();
       resolve({ kind: "timeout" });
-    }, KELLY_PROXY_STREAM_TIMEOUT_MS);
+    }, resolveKellyProxyStreamTimeoutMs(env));
   });
 
   try {
@@ -1368,6 +1422,11 @@ const fetchKellyOriginStream = async (
 const buildKellyProxyHealth = (env: WorkerEnv) => ({
   configured: Boolean(resolveKellyServerBaseUrl(env)),
   originBaseUrl: resolveKellyServerBaseUrl(env),
+  timeoutsMs: {
+    kellyGet: resolveKellyProxyGetTimeoutMs(env),
+    dashboardGet: resolveDashboardProxyGetTimeoutMs(env),
+    stream: resolveKellyProxyStreamTimeoutMs(env),
+  },
   circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
   consecutiveFailures: kellyGetProxyCircuit.consecutiveFailures,
   openUntil:
@@ -1512,7 +1571,7 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
   }
 
   if (request.method === "GET" && url.pathname === "/api/weather/kelly") {
-    const originAttempt = await fetchKellyOriginGet(request, env, KELLY_PROXY_GET_TIMEOUT_MS);
+    const originAttempt = await fetchKellyOriginGet(request, env, resolveKellyProxyGetTimeoutMs(env));
     if (originAttempt.kind === "passthrough") {
       return originAttempt.response;
     }
@@ -1528,7 +1587,7 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
   }
 
   if (request.method === "GET" && url.pathname === "/api/weather/dashboard") {
-    const originAttempt = await fetchDashboardOriginGet(request, env, DASHBOARD_PROXY_GET_TIMEOUT_MS);
+    const originAttempt = await fetchDashboardOriginGet(request, env, resolveDashboardProxyGetTimeoutMs(env));
     if (originAttempt.kind === "passthrough") {
       return originAttempt.response;
     }
@@ -1567,12 +1626,15 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
         ctx,
         EDGE_CACHE_TTL_SECONDS.dashboard,
         async () => {
-          const [hourlyResult, multimodel, reportResult, metar, taf] = await Promise.all([
+          const [hourlyResult, multimodelResult, reportResult, metar, taf] = await Promise.all([
             service.getHourly(locationId, mode, limit).then(
               (value) => ({ ok: true as const, value }),
               (error) => ({ ok: false as const, error }),
             ),
-            service.getMultiModelStatus(locationId),
+            service.getMultiModelStatus(locationId).then(
+              (value) => ({ ok: true as const, value }),
+              (error) => ({ ok: false as const, error }),
+            ),
             service.getWeatherReport(locationId).then(
               (value) => ({ ok: true as const, value }),
               (error) => ({ ok: false as const, error }),
@@ -1586,6 +1648,9 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
           const report = reportResult.ok
             ? reportResult.value
             : buildDashboardReportFallback(locationId, reportResult.error);
+          const multimodel = multimodelResult.ok
+            ? multimodelResult.value
+            : buildDashboardMultiModelFallback(locationId, multimodelResult.error);
           const dashboardEnhancements = buildDashboardEnhancements({
             locationId,
             hourly,
@@ -1595,7 +1660,9 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
           const syncState =
             hourly.freshness === "fallback_error" || report.freshness === "fallback_error"
               ? "fallback_error"
-              : "fresh";
+              : hourly.freshness === "revalidating" || report.freshness === "revalidating"
+                ? "revalidating"
+                : "fresh";
 
           return {
             generatedAt: new Date().toISOString(),
@@ -1606,7 +1673,9 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
               label:
                 syncState === "fallback_error"
                   ? "fallback_error"
-                  : "synced",
+                  : syncState === "revalidating"
+                    ? "revalidating"
+                    : "synced",
               updatedAt: hourly.fetchedAt,
             },
           locationDirectory: buildLocationDirectory(),
@@ -1633,7 +1702,7 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
           };
         },
         {
-          shouldCache: hasFreshDashboardSync,
+          shouldCache: hasCacheableDashboardStatus,
         },
       );
     }

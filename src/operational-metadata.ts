@@ -414,7 +414,6 @@ const buildEvidence = (
 ) => {
   const stationLabel = contract.settlementReference.stationCode ?? contract.settlementReference.label;
   const multiModelReferenceReady =
-    contract.currentSources.modelEnvelope.status === "production" ||
     multimodel.analysisStatus !== "unavailable" ||
     multimodel.imageStatus !== "unavailable";
   const evidence = [
@@ -423,8 +422,10 @@ const buildEvidence = (
 
   evidence.push(
     multiModelReferenceReady
-      ? "多模型参考可以在分析页继续确认升温时间和温度区间是否稳定。"
-      : "多模型参考还在补齐中，当前先看小时轨道和天气摘要。",
+      ? multimodel.freshness === "fallback_error"
+        ? "多模型参考当前先沿用最近一次可用结果，分析页可继续交叉确认，但先以小时轨道和天气摘要为主。"
+        : "多模型参考可以在分析页继续确认升温时间和温度区间是否稳定。"
+      : "多模型参考当前可能暂不可用，先看小时轨道和天气摘要。",
   );
 
   if (report.metrics.predictability) {

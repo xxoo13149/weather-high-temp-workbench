@@ -4,6 +4,7 @@ import { AppError } from "../../domain/errors.js";
 
 export const MULTIMODEL_IMAGE_VERSION = "2026-04-04.2";
 export const MULTIMODEL_HIGHCHARTS_VERSION = "2026-04-04.2";
+const MULTIMODEL_LOCATION_TOLERANCE_DEGREES = 0.2;
 
 type ParsedTemperatureUnit = "C" | "F";
 
@@ -22,6 +23,12 @@ export interface MultiModelPageModelMeta {
 export interface MultiModelPageInventoryResult {
   models: MultiModelPageModelMeta[];
   warnings: string[];
+}
+
+export interface MultiModelUrlLocationExpectation {
+  latitude: number;
+  longitude: number;
+  timezone: string;
 }
 
 const normalizeUrl = (href: string): string => {
@@ -72,6 +79,54 @@ const assertHighchartsUrl = (url: string): string => {
   }
 
   return url;
+};
+
+const parseOptionalUrlCoordinate = (url: URL, key: string): number | null => {
+  const raw = url.searchParams.get(key);
+  if (raw === null || raw === "") {
+    return null;
+  }
+
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+};
+
+export const assertMultiModelUrlMatchesLocation = (
+  url: string,
+  expectedLocation: MultiModelUrlLocationExpectation | undefined,
+  code: string,
+  assetLabel: string,
+): string => {
+  if (!expectedLocation) {
+    return url;
+  }
+
+  const parsed = new URL(url);
+  const latitude = parseOptionalUrlCoordinate(parsed, "lat");
+  const longitude = parseOptionalUrlCoordinate(parsed, "lon");
+  const timezone = parsed.searchParams.get("tz")?.trim() ?? null;
+
+  if (latitude === null || longitude === null || !timezone) {
+    return url;
+  }
+
+  const mismatch =
+    Math.abs(latitude - expectedLocation.latitude) > MULTIMODEL_LOCATION_TOLERANCE_DEGREES ||
+    Math.abs(longitude - expectedLocation.longitude) > MULTIMODEL_LOCATION_TOLERANCE_DEGREES ||
+    timezone !== expectedLocation.timezone;
+
+  if (!mismatch) {
+    return url;
+  }
+
+  throw new AppError(
+    503,
+    code,
+    `Resolved meteoblue multimodel ${assetLabel} points to a different location than requested.`,
+    {
+      retryable: true,
+    },
+  );
 };
 
 export const resolveMultiModelTemperatureUnit = (
@@ -125,7 +180,7 @@ const parseLastUpdatedIso = (value: string | null): string | null => {
   return null;
 };
 
-export const extractMultiModelImageUrl = (html: string): string => {
+export const extractMultiModelImageUrl = (html: string, expectedLocation?: MultiModelUrlLocationExpectation): string => {
   const $ = load(html);
   const preferred = $("a[href], a#chart_download[href]")
     .toArray()
@@ -149,10 +204,18 @@ export const extractMultiModelImageUrl = (html: string): string => {
     });
   }
 
-  return assertMultiModelImageUrl(normalizeUrl(candidate));
+  return assertMultiModelUrlMatchesLocation(
+    assertMultiModelImageUrl(normalizeUrl(candidate)),
+    expectedLocation,
+    "MULTIMODEL_IMAGE_LOCATION_MISMATCH",
+    "image link",
+  );
 };
 
-export const extractMultiModelHighchartsUrl = (html: string): string => {
+export const extractMultiModelHighchartsUrl = (
+  html: string,
+  expectedLocation?: MultiModelUrlLocationExpectation,
+): string => {
   const $ = load(html);
   const candidate = extractFirstAttrUrl(
     $,
@@ -179,7 +242,12 @@ export const extractMultiModelHighchartsUrl = (html: string): string => {
     );
   }
 
-  return assertHighchartsUrl(normalizeUrl(candidate));
+  return assertMultiModelUrlMatchesLocation(
+    assertHighchartsUrl(normalizeUrl(candidate)),
+    expectedLocation,
+    "MULTIMODEL_HIGHCHARTS_LOCATION_MISMATCH",
+    "highcharts link",
+  );
 };
 
 const parseSelectedDomainCodesFromUrl = (highchartsUrl: string): string[] => {

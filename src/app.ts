@@ -15,12 +15,15 @@ import type {
   HourlyWeatherResponse,
   LocationDirectoryEntry,
   LocationInfo,
+  MultiModelStatusResponse,
   WeatherReportMetrics,
   WeatherReportResponse,
   WeatherService,
 } from "./domain/weather.js";
+import { parseFiniteNumberQuery, parseIsoTimestampQuery, parsePositiveIntegerQuery, parsePositiveNumberQuery } from "./lib/query-params.js";
 import { normalizeDashboardMetarSnapshot } from "./domain/weather.js";
 import { buildDashboardEnhancements, buildLocationDirectory, buildMetricsText, buildSystemStatusResponse } from "./operational-metadata.js";
+import { buildMultiModelStatusPresentation } from "./providers/meteoblue/multimodel-error-presentation.js";
 import { MeteoblueWeatherService } from "./providers/meteoblue/service.js";
 import { registerKellyRoutes } from "./server/kelly-routes.js";
 
@@ -42,73 +45,21 @@ const parseMode = (raw: unknown): HourlyMode => {
 };
 
 const parseLimit = (raw: unknown): number | undefined => {
-  if (raw === undefined || raw === "") {
-    return undefined;
-  }
-
-  if (typeof raw !== "string") {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'limit' must be a positive integer.");
-  }
-
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'limit' must be a positive integer.");
-  }
-
-  return value;
+  return parsePositiveIntegerQuery(raw, "Query parameter 'limit' must be a positive integer.");
 };
 
 const parseAllowStale = (raw: unknown): boolean => raw === "true" || raw === "1";
 
 const parseTimestamp = (raw: unknown): string | undefined => {
-  if (raw === undefined || raw === "") {
-    return undefined;
-  }
-
-  if (typeof raw !== "string") {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'timestamp' must be a valid ISO timestamp.");
-  }
-
-  const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'timestamp' must be a valid ISO timestamp.");
-  }
-
-  return raw;
+  return parseIsoTimestampQuery(raw, "Query parameter 'timestamp' must be a valid ISO timestamp.");
 };
 
 const parseBucketSize = (raw: unknown): number | undefined => {
-  if (raw === undefined || raw === "") {
-    return undefined;
-  }
-
-  if (typeof raw !== "string") {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'bucketSize' must be a positive number.");
-  }
-
-  const value = Number.parseFloat(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'bucketSize' must be a positive number.");
-  }
-
-  return value;
+  return parsePositiveNumberQuery(raw, "Query parameter 'bucketSize' must be a positive number.");
 };
 
 const parseActualTemperatureC = (raw: unknown): number | undefined => {
-  if (raw === undefined || raw === "") {
-    return undefined;
-  }
-
-  if (typeof raw !== "string") {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'actualTemperatureC' must be a finite number.");
-  }
-
-  const value = Number.parseFloat(raw);
-  if (!Number.isFinite(value)) {
-    throw new AppError(400, "BAD_REQUEST", "Query parameter 'actualTemperatureC' must be a finite number.");
-  }
-
-  return value;
+  return parseFiniteNumberQuery(raw, "Query parameter 'actualTemperatureC' must be a finite number.");
 };
 
 const parseFavoriteBody = (raw: unknown): boolean => {
@@ -270,6 +221,41 @@ const buildDashboardReportFallback = (
   };
 };
 
+const buildDashboardMultiModelFallback = (
+  locationId: LocationInfo["id"],
+  reason: unknown,
+): MultiModelStatusResponse => {
+  const location = LOCATION_REGISTRY[locationId];
+  const presentation = buildMultiModelStatusPresentation(reason, {
+    hasRenderableImage: false,
+    hasRenderableAnalysis: false,
+  });
+
+  return {
+    location: {
+      id: location.id,
+      name: location.name,
+      timezone: location.timezone,
+    },
+    displayUnit: location.fallbackDisplayUnit,
+    fallbackDisplayUnit: location.fallbackDisplayUnit,
+    pageFetchedAt: null,
+    imageFetchedAt: null,
+    imageUrlFound: false,
+    cacheHit: false,
+    stale: false,
+    freshness: "fallback_error",
+    imageStatus: "unavailable",
+    analysisStatus: "unavailable",
+    lastError: presentation.userMessage,
+    diagnosticCode: presentation.diagnosticCode,
+    diagnosticMessage: presentation.diagnosticMessage,
+    lastSuccessAt: null,
+    imageUrl: null,
+    pageUrl: location.multimodelPageUrl,
+  };
+};
+
 const staticContentTypes: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
@@ -428,12 +414,15 @@ export const createApp = (
     const mode = parseMode(query.mode);
     const limit = parseLimit(query.limit);
 
-    const [hourlyResult, multimodel, reportResult, metar, taf] = await Promise.all([
+    const [hourlyResult, multimodelResult, reportResult, metar, taf] = await Promise.all([
       service.getHourly(locationId, mode, limit).then(
         (value) => ({ ok: true as const, value }),
         (error) => ({ ok: false as const, error }),
       ),
-      service.getMultiModelStatus(locationId),
+      service.getMultiModelStatus(locationId).then(
+        (value) => ({ ok: true as const, value }),
+        (error) => ({ ok: false as const, error }),
+      ),
       service.getWeatherReport(locationId).then(
         (value) => ({ ok: true as const, value }),
         (error) => ({ ok: false as const, error }),
@@ -447,6 +436,9 @@ export const createApp = (
     const report = reportResult.ok
       ? reportResult.value
       : buildDashboardReportFallback(locationId, reportResult.error);
+    const multimodel = multimodelResult.ok
+      ? multimodelResult.value
+      : buildDashboardMultiModelFallback(locationId, multimodelResult.error);
     const dashboardEnhancements = buildDashboardEnhancements({
       locationId,
       hourly,

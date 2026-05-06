@@ -15,12 +15,15 @@ export interface CacheGetOptions {
   allowStaleOnError?: boolean;
   staleWhileRevalidate?: boolean;
   forceRefresh?: boolean;
+  background?: boolean;
 }
 
 export interface CacheSnapshot<T> {
   entry: CacheEntry<T> | null;
   inFlight: boolean;
+  inFlightMode: "foreground" | "background" | null;
   lastError: string | null;
+  lastErrorCode: string | null;
   lastSuccessAt: string | null;
   freshness: CacheGetResult<T>["freshness"] | null;
 }
@@ -28,7 +31,9 @@ export interface CacheSnapshot<T> {
 export class RefreshableCache<T> {
   private entry: CacheEntry<T> | null = null;
   private inFlight: Promise<CacheEntry<T>> | null = null;
+  private inFlightMode: "foreground" | "background" | null = null;
   private lastError: string | null = null;
+  private lastErrorCode: string | null = null;
   private activeLoadId = 0;
 
   constructor(
@@ -49,7 +54,9 @@ export class RefreshableCache<T> {
 
     if (this.entry && options?.staleWhileRevalidate) {
       const freshness = this.lastError ? "fallback_error" : "revalidating";
-      void this.startLoad().catch(() => undefined);
+      void this.startLoad({
+        mode: "background",
+      }).catch(() => undefined);
       return {
         value: this.entry.value,
         cacheHit: true,
@@ -59,7 +66,10 @@ export class RefreshableCache<T> {
     }
 
     try {
-      const entry = await this.startLoad(options?.forceRefresh);
+      const entry = await this.startLoad({
+        forceRefresh: options?.forceRefresh,
+        mode: options?.background ? "background" : "foreground",
+      });
       return {
         value: entry.value,
         cacheHit: false,
@@ -94,7 +104,9 @@ export class RefreshableCache<T> {
     return {
       entry: this.entry,
       inFlight: this.inFlight !== null,
+      inFlightMode: this.inFlightMode,
       lastError: this.lastError,
+      lastErrorCode: this.lastErrorCode,
       lastSuccessAt: this.entry?.storedAt.toISOString() ?? null,
       freshness,
     };
@@ -111,10 +123,15 @@ export class RefreshableCache<T> {
       expiresAt: storedAt.getTime() + this.ttlMs,
     };
     this.lastError = null;
+    this.lastErrorCode = null;
     return this.entry;
   }
 
-  private startLoad(forceRefresh = false): Promise<CacheEntry<T>> {
+  private startLoad(options?: {
+    forceRefresh?: boolean;
+    mode?: "foreground" | "background";
+  }): Promise<CacheEntry<T>> {
+    const forceRefresh = options?.forceRefresh ?? false;
     if (this.inFlight) {
       return this.inFlight;
     }
@@ -122,6 +139,7 @@ export class RefreshableCache<T> {
     if (!this.inFlight || forceRefresh) {
       const loadId = this.activeLoadId + 1;
       this.activeLoadId = loadId;
+      this.inFlightMode = options?.mode ?? "foreground";
       this.inFlight = this.load(loadId);
     }
 
@@ -140,16 +158,20 @@ export class RefreshableCache<T> {
       if (this.activeLoadId === loadId) {
         this.entry = entry;
         this.lastError = null;
+        this.lastErrorCode = null;
       }
       return entry;
     } catch (error) {
       if (this.activeLoadId === loadId) {
         this.lastError = error instanceof Error ? error.message : String(error);
+        this.lastErrorCode =
+          typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : null;
       }
       throw error;
     } finally {
       if (this.activeLoadId === loadId) {
         this.inFlight = null;
+        this.inFlightMode = null;
       }
     }
   }

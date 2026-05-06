@@ -4,6 +4,8 @@ export interface ErrorPayload {
   retryable: boolean;
   staleAvailable: boolean;
   lastSuccessAt: string | null;
+  diagnosticCode?: string;
+  diagnosticMessage?: string;
 }
 
 export class AppError extends Error {
@@ -12,6 +14,8 @@ export class AppError extends Error {
   readonly retryable: boolean;
   readonly staleAvailable: boolean;
   readonly lastSuccessAt: string | null;
+  readonly diagnosticCode: string | null;
+  readonly diagnosticMessage: string | null;
 
   constructor(
     statusCode: number,
@@ -21,6 +25,8 @@ export class AppError extends Error {
       retryable?: boolean;
       staleAvailable?: boolean;
       lastSuccessAt?: string | null;
+      diagnosticCode?: string | null;
+      diagnosticMessage?: string | null;
     },
   ) {
     super(message);
@@ -30,16 +36,28 @@ export class AppError extends Error {
     this.retryable = options?.retryable ?? false;
     this.staleAvailable = options?.staleAvailable ?? false;
     this.lastSuccessAt = options?.lastSuccessAt ?? null;
+    this.diagnosticCode = options?.diagnosticCode ?? null;
+    this.diagnosticMessage = options?.diagnosticMessage ?? null;
   }
 
   toPayload(): ErrorPayload {
-    return {
+    const payload: ErrorPayload = {
       code: this.code,
       message: this.message,
       retryable: this.retryable,
       staleAvailable: this.staleAvailable,
       lastSuccessAt: this.lastSuccessAt,
     };
+
+    if (this.diagnosticCode) {
+      payload.diagnosticCode = this.diagnosticCode;
+    }
+
+    if (this.diagnosticMessage) {
+      payload.diagnosticMessage = this.diagnosticMessage;
+    }
+
+    return payload;
   }
 }
 
