@@ -126,6 +126,7 @@ const KELLY_FOCUS_RECOVERY_STALE_MS = 20_000;
 const KELLY_FOCUS_RECOVERY_COOLDOWN_MS = 1_500;
 const MOBILE_RAIL_HISTORY_KEY = "__weatherMobileRail";
 const MULTIMODEL_WARMUP_RETRY_DELAYS_MS = [900, 1_600, 2_600, 4_000, 6_000];
+const MULTIMODEL_TRANSIENT_RETRY_STATUSES = new Set([502, 503, 504]);
 const MULTIMODEL_WARMUP_RETRY_CODES = new Set([
   "MULTIMODEL_DISTRIBUTION_REFRESH_IN_PROGRESS",
   "MULTIMODEL_DISTRIBUTION_UNAVAILABLE",
@@ -245,6 +246,10 @@ const resolveWeatherApiErrorCode = (error: unknown) =>
 const isMultiModelWarmupRetryError = (error: unknown) => {
   if (!(error instanceof WeatherApiError)) {
     return false;
+  }
+
+  if (MULTIMODEL_TRANSIENT_RETRY_STATUSES.has(error.status) && error.payload?.retryable !== false) {
+    return true;
   }
 
   const code = resolveWeatherApiErrorCode(error);
