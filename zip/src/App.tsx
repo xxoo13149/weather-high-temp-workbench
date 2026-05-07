@@ -1472,17 +1472,6 @@ export default function App() {
       );
     }
 
-    if (targets.analysis && selectedTimestamp !== null) {
-      warmTasks.push(() =>
-        fetchDistributionSnapshot({
-          locationId,
-          selectedTimestamp,
-          signal: controller.signal,
-          bypassCache,
-        }),
-      );
-    }
-
     if (targets.kelly) {
       warmTasks.push(() =>
         fetchKellySnapshot({
@@ -2665,20 +2654,6 @@ export default function App() {
                 actualTemperatureC: requestActualTemperature,
                 signal: controller.signal,
               });
-        const distributionPromise =
-          routeState.path === "/analysis"
-            ? cachedDistribution
-              ? Promise.resolve(cachedDistribution)
-              : fetchDistributionSnapshot({
-                  locationId: requestLocationId,
-                  selectedTimestamp: requestSelectedTimestamp,
-                  signal: controller.signal,
-                })
-            : Promise.resolve(null);
-        const distributionResultPromise: Promise<PromiseSettledResult<DistributionViewModel | null>> = distributionPromise.then(
-          (value): PromiseFulfilledResult<DistributionViewModel | null> => ({ status: "fulfilled", value }),
-          (reason): PromiseRejectedResult => ({ status: "rejected", reason }),
-        );
         let insightTask: InsightViewModel | null = null;
         let insightBatchKey: string | null = null;
 
@@ -2721,31 +2696,37 @@ export default function App() {
           return;
         }
 
+        if (!insightTask) {
+          if (isCurrentAnalysisRequest()) {
+            setDistributionError(null);
+          }
+          return;
+        }
+
         let analysisTask: DistributionViewModel | null = null;
         let distributionFailure: string | null = null;
-        const distributionResult = await distributionResultPromise;
-        if (distributionResult.status === "fulfilled") {
-          analysisTask = distributionResult.value;
+        const distributionTimestamp = insightTask.selectedTimestamp;
+        const alignedCachedDistribution =
+          cachedDistribution?.selectedTimestamp === distributionTimestamp
+            ? cachedDistribution
+            : readWarmCacheEntry<DistributionViewModel>(
+                distributionWarmCacheRef.current,
+                buildDistributionWarmKey(requestLocationId, distributionTimestamp),
+              );
 
-          if (insightTask && (!analysisTask || analysisTask.selectedTimestamp !== insightTask.selectedTimestamp)) {
-            try {
-              analysisTask = await fetchDistributionSnapshot({
-                locationId: requestLocationId,
-                selectedTimestamp: insightTask.selectedTimestamp,
-                signal: controller.signal,
-              });
-            } catch (error) {
-              if (isAbortLikeError(error)) {
-                return;
-              }
-              distributionFailure = getErrorMessage(error, UI_TEXT.errors.distribution);
-            }
-          }
-        } else {
-          if (isAbortLikeError(distributionResult.reason)) {
+        try {
+          analysisTask =
+            alignedCachedDistribution ??
+            (await fetchDistributionSnapshot({
+              locationId: requestLocationId,
+              selectedTimestamp: distributionTimestamp,
+              signal: controller.signal,
+            }));
+        } catch (error) {
+          if (isAbortLikeError(error)) {
             return;
           }
-          distributionFailure = getErrorMessage(distributionResult.reason, UI_TEXT.errors.distribution);
+          distributionFailure = getErrorMessage(error, UI_TEXT.errors.distribution);
         }
 
         if (!isCurrentAnalysisRequest()) {
