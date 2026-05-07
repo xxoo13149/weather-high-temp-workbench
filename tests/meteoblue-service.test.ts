@@ -533,7 +533,6 @@ describe("MeteoblueWeatherService", () => {
     await expect(service.getMultiModelImage("shanghai_pvg", false)).rejects.toMatchObject({
       code: "MULTIMODEL_IMAGE_UNAVAILABLE",
       message: "该城市当前暂不可用，请稍后再试。",
-      diagnosticMessage: "boom",
       staleAvailable: true,
     });
   });
@@ -598,7 +597,7 @@ describe("MeteoblueWeatherService", () => {
     await vi.waitFor(async () => {
       const status = await service.getMultiModelStatus("shanghai_pvg");
       expect(status.lastError).toBe("多模型分析暂时不可用，当前先展示官方图。");
-      expect(status.diagnosticMessage).toContain("boom");
+      expect(status).not.toHaveProperty("diagnosticMessage");
       expect(status.imageStatus).toBe("ready");
       expect(status.analysisStatus).toBe("revalidating");
     });
@@ -636,13 +635,12 @@ describe("MeteoblueWeatherService", () => {
     await expect(service.getMultiModelDistribution("shanghai_pvg")).rejects.toMatchObject({
       code: "MULTIMODEL_DISTRIBUTION_UNAVAILABLE",
       message: "该城市当前暂不可用，请稍后再试。",
-      diagnosticMessage: "multimodel boom",
     });
 
     const status = await service.getMultiModelStatus("shanghai_pvg");
     expect(status.analysisStatus).toBe("revalidating");
     expect(status.lastError).toBe("该城市当前暂不可用，请稍后再试。");
-    expect(status.diagnosticMessage).toContain("multimodel boom");
+    expect(status).not.toHaveProperty("diagnosticMessage");
     expect(status.freshness).toBe("revalidating");
   });
 
@@ -666,7 +664,7 @@ describe("MeteoblueWeatherService", () => {
       expect(status.analysisStatus).toBe("ready");
       expect(status.freshness).toBe("fallback_error");
       expect(status.lastError).toBe("多模型数据暂时不可用，当前先展示最近一次可用结果。");
-      expect(status.diagnosticMessage).toContain("multimodel refresh failed");
+      expect(status).not.toHaveProperty("diagnosticMessage");
     });
   });
 
@@ -974,7 +972,6 @@ describe("MeteoblueWeatherService", () => {
     await expect(service.getMultiModelDistribution("losangeles_lax")).rejects.toMatchObject({
       code: "MULTIMODEL_HIGHCHARTS_LOCATION_MISMATCH",
       message: "该城市当前暂不可用，请稍后再试。",
-      diagnosticMessage: "Resolved meteoblue multimodel highcharts link points to a different location than requested.",
     });
     expect(fetchTextMock).toHaveBeenCalledTimes(1);
   });
@@ -1133,7 +1130,7 @@ describe("MeteoblueWeatherService", () => {
     });
   });
 
-  test("does not block foreground multimodel requests behind other location loads", async () => {
+  test("does not block foreground multimodel requests behind eight background city loads", async () => {
     let releaseGate!: () => void;
     const gate = new Promise<void>((resolve) => {
       releaseGate = resolve;
@@ -1147,6 +1144,7 @@ describe("MeteoblueWeatherService", () => {
       "lagos_los",
       "losangeles_lax",
       "guangzhou_can",
+      "beijing_pek",
     ]);
 
     fetchTextMock.mockImplementation(async (url: string) => {
@@ -1168,11 +1166,11 @@ describe("MeteoblueWeatherService", () => {
       service.getMultiModelStatus(locationId as keyof typeof LOCATION_REGISTRY),
     );
 
-    for (let attempt = 0; attempt < 20 && gatedPageLoads < gatedLocations.size; attempt += 1) {
+    for (let attempt = 0; attempt < 20 && gatedPageLoads < 7; attempt += 1) {
       await Promise.resolve();
     }
 
-    expect(gatedPageLoads).toBe(gatedLocations.size);
+    expect(gatedPageLoads).toBe(7);
 
     let foregroundTimeoutId: ReturnType<typeof setTimeout> | null = null;
     const foregroundTimeout = new Promise<never>((_, reject) => {

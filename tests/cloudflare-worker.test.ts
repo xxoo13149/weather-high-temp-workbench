@@ -1672,13 +1672,13 @@ describe("cloudflare worker kelly routing", () => {
     );
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
+    const body = await response.json();
+    expect(body).toMatchObject({
       multimodel: {
         analysisStatus: "unavailable",
         imageStatus: "unavailable",
         freshness: "fallback_error",
         lastError: "该城市当前暂不可用，请稍后再试。",
-        diagnosticMessage: "multimodel parse failed",
       },
       sourceMetadata: {
         freshness: {
@@ -1686,6 +1686,7 @@ describe("cloudflare worker kelly routing", () => {
         },
       },
     });
+    expect(body.multimodel).not.toHaveProperty("diagnosticMessage");
   });
 
   test("does not edge-cache dashboard responses while multimodel is revalidating", async () => {

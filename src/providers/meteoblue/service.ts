@@ -96,6 +96,7 @@ const METEOBLUE_WEEK_METEOGRAM_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs
 const METEOBLUE_WEEK_OPTIONAL_METEOGRAM_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 2_500);
 const METEOBLUE_MULTIMODEL_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 12_000);
 const METEOBLUE_MULTIMODEL_CACHE_LOAD_CONCURRENCY = 8;
+const METEOBLUE_MULTIMODEL_BACKGROUND_CACHE_LOAD_CONCURRENCY = 7;
 const METEOBLUE_MULTIMODEL_CACHE_SLOT_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 30_000);
 const METEOBLUE_WEEK_CACHE_SLOT_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 20_000);
 const METEOBLUE_WEEK_PAGE_TOTAL_TIMEOUT_MS = METEOBLUE_WEEK_PAGE_LOADER_TIMEOUT_MS + 1_500;
@@ -122,18 +123,60 @@ const createGlobalLimiter = (
   options?: {
     waitTimeoutMs?: number;
     createTimeoutError?: () => Error;
+    maxBackgroundConcurrent?: number;
   },
 ) => {
   let active = 0;
-  const waiters: Array<{
+  let activeBackground = 0;
+  const foregroundWaiters: Array<{
+    released: boolean;
+    timerId: ReturnType<typeof setTimeout> | null;
+    resolve: () => void;
+  }> = [];
+  const backgroundWaiters: Array<{
     released: boolean;
     timerId: ReturnType<typeof setTimeout> | null;
     resolve: () => void;
   }> = [];
 
-  return async <T,>(loader: () => Promise<T>): Promise<T> => {
+  const canAcquire = (mode: "foreground" | "background") => {
     if (active >= maxConcurrent) {
+      return false;
+    }
+
+    if (
+      mode === "background" &&
+      options?.maxBackgroundConcurrent !== undefined &&
+      activeBackground >= options.maxBackgroundConcurrent
+    ) {
+      return false;
+    }
+
+    return true;
+  };
+
+  const queueForMode = (mode: "foreground" | "background") =>
+    mode === "foreground" ? foregroundWaiters : backgroundWaiters;
+
+  const releaseNext = () => {
+    const foreground = foregroundWaiters.shift();
+    if (foreground) {
+      foreground.resolve();
+      return;
+    }
+
+    if (options?.maxBackgroundConcurrent !== undefined && activeBackground >= options.maxBackgroundConcurrent) {
+      return;
+    }
+
+    backgroundWaiters.shift()?.resolve();
+  };
+
+  return async <T,>(loader: () => Promise<T>, requestOptions?: { mode?: "foreground" | "background" }): Promise<T> => {
+    const mode = requestOptions?.mode ?? "foreground";
+    if (!canAcquire(mode)) {
       await new Promise<void>((resolve, reject) => {
+        const queue = queueForMode(mode);
         const waiter = {
           released: false,
           timerId: null as ReturnType<typeof setTimeout> | null,
@@ -157,9 +200,9 @@ const createGlobalLimiter = (
             }
 
             waiter.released = true;
-            const index = waiters.indexOf(waiter);
+            const index = queue.indexOf(waiter);
             if (index >= 0) {
-              waiters.splice(index, 1);
+              queue.splice(index, 1);
             }
             reject(
               options.createTimeoutError?.() ??
@@ -168,18 +211,23 @@ const createGlobalLimiter = (
           }, options.waitTimeoutMs);
         }
 
-        waiters.push(waiter);
+        queue.push(waiter);
       });
     }
 
     active += 1;
+    if (mode === "background") {
+      activeBackground += 1;
+    }
 
     try {
       return await loader();
     } finally {
       active = Math.max(0, active - 1);
-      const next = waiters.shift();
-      next?.resolve();
+      if (mode === "background") {
+        activeBackground = Math.max(0, activeBackground - 1);
+      }
+      releaseNext();
     }
   };
 };
@@ -198,6 +246,7 @@ const withWeekCacheLoadSlot = createGlobalLimiter(METEOBLUE_WEEK_CACHE_LOAD_CONC
 });
 
 const withMultiModelCacheLoadSlot = createGlobalLimiter(METEOBLUE_MULTIMODEL_CACHE_LOAD_CONCURRENCY, {
+  maxBackgroundConcurrent: METEOBLUE_MULTIMODEL_BACKGROUND_CACHE_LOAD_CONCURRENCY,
   waitTimeoutMs: METEOBLUE_MULTIMODEL_CACHE_SLOT_TIMEOUT_MS,
   createTimeoutError: () =>
     new AppError(
@@ -1455,55 +1504,62 @@ export class MeteoblueWeatherService implements WeatherService {
     }
 
     const location = this.requireLocation(locationId);
-    const cache = new RefreshableCache<ImageCacheValue>(config.multimodelImageTtlMs, async () => {
-      const expectedLocation = toMultiModelLocationExpectation(location);
-      const pageHtml = await withTimeout(
-        fetchText(location.multimodelPageUrl, { signal: createMultiModelLoaderSignal() }),
-        METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
-        () =>
-          new AppError(
-            504,
-            "MULTIMODEL_PAGE_TIMEOUT",
-            `Meteoblue multimodel page fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
-            {
-              retryable: true,
-            },
-          ),
-      );
-      const pageFetchedAt = new Date().toISOString();
-      const imageUrl = extractMultiModelImageUrl(pageHtml, expectedLocation);
-      const image = await withTimeout(
-        fetchBinary(imageUrl, { signal: createMultiModelLoaderSignal() }),
-        METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
-        () =>
-          new AppError(
-            504,
-            "MULTIMODEL_IMAGE_TIMEOUT",
-            `Meteoblue multimodel image fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
-            {
-              retryable: true,
-            },
-          ),
-      );
+    const cache = new RefreshableCache<ImageCacheValue>(config.multimodelImageTtlMs, async ({ mode }) => {
+      return await withMultiModelCacheLoadSlot(
+        async () => {
+          const expectedLocation = toMultiModelLocationExpectation(location);
+          const pageHtml = await withTimeout(
+            fetchText(location.multimodelPageUrl, { signal: createMultiModelLoaderSignal() }),
+            METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
+            () =>
+              new AppError(
+                504,
+                "MULTIMODEL_PAGE_TIMEOUT",
+                `Meteoblue multimodel page fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
+                {
+                  retryable: true,
+                },
+              ),
+          );
+          const pageFetchedAt = new Date().toISOString();
+          const imageUrl = extractMultiModelImageUrl(pageHtml, expectedLocation);
+          const image = await withTimeout(
+            fetchBinary(imageUrl, { signal: createMultiModelLoaderSignal() }),
+            METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
+            () =>
+              new AppError(
+                504,
+                "MULTIMODEL_IMAGE_TIMEOUT",
+                `Meteoblue multimodel image fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
+                {
+                  retryable: true,
+                },
+              ),
+          );
 
-      if (!image.contentType.toLowerCase().includes("image/png")) {
-        throw new AppError(
-          503,
-          "MULTIMODEL_IMAGE_INVALID_CONTENT_TYPE",
-          `Expected image/png content-type, got ${image.contentType}.`,
-          {
-            retryable: true,
-          },
-        );
-      }
+          if (!image.contentType.toLowerCase().includes("image/png")) {
+            throw new AppError(
+              503,
+              "MULTIMODEL_IMAGE_INVALID_CONTENT_TYPE",
+              `Expected image/png content-type, got ${image.contentType}.`,
+              {
+                retryable: true,
+              },
+            );
+          }
 
-      return {
-        pageFetchedAt,
-        imageFetchedAt: new Date().toISOString(),
-        imageUrl,
-        contentType: image.contentType,
-        body: image.body,
-      };
+          return {
+            pageFetchedAt,
+            imageFetchedAt: new Date().toISOString(),
+            imageUrl,
+            contentType: image.contentType,
+            body: image.body,
+          };
+        },
+        {
+          mode,
+        },
+      );
     });
 
     this.multiModelImageCaches.set(locationId, cache);
@@ -1519,50 +1575,54 @@ export class MeteoblueWeatherService implements WeatherService {
     const location = this.requireLocation(locationId);
     const cache = new RefreshableCache<MultiModelDistributionCacheValue>(
       config.multimodelDistributionTtlMs,
-      async () =>
-        await withMultiModelCacheLoadSlot(async () =>
-          await loadMultiModelDistribution(
-            location.multimodelPageUrl,
-            location.timezone,
-            {
-              loadPageHtml: async (pageUrl, init) =>
-                await withTimeout(
-                  fetchText(pageUrl, {
-                    ...init,
-                    signal: createMultiModelLoaderSignal(),
-                  }),
-                  METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
-                  () =>
-                    new AppError(
-                      504,
-                      "MULTIMODEL_PAGE_TIMEOUT",
-                      `Meteoblue multimodel page fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
-                      {
-                        retryable: true,
-                      },
-                    ),
-                ),
-              loadHighchartsText: async (highchartsUrl, init) =>
-                await withTimeout(
-                  fetchText(highchartsUrl, {
-                    ...init,
-                    signal: createMultiModelLoaderSignal(),
-                  }),
-                  METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
-                  () =>
-                    new AppError(
-                      504,
-                      "MULTIMODEL_HIGHCHARTS_TIMEOUT",
-                      `Meteoblue multimodel highcharts fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
-                      {
-                        retryable: true,
-                      },
-                    ),
-                ),
-            },
-            location.fallbackDisplayUnit,
-            toMultiModelLocationExpectation(location),
-          ),
+      async ({ mode }) =>
+        await withMultiModelCacheLoadSlot(
+          async () =>
+            await loadMultiModelDistribution(
+              location.multimodelPageUrl,
+              location.timezone,
+              {
+                loadPageHtml: async (pageUrl, init) =>
+                  await withTimeout(
+                    fetchText(pageUrl, {
+                      ...init,
+                      signal: createMultiModelLoaderSignal(),
+                    }),
+                    METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
+                    () =>
+                      new AppError(
+                        504,
+                        "MULTIMODEL_PAGE_TIMEOUT",
+                        `Meteoblue multimodel page fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
+                        {
+                          retryable: true,
+                        },
+                      ),
+                  ),
+                loadHighchartsText: async (highchartsUrl, init) =>
+                  await withTimeout(
+                    fetchText(highchartsUrl, {
+                      ...init,
+                      signal: createMultiModelLoaderSignal(),
+                    }),
+                    METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS,
+                    () =>
+                      new AppError(
+                        504,
+                        "MULTIMODEL_HIGHCHARTS_TIMEOUT",
+                        `Meteoblue multimodel highcharts fetch exceeded ${METEOBLUE_MULTIMODEL_TOTAL_TIMEOUT_MS}ms.`,
+                        {
+                          retryable: true,
+                        },
+                      ),
+                  ),
+              },
+              location.fallbackDisplayUnit,
+              toMultiModelLocationExpectation(location),
+            ),
+          {
+            mode,
+          },
         ),
     );
     this.multiModelDistributionCaches.set(locationId, cache);
@@ -2333,7 +2393,6 @@ export class MeteoblueWeatherService implements WeatherService {
       analysisStatus,
       lastError: presentation.userMessage,
       diagnosticCode: presentation.diagnosticCode,
-      diagnosticMessage: presentation.diagnosticMessage,
       lastSuccessAt: snapshot.entry?.value.imageFetchedAt ?? distributionSnapshot.lastSuccessAt,
       imageUrl: resolvedImageUrl,
       pageUrl: location.multimodelPageUrl,

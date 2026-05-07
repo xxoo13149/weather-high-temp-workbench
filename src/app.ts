@@ -249,7 +249,6 @@ const buildDashboardMultiModelFallback = (
     analysisStatus: "unavailable",
     lastError: presentation.userMessage,
     diagnosticCode: presentation.diagnosticCode,
-    diagnosticMessage: presentation.diagnosticMessage,
     lastSuccessAt: null,
     imageUrl: null,
     pageUrl: location.multimodelPageUrl,

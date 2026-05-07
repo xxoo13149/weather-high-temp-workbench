@@ -18,10 +18,16 @@ export interface CacheGetOptions {
   background?: boolean;
 }
 
+export type CacheLoadMode = "foreground" | "background";
+
+export interface CacheLoadContext {
+  mode: CacheLoadMode;
+}
+
 export interface CacheSnapshot<T> {
   entry: CacheEntry<T> | null;
   inFlight: boolean;
-  inFlightMode: "foreground" | "background" | null;
+  inFlightMode: CacheLoadMode | null;
   lastError: string | null;
   lastErrorCode: string | null;
   lastSuccessAt: string | null;
@@ -31,14 +37,14 @@ export interface CacheSnapshot<T> {
 export class RefreshableCache<T> {
   private entry: CacheEntry<T> | null = null;
   private inFlight: Promise<CacheEntry<T>> | null = null;
-  private inFlightMode: "foreground" | "background" | null = null;
+  private inFlightMode: CacheLoadMode | null = null;
   private lastError: string | null = null;
   private lastErrorCode: string | null = null;
   private activeLoadId = 0;
 
   constructor(
     private readonly ttlMs: number,
-    private readonly loader: () => Promise<T>,
+    private readonly loader: (context: CacheLoadContext) => Promise<T>,
   ) {}
 
   async get(options?: CacheGetOptions): Promise<CacheGetResult<T>> {
@@ -129,7 +135,7 @@ export class RefreshableCache<T> {
 
   private startLoad(options?: {
     forceRefresh?: boolean;
-    mode?: "foreground" | "background";
+    mode?: CacheLoadMode;
   }): Promise<CacheEntry<T>> {
     const forceRefresh = options?.forceRefresh ?? false;
     if (this.inFlight) {
@@ -140,15 +146,15 @@ export class RefreshableCache<T> {
       const loadId = this.activeLoadId + 1;
       this.activeLoadId = loadId;
       this.inFlightMode = options?.mode ?? "foreground";
-      this.inFlight = this.load(loadId);
+      this.inFlight = this.load(loadId, this.inFlightMode);
     }
 
     return this.inFlight;
   }
 
-  private async load(loadId: number): Promise<CacheEntry<T>> {
+  private async load(loadId: number, mode: CacheLoadMode): Promise<CacheEntry<T>> {
     try {
-      const value = await this.loader();
+      const value = await this.loader({ mode });
       const entry = {
         value,
         storedAt: new Date(),

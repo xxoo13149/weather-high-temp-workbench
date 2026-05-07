@@ -401,7 +401,6 @@ export interface MultiModelStatusResponse {
   analysisStatus: MultiModelAnalysisAvailability;
   lastError: string | null;
   diagnosticCode?: string | null;
-  diagnosticMessage?: string | null;
   lastSuccessAt: string | null;
   imageUrl: string | null;
   pageUrl: string;

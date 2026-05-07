@@ -140,7 +140,7 @@ export const buildMultiModelStatusPresentation = (
     return {
       userMessage: "多模型分析暂时不可用，当前先展示官方图。",
       diagnosticCode: diagnostic.code,
-      diagnosticMessage: diagnostic.message,
+      diagnosticMessage: null,
     };
   }
 
@@ -148,7 +148,7 @@ export const buildMultiModelStatusPresentation = (
     return {
       userMessage: "多模型图片暂时不可用，当前先展示已解析的多模型数据。",
       diagnosticCode: diagnostic.code,
-      diagnosticMessage: diagnostic.message,
+      diagnosticMessage: null,
     };
   }
 
@@ -161,7 +161,7 @@ export const buildMultiModelStatusPresentation = (
           : "多模型数据暂时不可用，当前先展示最近一次可用结果。"
         : buildUnavailableMessage(kind),
     diagnosticCode: diagnostic.code,
-    diagnosticMessage: diagnostic.message,
+    diagnosticMessage: null,
   };
 };
 
@@ -184,6 +184,6 @@ export const wrapMultiModelAppError = (
     staleAvailable: (appError?.staleAvailable ?? diagnostic.staleAvailable) || options.staleAvailable || false,
     lastSuccessAt: appError?.lastSuccessAt ?? diagnostic.lastSuccessAt ?? options.lastSuccessAt ?? null,
     diagnosticCode: diagnostic.code,
-    diagnosticMessage: diagnostic.message,
+    diagnosticMessage: null,
   });
 };

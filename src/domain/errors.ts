@@ -5,7 +5,6 @@ export interface ErrorPayload {
   staleAvailable: boolean;
   lastSuccessAt: string | null;
   diagnosticCode?: string;
-  diagnosticMessage?: string;
 }
 
 export class AppError extends Error {
@@ -51,10 +50,6 @@ export class AppError extends Error {
 
     if (this.diagnosticCode) {
       payload.diagnosticCode = this.diagnosticCode;
-    }
-
-    if (this.diagnosticMessage) {
-      payload.diagnosticMessage = this.diagnosticMessage;
     }
 
     return payload;

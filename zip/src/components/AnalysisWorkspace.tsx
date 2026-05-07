@@ -1476,10 +1476,10 @@ export const AnalysisWorkspace = ({
             </section>
 
             <section className="analysis-image-canvas rounded-[24px] border border-white/8 bg-black/20">
-              {imageUrl ? <div className="analysis-image-scroll"><img src={imageUrl} alt="meteoblue official multimodel chart" className="analysis-image rounded-[20px] border border-white/8 bg-black/30 shadow-[0_18px_60px_rgba(0,0,0,0.28)]" decoding="async" fetchPriority="high" /></div> : <div className="flex h-full min-h-[380px] items-center justify-center px-6 text-sm text-white/58">{imageStatusCaption}</div>}
-            </section>
-          </div>
-        </TabsContent>
+               {imageUrl ? <div className="analysis-image-scroll"><img key={imageUrl} src={imageUrl} alt="meteoblue official multimodel chart" className="analysis-image rounded-[20px] border border-white/8 bg-black/30 shadow-[0_18px_60px_rgba(0,0,0,0.28)]" decoding="async" fetchPriority="high" /></div> : <div className="flex h-full min-h-[380px] items-center justify-center px-6 text-sm text-white/58">{imageStatusCaption}</div>}
+             </section>
+           </div>
+         </TabsContent>
       </Tabs>
     </section>
   );

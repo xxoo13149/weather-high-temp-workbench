@@ -1609,6 +1609,7 @@ export default function App() {
       nextDistribution: DistributionViewModel | null;
       nextKelly: KellyWorkbenchResponse | null;
     }) => {
+      transitionCommitted = true;
       cacheDashboardSnapshot(locationId, nextDashboard);
 
       if (currentPath === "/analysis" && currentTab === "models") {
@@ -1698,6 +1699,7 @@ export default function App() {
     }
 
     let shouldPostTransitionRefresh = false;
+    let transitionCommitted = false;
 
     try {
       const cachedDashboard = readWarmCacheEntry<DashboardViewModel>(dashboardWarmCacheRef.current, locationId);
@@ -1772,6 +1774,11 @@ export default function App() {
     } finally {
       if (requestSeq === locationTransitionSeqRef.current) {
         setLoadingDashboard(false);
+        if (!transitionCommitted) {
+          setLoadingInsight(false);
+          setLoadingDistribution(false);
+          setLoadingKelly(false);
+        }
         setLocationTransitionState({
           pendingLocationId: null,
           stage: "idle",
@@ -2978,21 +2985,29 @@ export default function App() {
     setLastConsistentAnalysisKey(latestInsightEnvelope.key);
   }, [latestDistributionEnvelope, latestInsightEnvelope, routeState.locationId]);
 
-  const report = dashboard?.report;
-  const reportText = report?.textZh ?? CONFIG.fallback.emptyText;
-  const rawImageAvailabilityStatus = dashboard?.multimodel.imageStatus ?? "unavailable";
-  const imageUrl =
-    dashboard && dashboard.multimodel.imageUrlFound && rawImageAvailabilityStatus !== "unavailable"
-      ? weatherApi.buildMultiModelImageUrl(routeState.locationId, true, cacheBust)
-      : null;
-  const imageAvailabilityStatus = rawImageAvailabilityStatus;
-  const imageUpdatedAt =
-    imageAvailabilityStatus !== "unavailable"
-      ? (dashboard?.multimodel.displayUpdatedAt ?? dashboard?.sync.updatedAt ?? null)
-      : null;
   const isAnalysis = routeState.path === "/analysis";
   const isKelly = routeState.path === "/kelly";
   const currentPage = isKelly ? "kelly" : isAnalysis ? "analysis" : "home";
+  const report = dashboard?.report;
+  const reportText = report?.textZh ?? CONFIG.fallback.emptyText;
+  const analysisLocationCommitPending =
+    isAnalysis &&
+    locationTransitionState.pendingLocationId !== null &&
+    locationTransitionState.pendingLocationId !== routeState.locationId;
+  const rawImageAvailabilityStatus = dashboard?.multimodel.imageStatus ?? "unavailable";
+  const imageUrl =
+    analysisLocationCommitPending
+      ? null
+      : dashboard && dashboard.multimodel.imageUrlFound && rawImageAvailabilityStatus !== "unavailable"
+        ? weatherApi.buildMultiModelImageUrl(routeState.locationId, true, cacheBust)
+        : null;
+  const imageAvailabilityStatus = analysisLocationCommitPending ? "revalidating" : rawImageAvailabilityStatus;
+  const imageUpdatedAt =
+    analysisLocationCommitPending
+      ? null
+      : imageAvailabilityStatus !== "unavailable"
+      ? (dashboard?.multimodel.displayUpdatedAt ?? dashboard?.sync.updatedAt ?? null)
+      : null;
   const isLocationTransitionPending = locationTransitionState.stage === "dashboard";
 
   useEffect(() => {
@@ -3364,14 +3379,20 @@ export default function App() {
   const lastConsistentAnalysisKeyForLocation = lastConsistentAnalysisKey?.startsWith(`${routeState.locationId}::`)
     ? lastConsistentAnalysisKey
     : null;
-  const effectiveLastConsistentAnalysisKey = displayedAnalysisSnapshot?.key ?? lastConsistentAnalysisKeyForLocation;
+  const effectiveLastConsistentAnalysisKey = analysisLocationCommitPending
+    ? null
+    : displayedAnalysisSnapshot?.key ?? lastConsistentAnalysisKeyForLocation;
   const displayedAnalysisInsight = isAnalysis
-    ? latestInsightMatchesCurrentBatch
+    ? analysisLocationCommitPending
+      ? null
+      : latestInsightMatchesCurrentBatch
       ? latestInsightForCurrentBatch?.data ?? null
       : displayedAnalysisSnapshot?.insight ?? null
     : insight;
   const displayedAnalysisDistribution = isAnalysis
-    ? latestDistributionMatchesCurrentBatch
+    ? analysisLocationCommitPending
+      ? null
+      : latestDistributionMatchesCurrentBatch
       ? latestDistributionForCurrentBatch?.data ?? null
       : displayedAnalysisSnapshot?.distribution ?? null
     : distribution;
@@ -3386,7 +3407,7 @@ export default function App() {
   const analysisAvailabilityStatus =
     insightError || distributionError
       ? "fallback_error"
-      : analysisPageLoading || loadingInsight || loadingDistribution || manualAnalysisRefreshPending
+      : analysisLocationCommitPending || analysisPageLoading || loadingInsight || loadingDistribution || manualAnalysisRefreshPending
         ? "revalidating"
         : hasRenderableAnalysisData
           ? "ready"
@@ -3733,7 +3754,7 @@ export default function App() {
                   actualTemperatureC={routeState.actualTemperatureC}
                   warnings={translatedWarnings}
                   peakSummary={peakSummary}
-                  analysisKey={currentAnalysisKey}
+                  analysisKey={analysisLocationCommitPending ? null : currentAnalysisKey}
                   lastConsistentAnalysisKey={effectiveLastConsistentAnalysisKey}
                   analysisRefreshing={manualAnalysisRefreshPending}
                   pageLoading={analysisPageLoading}

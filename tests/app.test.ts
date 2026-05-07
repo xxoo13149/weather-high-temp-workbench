@@ -948,13 +948,13 @@ describe("createApp", () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({
+    const body = response.json();
+    expect(body).toMatchObject({
       multimodel: {
         analysisStatus: "unavailable",
         imageStatus: "unavailable",
         freshness: "fallback_error",
         lastError: "该城市当前暂不可用，请稍后再试。",
-        diagnosticMessage: "multimodel upstream down",
         imageProxyUrl: "/api/weather/multimodel/image?allowStale=true&locationId=miami_mia",
       },
       sourceMetadata: {
@@ -963,6 +963,7 @@ describe("createApp", () => {
         },
       },
     });
+    expect(body.multimodel).not.toHaveProperty("diagnosticMessage");
 
     await app.close();
   });
