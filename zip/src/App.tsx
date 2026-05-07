@@ -2675,62 +2675,35 @@ export default function App() {
                   signal: controller.signal,
                 })
             : Promise.resolve(null);
-        const [insightResult, distributionResult] = await Promise.allSettled([insightPromise, distributionPromise]);
+        const distributionResultPromise: Promise<PromiseSettledResult<DistributionViewModel | null>> = distributionPromise.then(
+          (value): PromiseFulfilledResult<DistributionViewModel | null> => ({ status: "fulfilled", value }),
+          (reason): PromiseRejectedResult => ({ status: "rejected", reason }),
+        );
+        let insightTask: InsightViewModel | null = null;
+        let insightBatchKey: string | null = null;
 
-        if (!isCurrentAnalysisRequest()) {
-          return;
-        }
-
-        let insightTask = insightResult.status === "fulfilled" ? insightResult.value : null;
-        let analysisTask = distributionResult.status === "fulfilled" ? distributionResult.value : null;
-        const insightFailure =
-          insightResult.status === "rejected" && !isAbortLikeError(insightResult.reason)
-            ? getErrorMessage(insightResult.reason, UI_TEXT.errors.insight)
-            : null;
-        let distributionFailure =
-          distributionResult.status === "rejected" && !isAbortLikeError(distributionResult.reason)
-            ? getErrorMessage(distributionResult.reason, UI_TEXT.errors.distribution)
-            : null;
-
-        if (routeState.path === "/analysis" && insightTask) {
-          const needsAlignedDistribution =
-            !analysisTask || analysisTask.selectedTimestamp !== insightTask.selectedTimestamp;
-
-          if (needsAlignedDistribution) {
-            try {
-              analysisTask = await fetchDistributionSnapshot({
-                locationId: requestLocationId,
-                selectedTimestamp: insightTask.selectedTimestamp,
-                signal: controller.signal,
-              });
-              distributionFailure = null;
-            } catch (error) {
-              distributionFailure = isAbortLikeError(error)
-                ? null
-                : getErrorMessage(error, UI_TEXT.errors.distribution);
-            }
+        try {
+          insightTask = await insightPromise;
+        } catch (error) {
+          if (isAbortLikeError(error)) {
+            return;
+          }
+          if (!isCurrentAnalysisRequest()) {
+            return;
+          }
+          setInsightError(getErrorMessage(error, UI_TEXT.errors.insight));
+        } finally {
+          if (isCurrentAnalysisRequest()) {
+            setLoadingInsight(false);
           }
         }
 
-        if (!isCurrentAnalysisRequest()) {
-          return;
-        }
-
-        if (
-          routeState.path === "/analysis" &&
-          analysisRuntimeRef.current.routePath === "/analysis" &&
-          !insightTask &&
-          !analysisTask &&
-          !distributionFailure
-        ) {
-          return;
-        }
-
-        const insightBatchKey = insightTask
-          ? buildAnalysisBatchKey(requestLocationId, insightTask.selectedTimestamp)
-          : null;
-
         if (insightTask) {
+          if (!isCurrentAnalysisRequest()) {
+            return;
+          }
+
+          insightBatchKey = buildAnalysisBatchKey(requestLocationId, insightTask.selectedTimestamp);
           setInsight(insightTask);
           if (insightBatchKey) {
             setLatestInsightEnvelope({
@@ -2741,9 +2714,49 @@ export default function App() {
               data: insightTask,
             });
           }
+          setInsightError(null);
         }
 
-        if (routeState.path === "/analysis" && analysisTask) {
+        if (routeState.path !== "/analysis") {
+          return;
+        }
+
+        let analysisTask: DistributionViewModel | null = null;
+        let distributionFailure: string | null = null;
+        const distributionResult = await distributionResultPromise;
+        if (distributionResult.status === "fulfilled") {
+          analysisTask = distributionResult.value;
+
+          if (insightTask && (!analysisTask || analysisTask.selectedTimestamp !== insightTask.selectedTimestamp)) {
+            try {
+              analysisTask = await fetchDistributionSnapshot({
+                locationId: requestLocationId,
+                selectedTimestamp: insightTask.selectedTimestamp,
+                signal: controller.signal,
+              });
+            } catch (error) {
+              if (isAbortLikeError(error)) {
+                return;
+              }
+              distributionFailure = getErrorMessage(error, UI_TEXT.errors.distribution);
+            }
+          }
+        } else {
+          if (isAbortLikeError(distributionResult.reason)) {
+            return;
+          }
+          distributionFailure = getErrorMessage(distributionResult.reason, UI_TEXT.errors.distribution);
+        }
+
+        if (!isCurrentAnalysisRequest()) {
+          return;
+        }
+
+        if (!insightTask && !analysisTask && !distributionFailure) {
+          return;
+        }
+
+        if (analysisTask) {
           const distributionBatchKey = buildAnalysisBatchKey(requestLocationId, analysisTask.selectedTimestamp);
           setDistribution(analysisTask);
           if (distributionBatchKey) {
@@ -2765,17 +2778,10 @@ export default function App() {
             setLastConsistentAnalysisKey(insightBatchKey);
           }
         }
-        if (insightFailure && !insightTask) {
-          setInsightError(insightFailure);
+        if (distributionFailure && !analysisTask) {
+          setDistributionError(distributionFailure);
         } else {
-          setInsightError(null);
-        }
-        if (routeState.path === "/analysis") {
-          if (distributionFailure && !analysisTask) {
-            setDistributionError(distributionFailure);
-          } else {
-            setDistributionError(null);
-          }
+          setDistributionError(null);
         }
       } catch (error) {
         if (isAbortLikeError(error)) {

@@ -96,7 +96,7 @@ const METEOBLUE_WEEK_METEOGRAM_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs
 const METEOBLUE_WEEK_OPTIONAL_METEOGRAM_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 2_500);
 const METEOBLUE_MULTIMODEL_LOADER_TIMEOUT_MS = Math.min(config.httpTimeoutMs, 12_000);
 const METEOBLUE_MULTIMODEL_CACHE_LOAD_CONCURRENCY = 8;
-const METEOBLUE_MULTIMODEL_BACKGROUND_CACHE_LOAD_CONCURRENCY = 7;
+const METEOBLUE_MULTIMODEL_BACKGROUND_CACHE_LOAD_CONCURRENCY = 2;
 const METEOBLUE_MULTIMODEL_CACHE_SLOT_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 30_000);
 const METEOBLUE_WEEK_CACHE_SLOT_TIMEOUT_MS = Math.max(config.httpTimeoutMs, 20_000);
 const METEOBLUE_WEEK_PAGE_TOTAL_TIMEOUT_MS = METEOBLUE_WEEK_PAGE_LOADER_TIMEOUT_MS + 1_500;
@@ -2295,7 +2295,7 @@ export class MeteoblueWeatherService implements WeatherService {
         distributionSnapshot = distributionCache.peek();
       }
     }
-    if (isSnapshotMissingOrExpired(distributionSnapshot)) {
+    if (distributionSnapshot.entry !== null && isSnapshotMissingOrExpired(distributionSnapshot)) {
       triggerCacheRefreshInBackground(distributionCache);
       distributionSnapshot = distributionCache.peek();
     }
