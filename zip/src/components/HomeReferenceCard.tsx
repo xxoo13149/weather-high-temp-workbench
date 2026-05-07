@@ -6,7 +6,7 @@ import { createPortal } from "react-dom";
 import { formatLocalDateTimeLabel } from "../lib/aviation-display";
 import { HOME_DETAIL_ID, HOME_DETAIL_SLOT, HOME_DETAIL_SOURCE } from "../lib/home-detail-contract";
 import { buildMetarReaderUrl } from "../lib/metar-reader";
-import { resolveSourceReadState } from "../lib/source-read-state";
+import { resolveMultiModelAnalysisReadState, resolveSourceReadState } from "../lib/source-read-state";
 import type {
   DashboardMetarSnapshot,
   DashboardResponse,
@@ -104,9 +104,10 @@ export const HomeReferenceCard = ({
   const contract = sourceMetadata.contract;
   const primaryMetarStationCode = contract.currentSources.primaryObservation.stationCode;
   const metarReaderUrl = buildMetarReaderUrl(primaryMetarStationCode);
-  const hasMultiModelInsight = Boolean(insight && (insight.modelCount > 0 || insight.rankedModels.length > 0));
-  const multimodelReadAt = insight?.fetchedAt ?? multimodel.pageFetchedAt ?? multimodel.imageFetchedAt ?? null;
-  const multimodelObservedAt = insight?.sourceProof.pageFetchedAt ?? multimodel.displayUpdatedAt ?? null;
+  const multimodelAnalysisReadState = resolveMultiModelAnalysisReadState(insight);
+  const hasMultiModelInsight = multimodelAnalysisReadState.hasRuntimeData;
+  const multimodelReadAt = multimodelAnalysisReadState.readAt;
+  const multimodelObservedAt = multimodelAnalysisReadState.observedAt;
 
   const rows = useMemo<SourceRow[]>(
     () => {
@@ -174,8 +175,7 @@ export const HomeReferenceCard = ({
           stationCode: null,
           status: contract.currentSources.modelEnvelope.status,
           freshness: insight?.freshness ?? multimodel.freshness,
-          hasRuntimeData:
-            hasMultiModelInsight || Boolean(multimodel.pageFetchedAt || multimodel.imageFetchedAt || multimodel.displayUpdatedAt),
+          hasRuntimeData: hasMultiModelInsight,
           observedAt: multimodelObservedAt,
           readAt: multimodelReadAt,
           sourceUrl: multimodelSourceUrl,

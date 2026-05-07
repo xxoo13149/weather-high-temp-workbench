@@ -28,4 +28,51 @@ describe("resolveSourceReadState", () => {
     expect(resolveSourceReadState("fallback_error", false).label).toBe("暂无读取");
     expect(resolveSourceReadState(null, false).label).toBe("暂无读取");
   });
+  test("only treats multimodel insight as readable when it has real parsed analysis output", async () => {
+    const modulePath = new URL("../zip/src/lib/source-read-state.ts", import.meta.url).href;
+    const { resolveMultiModelAnalysisReadState } = (await import(modulePath)) as {
+      resolveMultiModelAnalysisReadState: (
+        insight:
+          | {
+              fetchedAt: string;
+              modelCount: number;
+              rankedModels: Array<{ modelName: string }>;
+              sourceProof: { pageFetchedAt: string; modelNames: string[] };
+            }
+          | null,
+      ) => { hasRuntimeData: boolean; readAt: string | null; observedAt: string | null };
+    };
+
+    expect(
+      resolveMultiModelAnalysisReadState({
+        fetchedAt: "2026-05-06T08:05:00.000Z",
+        modelCount: 3,
+        rankedModels: [],
+        sourceProof: {
+          pageFetchedAt: "2026-05-06T08:00:00.000Z",
+          modelNames: ["IFS", "ICON", "GFS"],
+        },
+      }),
+    ).toMatchObject({
+      hasRuntimeData: true,
+      readAt: "2026-05-06T08:05:00.000Z",
+      observedAt: "2026-05-06T08:00:00.000Z",
+    });
+
+    expect(
+      resolveMultiModelAnalysisReadState({
+        fetchedAt: "2026-05-06T08:05:00.000Z",
+        modelCount: 0,
+        rankedModels: [],
+        sourceProof: {
+          pageFetchedAt: "2026-05-06T08:00:00.000Z",
+          modelNames: [],
+        },
+      }),
+    ).toMatchObject({
+      hasRuntimeData: false,
+      readAt: null,
+      observedAt: null,
+    });
+  });
 });

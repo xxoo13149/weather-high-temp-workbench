@@ -147,7 +147,7 @@ const LOCATION_CATALOG = {
     latitude: 33.9415889,
     longitude: -118.40853,
     aslM: 38,
-    meteoblueWeekPath: "/en/weather/week/los-angeles-international-airport_united-states_5391958",
+    meteoblueWeekPath: "/en/weather/week/los-angeles-international-airport_united-states_5368418",
     enabled: true,
     sortOrder: 30,
   },

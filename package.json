@@ -20,6 +20,7 @@
     "start": "node dist/index.js",
     "deploy:cloudflare": "npx wrangler deploy",
     "audit:production": "node tools/audit-production-city-health.mjs",
+    "audit:meteoblue-locations": "node --import tsx tools/audit-meteoblue-location-links.mjs",
     "test": "vitest run",
     "test:pw": "node tools/playwright-location-regression.cjs",
     "test:pw:online": "node tools/playwright-location-regression.cjs --suite=online-smoke"
