@@ -78,6 +78,40 @@ describe("weatherApi", () => {
     expect(isAbortLikeError(new Error("signal is aborted without reason"))).toBe(true);
   });
 
+  test("does not retry multimodel origin unavailability responses", async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          code: "MULTIMODEL_ORIGIN_UNAVAILABLE",
+          message: "Multimodel origin is temporarily unavailable.",
+          retryable: true,
+          staleAvailable: false,
+          lastSuccessAt: null,
+        }),
+        {
+          status: 503,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+          },
+        },
+      ),
+    );
+
+    const apiModulePath = new URL("../zip/src/api.ts", import.meta.url).href;
+    const { weatherApi } = (await import(apiModulePath)) as {
+      weatherApi: { fetchInsights: (locationId?: string) => Promise<unknown> };
+    };
+
+    await expect(weatherApi.fetchInsights("miami_mia")).rejects.toMatchObject({
+      status: 503,
+      payload: expect.objectContaining({
+        code: "MULTIMODEL_ORIGIN_UNAVAILABLE",
+      }),
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   test("builds Kelly endpoint requests with route controls", async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValue(

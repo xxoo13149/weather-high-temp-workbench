@@ -894,7 +894,7 @@ describe("createApp", () => {
         freshness: {
           hourly: "fresh",
           report: "fresh",
-          multimodel: "fresh",
+          multimodel: "fallback_error",
         },
       },
       intradaySignals: expect.objectContaining({

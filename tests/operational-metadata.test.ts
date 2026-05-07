@@ -35,6 +35,7 @@ describe("buildDashboardEnhancements", () => {
     expect(enhancements.intradaySignals.evidence).not.toContain(
       "多模型参考可以在分析页继续确认升温时间和温度区间是否稳定。",
     );
+    expect(enhancements.sourceMetadata.freshness.multimodel).toBe("fallback_error");
   });
 
   test("formats intraday temperature guidance in the location display unit", () => {

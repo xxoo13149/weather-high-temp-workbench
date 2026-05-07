@@ -1187,6 +1187,21 @@ const fetchMultiModelOriginGet = async (
       }),
     );
 
+    if (await isKellyOriginLocationVersionSkew(request, response)) {
+      const reasonCode = "origin_location_version_skew";
+      logOriginProxyResult(request, {
+        requestKind: "multimodel",
+        originMode: "local-fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(multiModelGetProxyCircuit),
+      });
+      return {
+        kind: "fallback",
+        reasonCode,
+        circuitState: resolveKellyProxyCircuitState(multiModelGetProxyCircuit),
+      };
+    }
+
     if (response.ok || (response.status >= 400 && response.status < 500 && isKellyOriginJsonResponse(response))) {
       recordKellyOriginSuccess(multiModelGetProxyCircuit);
       logOriginProxyResult(request, {
@@ -1701,7 +1716,7 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
     }
     if (originAttempt.kind === "fallback") {
       throw new AppError(503, "MULTIMODEL_ORIGIN_UNAVAILABLE", "Multimodel origin is temporarily unavailable.", {
-        retryable: true,
+        retryable: originAttempt.reasonCode !== "origin_location_version_skew",
         diagnosticCode: originAttempt.reasonCode,
       });
     }

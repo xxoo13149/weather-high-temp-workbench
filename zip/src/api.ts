@@ -26,6 +26,7 @@ export class WeatherApiError extends Error {
 
 const NETWORK_RETRY_DELAY_MS = 350;
 const TRANSIENT_API_RETRY_STATUSES = new Set([502, 503, 504]);
+const NON_RETRYABLE_TRANSIENT_API_CODES = new Set(["MULTIMODEL_ORIGIN_UNAVAILABLE"]);
 
 const buildUrl = (
   basePath: string,
@@ -78,7 +79,11 @@ const shouldRetryTransientApiStatus = (
   status: number,
   payload: ApiErrorPayload | null,
   init?: RequestInit,
-) => isGetRequest(init) && TRANSIENT_API_RETRY_STATUSES.has(status) && payload?.retryable !== false;
+) =>
+  isGetRequest(init) &&
+  TRANSIENT_API_RETRY_STATUSES.has(status) &&
+  payload?.retryable !== false &&
+  !NON_RETRYABLE_TRANSIENT_API_CODES.has(payload?.code ?? "");
 
 const requestJson = async <T>(
   basePath: string,

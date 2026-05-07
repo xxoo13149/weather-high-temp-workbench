@@ -557,6 +557,59 @@ describe("cloudflare worker kelly routing", () => {
     expect(getMultiModelInsight).not.toHaveBeenCalled();
   });
 
+  test("treats multimodel origin location-version skew as non-retryable without opening the global circuit", async () => {
+    const getMultiModelInsight = vi.fn();
+    const env = createEnv({ KELLY_SERVER_BASE_URL: "https://kelly-proxy.example" });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          code: "BAD_REQUEST",
+          message: "Query parameter 'locationId' is not supported: 'guangzhou_can'.",
+          retryable: false,
+          staleAvailable: false,
+          lastSuccessAt: null,
+        }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    vi.doMock("../src/providers/meteoblue/service.js", () => {
+      class MockMeteoblueWeatherService {
+        getMultiModelInsight = getMultiModelInsight;
+      }
+
+      return { MeteoblueWeatherService: MockMeteoblueWeatherService };
+    });
+
+    const worker = await loadWorker();
+    const responses = [];
+    for (let index = 0; index < 4; index += 1) {
+      responses.push(
+        await worker.fetch(
+          new Request("https://lukaluka.fun/api/weather/multimodel/insights?locationId=guangzhou_can"),
+          env,
+          createContext(),
+        ),
+      );
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    await Promise.all(
+      responses.map(async (response) => {
+        expect(response.status).toBe(503);
+        await expect(response.json()).resolves.toMatchObject({
+          code: "MULTIMODEL_ORIGIN_UNAVAILABLE",
+          retryable: false,
+          diagnosticCode: "origin_location_version_skew",
+        });
+      }),
+    );
+    expect(getMultiModelInsight).not.toHaveBeenCalled();
+  });
+
   test("proxies Kelly stream requests when remote-first mode receives a websocket upgrade", async () => {
     const proxyUrl = "https://kelly-proxy.example";
     const upstreamSocket = { id: "origin-socket" };

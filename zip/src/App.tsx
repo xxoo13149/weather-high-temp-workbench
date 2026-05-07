@@ -133,7 +133,6 @@ const MULTIMODEL_WARMUP_RETRY_CODES = new Set([
   "MULTIMODEL_HIGHCHARTS_TIMEOUT",
   "MULTIMODEL_INSIGHT_REFRESH_IN_PROGRESS",
   "MULTIMODEL_INSIGHT_UNAVAILABLE",
-  "MULTIMODEL_ORIGIN_UNAVAILABLE",
   "MULTIMODEL_PAGE_TIMEOUT",
   "MULTIMODEL_CACHE_LOAD_BUSY",
   "UPSTREAM_BAD_STATUS",
@@ -205,13 +204,21 @@ const awaitAbortable = <T,>(promise: Promise<T>, signal: AbortSignal) => {
   });
 };
 
-const withClientTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> => {
+const withClientTimeout = async <T,>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+  onTimeout?: () => void,
+): Promise<T> => {
   let timerId: number | null = null;
   try {
     return await Promise.race([
       promise,
       new Promise<T>((_, reject) => {
-        timerId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+        timerId = window.setTimeout(() => {
+          onTimeout?.();
+          reject(new Error(message));
+        }, timeoutMs);
       }),
     ]);
   } finally {
@@ -251,10 +258,28 @@ const isMultiModelWarmupRetryError = (error: unknown) => {
 
   const code = resolveWeatherApiErrorCode(error);
   if (MULTIMODEL_TRANSIENT_RETRY_STATUSES.has(error.status)) {
-    return !code || error.payload?.retryable !== false;
+    return code
+      ? MULTIMODEL_WARMUP_RETRY_CODES.has(code) && error.payload?.retryable !== false
+      : error.payload?.retryable !== false;
   }
 
   return Boolean(code && MULTIMODEL_WARMUP_RETRY_CODES.has(code) && error.payload?.retryable !== false);
+};
+
+const createLinkedAbortController = (signal: AbortSignal) => {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal.aborted) {
+    controller.abort();
+  } else {
+    signal.addEventListener("abort", abort, { once: true });
+  }
+
+  return {
+    controller,
+    signal: controller.signal,
+    cleanup: () => signal.removeEventListener("abort", abort),
+  };
 };
 
 const withMultiModelWarmupRetry = async <T,>(
@@ -1162,19 +1187,23 @@ export default function App() {
       }
     }
 
+    const abortLink = createLinkedAbortController(signal);
+    const requestSignal = abortLink.signal;
     const request = withClientTimeout(
       withMultiModelWarmupRetry(
         () =>
           weatherApi.fetchInsights(locationId, selectedTimestamp ?? undefined, actualTemperatureC ?? undefined, {
-            signal,
+            signal: requestSignal,
           }),
-        signal,
+        requestSignal,
         retryWarmup,
       ),
       ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS,
       `Insight refresh timed out after ${Math.round(ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS / 1_000)}s.`,
+      () => abortLink.controller.abort(),
     )
-      .then((response) => writeWarmCacheEntry(insightWarmCacheRef.current, insightKey, mapInsightResponse(response)));
+      .then((response) => writeWarmCacheEntry(insightWarmCacheRef.current, insightKey, mapInsightResponse(response)))
+      .finally(abortLink.cleanup);
     const entry = {
       startedAt: Date.now(),
       promise: request,
@@ -1234,18 +1263,22 @@ export default function App() {
       }
     }
 
+    const abortLink = createLinkedAbortController(signal);
+    const requestSignal = abortLink.signal;
     const request = withClientTimeout(
       withMultiModelWarmupRetry(
-        () => weatherApi.fetchDistribution(locationId, selectedTimestamp, 1, { signal }),
-        signal,
+        () => weatherApi.fetchDistribution(locationId, selectedTimestamp, 1, { signal: requestSignal }),
+        requestSignal,
         retryWarmup,
       ),
       ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS,
       `Distribution refresh timed out after ${Math.round(ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS / 1_000)}s.`,
+      () => abortLink.controller.abort(),
     )
       .then((response) =>
         writeWarmCacheEntry(distributionWarmCacheRef.current, distributionKey, mapDistributionResponse(response)),
-      );
+      )
+      .finally(abortLink.cleanup);
     const entry = {
       startedAt: Date.now(),
       promise: request,

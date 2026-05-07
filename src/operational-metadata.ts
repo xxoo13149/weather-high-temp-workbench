@@ -456,6 +456,10 @@ export const buildDashboardEnhancements = ({
   const displayUnit = LOCATION_REGISTRY[locationId].fallbackDisplayUnit;
   const maxTemperatureC = report.metrics.maxTemperatureC;
   const confidence = report.metrics.confidence ?? "low";
+  const multimodelSourceFreshness =
+    multimodel.analysisStatus === "unavailable" && multimodel.imageStatus === "unavailable"
+      ? "fallback_error"
+      : multimodel.freshness;
   const baseCase =
     typeof maxTemperatureC === "number"
       ? `目前先按今天最高温约 ${formatDisplayTemperature(maxTemperatureC, displayUnit)} 来看。`
@@ -475,7 +479,7 @@ export const buildDashboardEnhancements = ({
       freshness: {
         hourly: hourly.freshness,
         report: report.freshness,
-        multimodel: multimodel.freshness,
+        multimodel: multimodelSourceFreshness,
       },
     },
     intradaySignals: {
