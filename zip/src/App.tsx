@@ -3432,6 +3432,7 @@ export default function App() {
   const analysisPageLoading =
     isAnalysis &&
     routeState.tab === "models" &&
+    !dashboard &&
     (loadingInsight || loadingDistribution || manualAnalysisRefreshPending) &&
     !hasRenderableAnalysisData &&
     !insightError &&
