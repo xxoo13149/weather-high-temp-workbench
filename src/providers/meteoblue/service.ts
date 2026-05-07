@@ -30,6 +30,7 @@ import type {
   UserFavoritesResponse,
   WeatherReportResponse,
   WeatherService,
+  DataFreshnessState,
 } from "../../domain/weather.js";
 import { normalizeDashboardMetarSnapshot } from "../../domain/weather.js";
 import { buildDiscoveryWarnings, PolymarketClient, type NormalizedOrderBook, type PolymarketDiscoveryResult } from "../../kelly/polymarket.js";
@@ -2327,34 +2328,6 @@ export class MeteoblueWeatherService implements WeatherService {
     const imageUrlFound = resolvedImageUrl !== null;
     const hasRenderableImage = snapshot.entry !== null || imageUrlFound;
     const hasRenderableAnalysis = distributionSnapshot.entry !== null;
-    const distributionFreshness =
-      resolveSnapshotFreshness(distributionSnapshot) ??
-      (hasRenderableAnalysis ? (analysisInFlight ? "revalidating" : "fresh") : analysisInFlight ? "revalidating" : null);
-    const imageFreshness =
-      resolveSnapshotFreshness(snapshot) ??
-      distributionFreshness ??
-      (hasRenderableImage ? (imageInFlight ? "revalidating" : "fresh") : imageInFlight ? "revalidating" : "revalidating");
-    const analysisFreshness = distributionFreshness ?? "revalidating";
-    const imageStatus = hasRenderableImage
-      ? "ready"
-      : imageInFlight
-        ? "revalidating"
-        : "unavailable";
-    const analysisStatus = hasRenderableAnalysis
-      ? "ready"
-      : analysisInFlight
-        ? "revalidating"
-        : "unavailable";
-    const freshness =
-      imageFreshness === "fallback_error" || analysisFreshness === "fallback_error"
-        ? "fallback_error"
-        : !hasRenderableImage && !hasRenderableAnalysis
-          ? imageInFlight || analysisInFlight
-            ? "revalidating"
-            : "revalidating"
-        : imageInFlight || analysisInFlight
-          ? "revalidating"
-          : "fresh";
     const statusError =
       cacheValidationError ??
       (snapshot.lastError !== null
@@ -2368,6 +2341,37 @@ export class MeteoblueWeatherService implements WeatherService {
               message: distributionSnapshot.lastError,
             }
           : null);
+    const distributionFreshness: DataFreshnessState | null =
+      resolveSnapshotFreshness(distributionSnapshot) ??
+      (hasRenderableAnalysis ? (analysisInFlight ? "revalidating" : "fresh") : analysisInFlight ? "revalidating" : null);
+    const imageFreshness: DataFreshnessState | null =
+      resolveSnapshotFreshness(snapshot) ??
+      distributionFreshness ??
+      (hasRenderableImage ? (imageInFlight ? "revalidating" : "fresh") : imageInFlight ? "revalidating" : null);
+    const analysisFreshness: DataFreshnessState | null = distributionFreshness ?? (analysisInFlight ? "revalidating" : null);
+    const imageStatus = hasRenderableImage
+      ? "ready"
+      : imageInFlight
+        ? "revalidating"
+        : "unavailable";
+    const analysisStatus = hasRenderableAnalysis
+      ? "ready"
+      : analysisInFlight
+        ? "revalidating"
+        : "unavailable";
+    const hasActiveLoad = imageInFlight || analysisInFlight;
+    const freshness: DataFreshnessState =
+      imageFreshness === "fallback_error" || analysisFreshness === "fallback_error"
+        ? "fallback_error"
+        : !hasRenderableImage && !hasRenderableAnalysis
+          ? hasActiveLoad
+            ? "revalidating"
+            : statusError
+              ? "fallback_error"
+              : "fresh"
+        : hasActiveLoad || imageFreshness === "revalidating" || analysisFreshness === "revalidating"
+          ? "revalidating"
+          : "fresh";
     const presentation = buildMultiModelStatusPresentation(statusError, {
       hasRenderableImage,
       hasRenderableAnalysis,

@@ -43,6 +43,7 @@ type WorkerEnv = {
   KELLY_STREAM_PROXY_MODE?: string;
   KELLY_PROXY_GET_TIMEOUT_MS?: string;
   DASHBOARD_PROXY_GET_TIMEOUT_MS?: string;
+  MULTIMODEL_PROXY_GET_TIMEOUT_MS?: string;
   KELLY_PROXY_STREAM_TIMEOUT_MS?: string;
 };
 
@@ -87,6 +88,7 @@ const KELLY_PROXY_FAILURE_WINDOW_MS = 60_000;
 const KELLY_PROXY_OPEN_DURATION_MS = 5 * 60_000;
 const DEFAULT_KELLY_PROXY_GET_TIMEOUT_MS = 14_000;
 const DEFAULT_DASHBOARD_PROXY_GET_TIMEOUT_MS = 8_000;
+const DEFAULT_MULTIMODEL_PROXY_GET_TIMEOUT_MS = 24_000;
 const DEFAULT_KELLY_PROXY_STREAM_TIMEOUT_MS = 6_000;
 
 const readPositiveIntegerEnv = (raw: string | undefined, fallback: number) => {
@@ -103,6 +105,9 @@ const resolveKellyProxyGetTimeoutMs = (env: WorkerEnv) =>
 
 const resolveDashboardProxyGetTimeoutMs = (env: WorkerEnv) =>
   readPositiveIntegerEnv(env.DASHBOARD_PROXY_GET_TIMEOUT_MS, DEFAULT_DASHBOARD_PROXY_GET_TIMEOUT_MS);
+
+const resolveMultiModelProxyGetTimeoutMs = (env: WorkerEnv) =>
+  readPositiveIntegerEnv(env.MULTIMODEL_PROXY_GET_TIMEOUT_MS, DEFAULT_MULTIMODEL_PROXY_GET_TIMEOUT_MS);
 
 const resolveKellyProxyStreamTimeoutMs = (env: WorkerEnv) =>
   readPositiveIntegerEnv(env.KELLY_PROXY_STREAM_TIMEOUT_MS, DEFAULT_KELLY_PROXY_STREAM_TIMEOUT_MS);
@@ -121,6 +126,7 @@ const createKellyProxyCircuitTracker = (): KellyProxyCircuitTracker => ({
 const kellyGetProxyCircuit = createKellyProxyCircuitTracker();
 const kellyStreamProxyCircuit = createKellyProxyCircuitTracker();
 const dashboardGetProxyCircuit = createKellyProxyCircuitTracker();
+const multiModelGetProxyCircuit = createKellyProxyCircuitTracker();
 
 const ensureRuntimeMetadata = () => {
   const rawBuildId =
@@ -995,7 +1001,7 @@ type OriginProxyAttemptResult =
 const logOriginProxyResult = (
   request: Request,
   details: {
-    requestKind: "dashboard" | "get" | "stream";
+    requestKind: "dashboard" | "get" | "multimodel" | "stream";
     originMode: "remote" | "local-fallback";
     reasonCode: string;
     circuitState: KellyCircuitState;
@@ -1137,6 +1143,90 @@ const fetchKellyOriginGet = async (
       kind: "fallback",
       reasonCode,
       circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+const fetchMultiModelOriginGet = async (
+  request: Request,
+  env: WorkerEnv,
+  timeoutMs: number,
+): Promise<OriginProxyAttemptResult> => {
+  const proxyRequest = buildOriginProxyRequest(request, env);
+  if (!proxyRequest) {
+    return { kind: "unconfigured" };
+  }
+
+  if (shouldBypassKellyOrigin(multiModelGetProxyCircuit)) {
+    multiModelGetProxyCircuit.localFallbackActive = true;
+    const circuitState = resolveKellyProxyCircuitState(multiModelGetProxyCircuit);
+    logOriginProxyResult(request, {
+      requestKind: "multimodel",
+      originMode: "local-fallback",
+      reasonCode: "origin_circuit_open",
+      circuitState,
+    });
+    return {
+      kind: "fallback",
+      reasonCode: "origin_circuit_open",
+      circuitState,
+    };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(
+      new Request(proxyRequest, {
+        signal: controller.signal,
+      }),
+    );
+
+    if (response.ok || (response.status >= 400 && response.status < 500 && isKellyOriginJsonResponse(response))) {
+      recordKellyOriginSuccess(multiModelGetProxyCircuit);
+      logOriginProxyResult(request, {
+        requestKind: "multimodel",
+        originMode: "remote",
+        reasonCode: response.ok ? "origin_ok" : `origin_status_${response.status}`,
+        circuitState: resolveKellyProxyCircuitState(multiModelGetProxyCircuit),
+      });
+      return {
+        kind: "passthrough",
+        response,
+      };
+    }
+
+    const reasonCode = `origin_status_${response.status}`;
+    recordKellyOriginFailure(multiModelGetProxyCircuit, reasonCode);
+    logOriginProxyResult(request, {
+      requestKind: "multimodel",
+      originMode: "local-fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(multiModelGetProxyCircuit),
+    });
+    return {
+      kind: "fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(multiModelGetProxyCircuit),
+    };
+  } catch (error) {
+    const reasonCode = error instanceof Error && error.name === "AbortError" ? "origin_timeout" : "origin_fetch_failed";
+    recordKellyOriginFailure(multiModelGetProxyCircuit, reasonCode);
+    logOriginProxyResult(request, {
+      requestKind: "multimodel",
+      originMode: "local-fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(multiModelGetProxyCircuit),
+    });
+    return {
+      kind: "fallback",
+      reasonCode,
+      circuitState: resolveKellyProxyCircuitState(multiModelGetProxyCircuit),
     };
   } finally {
     clearTimeout(timeoutId);
@@ -1424,6 +1514,7 @@ const buildKellyProxyHealth = (env: WorkerEnv) => ({
   timeoutsMs: {
     kellyGet: resolveKellyProxyGetTimeoutMs(env),
     dashboardGet: resolveDashboardProxyGetTimeoutMs(env),
+    multimodelGet: resolveMultiModelProxyGetTimeoutMs(env),
     stream: resolveKellyProxyStreamTimeoutMs(env),
   },
   circuitState: resolveKellyProxyCircuitState(kellyGetProxyCircuit),
@@ -1444,6 +1535,11 @@ const buildKellyProxyHealth = (env: WorkerEnv) => ({
   dashboardLastOriginFailureAt: dashboardGetProxyCircuit.lastOriginFailureAt,
   dashboardLastOriginFailureCode: dashboardGetProxyCircuit.lastOriginFailureCode,
   dashboardLocalFallbackActive: dashboardGetProxyCircuit.localFallbackActive,
+  multimodelCircuitState: resolveKellyProxyCircuitState(multiModelGetProxyCircuit),
+  multimodelLastOriginSuccessAt: multiModelGetProxyCircuit.lastOriginSuccessAt,
+  multimodelLastOriginFailureAt: multiModelGetProxyCircuit.lastOriginFailureAt,
+  multimodelLastOriginFailureCode: multiModelGetProxyCircuit.lastOriginFailureCode,
+  multimodelLocalFallbackActive: multiModelGetProxyCircuit.localFallbackActive,
 });
 
 const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerContext) => {
@@ -1527,6 +1623,12 @@ const handleKellyStream = async (request: Request, env: WorkerEnv, ctx: WorkerCo
   return createWebSocketUpgradeResponse(client);
 };
 
+const isMultiModelApiPath = (pathname: string) =>
+  pathname === "/api/weather/multimodel/status" ||
+  pathname === "/api/weather/multimodel/distribution" ||
+  pathname === "/api/weather/multimodel/insights" ||
+  pathname === "/api/weather/multimodel/image";
+
 const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerContext): Promise<Response> => {
   const url = new URL(request.url);
   const runtimeMetadata = ensureRuntimeMetadata();
@@ -1589,6 +1691,19 @@ const handleApiRequest = async (request: Request, env: WorkerEnv, ctx: WorkerCon
     const originAttempt = await fetchDashboardOriginGet(request, env, resolveDashboardProxyGetTimeoutMs(env));
     if (originAttempt.kind === "passthrough") {
       return originAttempt.response;
+    }
+  }
+
+  if (request.method === "GET" && isMultiModelApiPath(url.pathname)) {
+    const originAttempt = await fetchMultiModelOriginGet(request, env, resolveMultiModelProxyGetTimeoutMs(env));
+    if (originAttempt.kind === "passthrough") {
+      return originAttempt.response;
+    }
+    if (originAttempt.kind === "fallback") {
+      throw new AppError(503, "MULTIMODEL_ORIGIN_UNAVAILABLE", "Multimodel origin is temporarily unavailable.", {
+        retryable: true,
+        diagnosticCode: originAttempt.reasonCode,
+      });
     }
   }
 

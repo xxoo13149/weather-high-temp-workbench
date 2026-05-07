@@ -14,6 +14,7 @@ type TestWorkerEnv = {
   KELLY_STREAM_PROXY_MODE?: string;
   KELLY_PROXY_GET_TIMEOUT_MS?: string;
   DASHBOARD_PROXY_GET_TIMEOUT_MS?: string;
+  MULTIMODEL_PROXY_GET_TIMEOUT_MS?: string;
   KELLY_PROXY_STREAM_TIMEOUT_MS?: string;
 };
 
@@ -146,6 +147,7 @@ describe("cloudflare worker kelly routing", () => {
         timeoutsMs: {
           kellyGet: 12000,
           dashboardGet: 9000,
+          multimodelGet: 24000,
           stream: 5000,
         },
         circuitState: "closed",
@@ -468,6 +470,91 @@ describe("cloudflare worker kelly routing", () => {
         },
       },
     });
+  });
+
+  test("proxies multimodel analysis requests to the origin when configured", async () => {
+    const proxyUrl = "https://kelly-proxy.example";
+    const getMultiModelInsight = vi.fn();
+    const env = createEnv({ KELLY_SERVER_BASE_URL: proxyUrl });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          proxied: true,
+          freshness: "fresh",
+          location: {
+            id: "miami_mia",
+          },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    vi.doMock("../src/providers/meteoblue/service.js", () => {
+      class MockMeteoblueWeatherService {
+        getMultiModelInsight = getMultiModelInsight;
+      }
+
+      return { MeteoblueWeatherService: MockMeteoblueWeatherService };
+    });
+
+    const worker = await loadWorker();
+    const response = await worker.fetch(
+      new Request("https://lukaluka.fun/api/weather/multimodel/insights?locationId=miami_mia"),
+      env,
+      createContext(),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [requested] = fetchMock.mock.calls[0];
+    expect(requested).toBeInstanceOf(Request);
+    expect((requested as Request).url).toBe(`${proxyUrl}/api/weather/multimodel/insights?locationId=miami_mia`);
+    expect((requested as Request).headers.get("x-weather-kelly-proxy")).toBe("cloudflare-worker");
+    expect(getMultiModelInsight).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      proxied: true,
+      freshness: "fresh",
+      location: {
+        id: "miami_mia",
+      },
+    });
+  });
+
+  test("returns a retryable multimodel proxy error instead of running heavy local fallback", async () => {
+    const getMultiModelInsight = vi.fn();
+    const env = createEnv({ KELLY_SERVER_BASE_URL: "https://kelly-proxy.example" });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ code: "UPSTREAM_BUSY" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    vi.doMock("../src/providers/meteoblue/service.js", () => {
+      class MockMeteoblueWeatherService {
+        getMultiModelInsight = getMultiModelInsight;
+      }
+
+      return { MeteoblueWeatherService: MockMeteoblueWeatherService };
+    });
+
+    const worker = await loadWorker();
+    const response = await worker.fetch(
+      new Request("https://lukaluka.fun/api/weather/multimodel/insights?locationId=miami_mia"),
+      env,
+      createContext(),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      code: "MULTIMODEL_ORIGIN_UNAVAILABLE",
+      retryable: true,
+      diagnosticCode: "origin_status_503",
+    });
+    expect(getMultiModelInsight).not.toHaveBeenCalled();
   });
 
   test("proxies Kelly stream requests when remote-first mode receives a websocket upgrade", async () => {

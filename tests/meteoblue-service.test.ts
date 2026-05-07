@@ -627,7 +627,7 @@ describe("MeteoblueWeatherService", () => {
     expect(fetchTextMock).toHaveBeenCalledTimes(1);
   });
 
-  test("reports multimodel analysis as revalidating after a cold refresh failure without stale cache", async () => {
+  test("reports multimodel analysis as unavailable after a cold refresh failure without stale cache", async () => {
     fetchTextMock.mockRejectedValue(new Error("multimodel boom"));
 
     const service = new MeteoblueWeatherService();
@@ -641,7 +641,7 @@ describe("MeteoblueWeatherService", () => {
     expect(status.analysisStatus).toBe("unavailable");
     expect(status.lastError).toBe("该城市当前暂不可用，请稍后再试。");
     expect(status).not.toHaveProperty("diagnosticMessage");
-    expect(status.freshness).toBe("revalidating");
+    expect(status.freshness).toBe("fallback_error");
   });
 
   test("keeps multimodel analysis status ready when stale cache is still renderable after refresh failure", async () => {
@@ -690,13 +690,13 @@ describe("MeteoblueWeatherService", () => {
     });
   });
 
-  test("does not start cold multimodel analysis loading from status", async () => {
+  test("reports cold multimodel analysis as unavailable without starting status warmup", async () => {
     const service = new MeteoblueWeatherService();
 
     const status = await service.getMultiModelStatus("shanghai_pvg");
     expect(status.analysisStatus).toBe("unavailable");
     expect(status.imageStatus).toBe("unavailable");
-    expect(status.freshness).toBe("revalidating");
+    expect(status.freshness).toBe("fresh");
     expect(fetchTextMock).not.toHaveBeenCalled();
   });
 

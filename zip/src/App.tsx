@@ -119,7 +119,7 @@ const ENABLE_KELLY_DATE_WARM = false;
 const KELLY_STREAM_RECONNECT_BASE_MS = 1_500;
 const KELLY_STREAM_RECONNECT_MAX_MS = 12_000;
 const SHARED_IN_FLIGHT_STALE_MS = 15_000;
-const ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS = 20_000;
+const ANALYSIS_SNAPSHOT_CLIENT_TIMEOUT_MS = 35_000;
 const DASHBOARD_SNAPSHOT_CLIENT_TIMEOUT_MS = 20_000;
 const KELLY_SNAPSHOT_CLIENT_TIMEOUT_MS = 20_000;
 const KELLY_FOCUS_RECOVERY_STALE_MS = 20_000;
@@ -133,6 +133,7 @@ const MULTIMODEL_WARMUP_RETRY_CODES = new Set([
   "MULTIMODEL_HIGHCHARTS_TIMEOUT",
   "MULTIMODEL_INSIGHT_REFRESH_IN_PROGRESS",
   "MULTIMODEL_INSIGHT_UNAVAILABLE",
+  "MULTIMODEL_ORIGIN_UNAVAILABLE",
   "MULTIMODEL_PAGE_TIMEOUT",
   "MULTIMODEL_CACHE_LOAD_BUSY",
   "UPSTREAM_BAD_STATUS",
@@ -248,11 +249,11 @@ const isMultiModelWarmupRetryError = (error: unknown) => {
     return false;
   }
 
-  if (MULTIMODEL_TRANSIENT_RETRY_STATUSES.has(error.status) && error.payload?.retryable !== false) {
-    return true;
+  const code = resolveWeatherApiErrorCode(error);
+  if (MULTIMODEL_TRANSIENT_RETRY_STATUSES.has(error.status)) {
+    return !code || error.payload?.retryable !== false;
   }
 
-  const code = resolveWeatherApiErrorCode(error);
   return Boolean(code && MULTIMODEL_WARMUP_RETRY_CODES.has(code) && error.payload?.retryable !== false);
 };
 

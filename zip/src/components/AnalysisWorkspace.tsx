@@ -1427,10 +1427,10 @@ export const AnalysisWorkspace = ({
                             </AnimatePresence>
                           </article>
                         );
-                      }) : <div className="rounded-[20px] border border-white/8 bg-black/20 px-4 py-5 text-sm leading-6 text-white/56">{analysisUnavailable ? UI_TEXT.analysis.waitingModelData : NO_FILTER_MATCH_TEXT}</div>}
+                      }) : <div className="rounded-[20px] border border-white/8 bg-black/20 px-4 py-5 text-sm leading-6 text-white/56">{insightError ?? (analysisUnavailable ? UI_TEXT.analysis.waitingModelData : NO_FILTER_MATCH_TEXT)}</div>}
                     </div>
                     {loadingInsight ? <div className="mt-4 text-xs text-white/54">{UI_TEXT.analysis.rankingLoading}</div> : null}
-                    {insightError ? <div className="mt-3 text-sm text-[var(--warning)]">{insightError}</div> : null}
+                    {insightError && filteredModels.length > 0 ? <div className="mt-3 text-sm text-[var(--warning)]">{insightError}</div> : null}
                   </section>
 
                   {isMobileLayout ? mobileInspectorPanel : contextPanel}
