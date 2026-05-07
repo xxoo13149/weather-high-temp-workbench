@@ -68,6 +68,38 @@ describe("RefreshableCache", () => {
     expect(calls).toBe(1);
   });
 
+  it("lets a cold foreground read overtake a background load", async () => {
+    const releases: Array<(value: string) => void> = [];
+    const modes: string[] = [];
+    const cache = new RefreshableCache(60_000, async ({ mode }) => {
+      modes.push(mode);
+      return await new Promise<string>((resolve) => {
+        releases.push(resolve);
+      });
+    });
+
+    const background = cache.get({ background: true });
+    expect(cache.peek().inFlightMode).toBe("background");
+
+    const foreground = cache.get();
+    expect(cache.peek().inFlightMode).toBe("foreground");
+    expect(modes).toEqual(["background", "foreground"]);
+
+    releases[1]?.("foreground-value");
+    await expect(foreground).resolves.toMatchObject({
+      value: "foreground-value",
+      freshness: "fresh",
+    });
+    expect(cache.peek().entry?.value).toBe("foreground-value");
+
+    releases[0]?.("background-value");
+    await expect(background).resolves.toMatchObject({
+      value: "background-value",
+      freshness: "fresh",
+    });
+    expect(cache.peek().entry?.value).toBe("foreground-value");
+  });
+
   it("returns stale value immediately and refreshes in background when staleWhileRevalidate is enabled", async () => {
     vi.useFakeTimers();
 

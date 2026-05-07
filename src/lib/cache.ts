@@ -138,14 +138,23 @@ export class RefreshableCache<T> {
     mode?: CacheLoadMode;
   }): Promise<CacheEntry<T>> {
     const forceRefresh = options?.forceRefresh ?? false;
+    const requestedMode = options?.mode ?? "foreground";
     if (this.inFlight) {
+      if (!forceRefresh && this.inFlightMode === "background" && requestedMode === "foreground" && !this.entry) {
+        const loadId = this.activeLoadId + 1;
+        this.activeLoadId = loadId;
+        this.inFlightMode = "foreground";
+        this.inFlight = this.load(loadId, this.inFlightMode);
+        return this.inFlight;
+      }
+
       return this.inFlight;
     }
 
     if (!this.inFlight || forceRefresh) {
       const loadId = this.activeLoadId + 1;
       this.activeLoadId = loadId;
-      this.inFlightMode = options?.mode ?? "foreground";
+      this.inFlightMode = requestedMode;
       this.inFlight = this.load(loadId, this.inFlightMode);
     }
 

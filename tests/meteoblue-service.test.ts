@@ -1089,18 +1089,23 @@ describe("MeteoblueWeatherService", () => {
     await Promise.resolve();
   });
 
-  test("waits for a cold background multimodel refresh before serving distribution and insight", async () => {
+  test("lets cold foreground multimodel reads overtake a background status refresh", async () => {
     let releaseRefresh!: () => void;
     const refreshGate = new Promise<void>((resolve) => {
       releaseRefresh = resolve;
     });
+    let gateNextPageLoad = true;
 
-    fetchTextMock
-      .mockImplementationOnce(async () => {
+    fetchTextMock.mockImplementation(async (url: string) => {
+      const isHighchartsRequest = /format=highcharts|highcharts\.json|download=1/i.test(url);
+      if (!isHighchartsRequest && gateNextPageLoad) {
+        gateNextPageLoad = false;
         await refreshGate;
         return fixture("multimodel.html");
-      })
-      .mockResolvedValueOnce(fixture("multimodel-highcharts.json"));
+      }
+
+      return isHighchartsRequest ? fixture("multimodel-highcharts.json") : fixture("multimodel.html");
+    });
 
     const service = new MeteoblueWeatherService();
     const status = await service.getMultiModelStatus("shanghai_pvg");
@@ -1109,10 +1114,29 @@ describe("MeteoblueWeatherService", () => {
 
     const distributionPromise = service.getMultiModelDistribution("shanghai_pvg");
     const insightPromise = service.getMultiModelInsight("shanghai_pvg");
+    let foregroundTimeoutId: ReturnType<typeof setTimeout> | null = null;
+    const foregroundTimeout = new Promise<never>((_, reject) => {
+      foregroundTimeoutId = setTimeout(
+        () => reject(new Error("foreground multimodel request waited for background status refresh")),
+        500,
+      );
+    });
 
-    releaseRefresh();
-
-    const [distribution, insight] = await Promise.all([distributionPromise, insightPromise]);
+    let distribution!: Awaited<ReturnType<MeteoblueWeatherService["getMultiModelDistribution"]>>;
+    let insight!: Awaited<ReturnType<MeteoblueWeatherService["getMultiModelInsight"]>>;
+    try {
+      [distribution, insight] = await Promise.race([
+        Promise.all([distributionPromise, insightPromise]),
+        foregroundTimeout,
+      ]);
+    } finally {
+      if (foregroundTimeoutId) {
+        clearTimeout(foregroundTimeoutId);
+      }
+      releaseRefresh();
+      await Promise.resolve();
+      await Promise.resolve();
+    }
 
     expect(distribution).toMatchObject({
       location: {
@@ -1128,6 +1152,7 @@ describe("MeteoblueWeatherService", () => {
       freshness: "fresh",
       stale: false,
     });
+
   });
 
   test("does not block foreground multimodel requests behind eight background city loads", async () => {
