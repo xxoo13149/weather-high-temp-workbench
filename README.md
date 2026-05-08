@@ -1,65 +1,113 @@
 # 全球机场高温天气决策台
 
-一个面向机场高温、小时级天气与市场信号的综合决策工作台。项目后端负责聚合 meteoblue、航空天气报文与 Kelly 分析服务，前端提供桌面端高信息密度工作流和移动端触屏友好的快速判断体验。
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=0B1220)](https://react.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Vite](https://img.shields.io/badge/Vite-6-646CFF?logo=vite&logoColor=white)](https://vite.dev/)
+[![Vitest](https://img.shields.io/badge/Tests-249%20passed-2FB344?logo=vitest&logoColor=white)](https://vitest.dev/)
 
-当前生产部署使用 Cloudflare Workers + 静态资源托管，主域名配置在 `wrangler.toml` 中。仓库不提交任何本地密钥，部署凭据请放在本机环境或 `.local/` 目录中。
+面向全球机场高温风险、小时级天气和市场信号的实时决策工作台。系统把 meteoblue 多模型、官方天气图、航空 METAR/TAF、Kelly 概率和市场参考聚合在一个高信息密度界面里，让用户快速判断：哪个机场正在升温、哪个时段最关键、哪些模型分歧最大、当前数据是否可靠。
 
-## 当前功能
+生产环境入口：[https://lukaluka.fun](https://lukaluka.fun)
 
-- 全球机场天气 Alpha 首页：按城市/机场查看当前温度、高温峰值、24 小时轨道、关键小时与天气摘要。
-- 地点工作流：支持地点切换、收藏持久化、最近地点、移动端地点抽屉，以及切换时的旧数据 race guard。
-- meteoblue week 数据：解析小时级预报、中文天气报告和 week meteogram 表格数据。
-- meteoblue multimodel：转发官方 multimodel 原图，并从公开 Highcharts payload 中提取多模型温度分布与模型级分析。
-- 航空天气报文：接入 AviationWeather 的 METAR / TAF 数据，首页提供机场报文摘要。
-- METAR Reader 入口：首页会根据四字 ICAO 机场码生成一键外链，例如 `https://www.metarreader.com/ZSPD`。
-- 数据源可用性展示：用户侧优先展示“已读取/可用”的体验状态，非阻断的刷新、缓存回退和源站提示不再打扰主流程。
-- 多模型 Insight：支持城市级多模型刷新、超时保护、缓存兜底和可读分析文本。
-- Kelly 工作台：集成 Kelly 概率、市场参考、机会面板、证据检查器与流式更新路径。
-- 移动端适配：重构 Header、地点选择器、首页信息层级、分析页触屏列表/详情工作流，并保留桌面端完整排序和 sticky 资料栏。
+> 当前重点：稳定 Cloudflare 线上多模型分析。最新版本已经覆盖快速切换城市、冷/热缓存、超时中断、origin 代理和前端可解释加载态。
 
-## 最近更新
+## 一眼看懂
 
-- 2026-05：新增 METAR Reader 外链能力，首页和详情层都可以快速跳转到对应机场报文站点。
-- 2026-05：完成移动端核心回归，覆盖收藏、刷新四态、切地点准确性、中文编码、移动首屏、弹层和桌面主工作流。
-- 2026-05：收敛用户侧噪音提示，隐藏不影响体验的源站超时、嵌入 meteogram 增强失败、缓存回退等非阻断运行信息。
-- 2026-05：修复部分中文乱码和 `null` 被误显示为 `0` 的展示问题。
-- 2026-04：强化 meteoblue 多模型分布读取、小时数据缓存、Cloudflare Worker 路由和 Kelly 预热策略。
-- 2026-04：加入 Kelly 桥接、流式分析、市场参考和生产环境稳定性热修复。
+| 模块 | 用户价值 | 当前状态 |
+| --- | --- | --- |
+| 全球机场天气首页 | 查看当前温度、24 小时轨道、高温峰值、天气摘要和航空报文 | 可用 |
+| 多模型分析 | 读取 meteoblue multimodel Highcharts 数据，展示模型排名、温度分布和峰值时段 | 重点加固中 |
+| 官方多模型原图 | 转发 meteoblue 官方 multimodel 图片，保留可核对来源 | 可用 |
+| Kelly 工作台 | 把天气信号、市场参考、机会面板和风险模式放在同一工作流 | 可用 |
+| 移动端快切 | 触屏地点选择、收藏、分组浏览和分析页移动视图 | 可用 |
+| Cloudflare 线上验证 | 真实域名下的 direct / switch / burst / click-burst 回归脚本 | 已接入 |
+
+## 产品亮点
+
+- **用户无感的多模型加载**：Insight 先显示，Distribution 后补齐；抓取慢时保留可展示缓存；失败时明确区分加载中、缓存兜底、origin 不可用和数据缺失。
+- **快速城市切换不串数据**：前端使用 request epoch、AbortController、location guard 和 batch key，避免旧城市请求晚返回后覆盖新城市。
+- **Cloudflare 边缘轻量化**：Worker 负责路由、缓存和代理；长耗时的多模型抓取优先交给 origin，降低 Worker 1102 资源限制风险。
+- **高信号源状态展示**：数据源卡片表达“用户现在能不能读到数据”，不把内部刷新、回退或诊断状态直接暴露成主体验。
+- **航空天气上下文**：METAR / TAF 摘要、METAR Reader 外链和机场级报文状态帮助用户核对真实天气。
+- **桌面和移动双工作流**：桌面保留高密度排序、sticky 资料栏和完整模型面板；移动端提供单手切换和触屏列表。
+
+## 系统架构
+
+```mermaid
+flowchart LR
+  User["用户浏览器"] --> CF["Cloudflare Worker + Assets"]
+  CF --> Cache["Edge Cache"]
+  CF --> Origin["Origin 服务"]
+  Origin --> Meteoblue["meteoblue week / multimodel"]
+  Origin --> Aviation["AviationWeather METAR / TAF"]
+  Origin --> Kelly["Kelly / 市场参考服务"]
+  Origin --> RuntimeCache["运行时缓存与 stale fallback"]
+  RuntimeCache --> Origin
+  Cache --> CF
+  CF --> User
+```
+
+## 核心页面
+
+### 首页
+
+- 当前机场温度、高温峰值、24 小时温度轨道和中文天气摘要。
+- 航空报文摘要、METAR Reader 外链和数据源状态。
+- 收藏城市、最近城市和分组地点切换。
+
+### 多模型分析
+
+- meteoblue multimodel 模型排名、当前温度偏差、日内峰值温度和峰值时间。
+- 当前温度分布、日内最高温分布、峰值命中模型集合。
+- 官方原图查看、模型资料侧栏和多模型 source proof。
+- 快速城市切换场景下支持缓存兜底、请求取消和晚返回防护。
+
+### Kelly 工作台
+
+- 按机场、目标日期、资金、风险模式和实际温度参数生成机会面板。
+- 结合天气信号、市场参考、盘口状态和流式更新。
+- 支持 origin 代理、WebSocket 路径和本地 fallback。
+
+## 最近版本
+
+完整版本历史见 [CHANGELOG.md](./CHANGELOG.md)。
+
+| 版本 | 主题 | 关键变化 |
+| --- | --- | --- |
+| v0.1.12 | 多模型加载 UX 稳定 | 避免整页 skeleton 误遮住分析区；新增 Cloudflare render timing / click-burst 测试脚本 |
+| v0.1.11 | 多模型稳定性硬化 | timeout 触发真实 abort；收紧 `MULTIMODEL_ORIGIN_UNAVAILABLE` 重试；修复 origin skew circuit 风险 |
+| v0.1.10 | 多模型 origin 代理 | Cloudflare Worker 不再承担重型 multimodel 抓取，改由 origin 处理并暴露健康字段 |
+| v0.1.7 | Distribution 延迟加载 | Insight 成功后再加载 distribution，减少快速切城时前台压力 |
+| v0.1.6 | 渐进式多模型渲染 | Insight 先可见，distribution 失败不再清空整个分析工作区 |
+| v0.1.5 | 前台缓存优先级 | 冷启动前台请求可以越过后台 refresh，避免用户等待后台任务 |
 
 ## 技术栈
 
-- 运行时：Node.js 22+、TypeScript、ESM。
-- 后端服务：Fastify 5、`@fastify/websocket`、Cheerio、WebSocket。
-- Cloudflare：Workers、Assets、`wrangler`、自定义域名路由。
-- 前端：React 19、Vite 6、Tailwind CSS 4、Radix UI、cmdk、lucide-react、motion。
-- 测试与验证：Vitest、TypeScript 编译检查、Playwright 回归脚本、编码检查脚本。
-- 数据处理：meteoblue 页面解析、Highcharts payload 解析、航空报文解析、Kelly origin 代理与预热。
+| 层级 | 技术 |
+| --- | --- |
+| 前端 | React 19, Vite 6, Tailwind CSS 4, Radix UI, lucide-react, motion |
+| 后端 | Node.js 22+, TypeScript, Fastify 5, ESM, Cheerio |
+| 实时路径 | WebSocket, Kelly stream proxy, origin fallback |
+| Cloudflare | Workers, Assets, edge cache, wrangler, custom domain |
+| 测试 | Vitest, TypeScript compile check, Playwright online regression, encoding guard |
+| 数据处理 | meteoblue Highcharts payload, week meteogram, METAR/TAF, Kelly market reference |
 
-## 数据源与口径
+## 数据源
 
-- meteoblue week 页面用于小时级天气、天气报告和 week meteogram 补充数据。
-- meteoblue multimodel 图片接口只转发官方原图，不在本项目中重绘官方图。
-- 多模型分布来自 multimodel 页面公开的 `format=highcharts` 数据，不依赖 OCR。
-- METAR / TAF 默认来自 AviationWeather；`.env.example` 中保留 AVWX、CheckWX 等可选配置位。
-- METAR Reader 是外部详情站点，本项目只生成对应 ICAO 链接，不抓取或缓存其页面内容。
-- 当源站短时不完整或慢响应时，后端允许使用最近一次成功缓存；前端默认不把非阻断诊断信息暴露给普通用户。
+- meteoblue week 页面：小时级天气、中文天气报告和 meteogram 补充数据。
+- meteoblue multimodel 页面：官方原图转发与公开 `format=highcharts` payload 解析。
+- AviationWeather：默认 METAR / TAF 数据源。
+- METAR Reader：外部详情站点，本项目只生成机场 ICAO 链接。
+- Kelly origin：市场参考、机会面板、流式更新和生产代理路径。
 
-## API 概览
+## 快速开始
 
-- `GET /`：前端入口，由 `zip/dist` 构建产物提供。
-- `GET /healthz`：健康检查和构建信息。
-- `GET /api/weather/dashboard?locationId=...&mode=1h|3h&limit=...`：首页聚合数据。
-- `GET /api/weather/report?locationId=...`：中文天气报告。
-- `GET /api/weather/hourly?locationId=...&mode=1h|3h&limit=...`：小时级天气。
-- `GET /api/weather/multimodel/image?locationId=...&allowStale=true|false`：官方 multimodel 图片转发。
-- `GET /api/weather/multimodel/status?locationId=...`：multimodel 刷新状态。
-- `GET /api/weather/multimodel/distribution?locationId=...&timestamp=<ISO>&bucketSize=1`：模型级温度分布。
-- `GET /api/weather/aviation?locationId=...`：航空天气报文摘要。
-- `GET /api/kelly/*`：Kelly 工作台代理、预热、流式与市场参考相关接口。
+环境要求：
 
-具体参数会随页面状态和地点配置变化，前端 API client 位于 `zip/src/api.ts`。
-
-## 本地开发
+- Node.js 22+
+- npm 或 pnpm
+- Cloudflare 部署需要本地 wrangler 凭据
 
 ```bash
 npm install
@@ -68,7 +116,7 @@ copy .env.example .env
 npm run dev
 ```
 
-前端单独开发时使用 Vite，并通过代理访问后端 API：
+前端单独开发：
 
 ```bash
 npm run dev:web
@@ -81,43 +129,49 @@ npm run build
 npm run dev:cloudflare
 ```
 
-## 构建、测试与部署
+## 常用命令
 
 ```bash
 npm run build
-npm test
 npm run check
+npm test
 ```
 
-常用定向回归：
+线上多模型快速切换验证：
 
 ```bash
-npx vitest run tests/frontend-api.test.ts tests/display-text.test.ts tests/source-read-state.test.ts tests/metar-reader-link.test.ts
-npm run test:pw
+node tools/measure-multimodel-render-timing.mjs --baseUrl=https://lukaluka.fun --mode=click-burst --burstSize=9 --intervalMs=50 --rowTimeoutMs=24000
+node tools/measure-multimodel-render-timing.mjs --baseUrl=https://lukaluka.fun --mode=burst --burstSize=8 --intervalMs=100 --rowTimeoutMs=24000
 ```
 
-部署到 Cloudflare：
+Cloudflare 部署：
 
 ```bash
 npm run build
 npm run deploy:cloudflare
 ```
 
-部署前请确认 Cloudflare 凭据已经在本机 shell 或本地私有文件中配置，避免把任何密钥写入仓库。
-
 ## 目录结构
 
-- `src/`：后端 Fastify 服务、Cloudflare Worker 入口、领域模型、数据源适配器与 Kelly 代理逻辑。
-- `zip/src/`：React 前端源码，包含首页、分析页、Kelly 工作台、移动端布局和展示文案。
-- `tests/`：Vitest 单元测试、接口契约测试和关键展示逻辑回归。
-- `tools/`：编码检查、生产审计、Playwright 地点回归和 Kelly 批量检查脚本。
-- `docs/plan/`：阶段性实施计划和任务拆分文档。
-- `.local/`：本地私有配置目录，已被 `.gitignore` 排除，不应提交。
+```text
+src/       后端服务、Cloudflare Worker、领域模型、数据源适配器、Kelly 代理
+zip/src/   React 前端：首页、分析页、Kelly 工作台、移动端布局和展示文案
+tests/     Vitest 单元测试、接口契约测试、关键展示逻辑回归
+tools/     编码检查、生产审计、Playwright 地点/多模型线上回归脚本
+docs/      实施计划、发布记录、生产说明和私有运行手册入口
+.local/    本地私有配置目录，已被 .gitignore 排除
+```
 
-## 维护注意事项
+## 维护原则
 
-- 不要把 `.local/`、`.wrangler/`、运行日志、截图、Playwright 产物、测试报告或热修复 zip 提交到仓库。
-- 用户可见文案统一走 `zip/src/display-text.ts` 等展示层 helper，避免把底层错误直接暴露到 UI。
-- 数据源状态卡片应表达“用户现在是否能读到数据”，不要把内部刷新中、缓存回退等诊断状态当成用户主状态。
-- 移动端改造不能破坏桌面端主工作流：桌面分析页仍应保持左侧完整排序和右侧 sticky 资料栏。
-- `null`、缺测和真实 `0` 必须区分展示，避免把缺数据误读为 0 度、0 风速或 0 概率。
+- 不提交 `.local/`、`.wrangler/`、日志、截图、Playwright 产物、热修复 zip 或测试报告。
+- 用户可见文案集中放在展示层 helper，避免把底层错误直接暴露到 UI。
+- 多模型页面必须优先保证“能展示已有可信数据”，再后台刷新新鲜数据。
+- `null`、缺测和真实 `0` 必须区分展示，不能把缺数据误读成 0 度、0 风速或 0 概率。
+- 移动端改造不能破坏桌面端主工作流：桌面分析页仍要保留完整排序和资料栏。
+
+## 文档风格参考
+
+- [GitHub Docs: About READMEs](https://docs.github.com/articles/about-readmes/)
+- [Google Developer Documentation Style Guide: READMEs](https://google.github.io/styleguide/docguide/READMEs.html)
+- [Keep a Changelog](https://keepachangelog.com/)
